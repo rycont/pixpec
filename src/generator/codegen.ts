@@ -83,7 +83,7 @@ function emitComponent(n: IRComponent): ts.JsxSelfClosingElement {
   )
 }
 
-function emitFrame(n: IRFrame): ts.JsxElement {
+function emitFrame(n: IRFrame, ctx: CodegenCtx): ts.JsxElement {
   const flexDir = n.layout.direction === 'none' ? null : n.layout.direction
   const styles: Record<string, unknown> = {}
   if (flexDir) {
@@ -109,11 +109,25 @@ function emitFrame(n: IRFrame): ts.JsxElement {
     f.createIdentifier('div'), undefined, f.createJsxAttributes(styleAttr),
   )
   const close = f.createJsxClosingElement(f.createIdentifier('div'))
-  const children = n.children.map(emitNode)
+  const children = n.children.map((c) => emitNode(c, ctx))
   return f.createJsxElement(open, children, close)
 }
 
-function emitText(n: IRText): ts.JsxElement {
+function emitText(n: IRText, ctx: CodegenCtx): ts.JsxElement {
+  // If textStyleId matches a registered typography wrapper, use it.
+  // The wrapper handles fontSize/lineHeight/weight/y-shift internally.
+  // Live textStyleId format: "S:<hash>,<nodeSuffix>"; binding keys end in
+  // ",", so binding key is a prefix of the live id.
+  const wrapperName = n.textStyleId ? lookupTypoByPrefix(n.textStyleId, ctx.typographyMap) : undefined
+  if (wrapperName) {
+    ctx.usedTypography.add(wrapperName)
+    const open = f.createJsxOpeningElement(
+      f.createIdentifier(wrapperName), undefined, f.createJsxAttributes([]),
+    )
+    const close = f.createJsxClosingElement(f.createIdentifier(wrapperName))
+    return f.createJsxElement(open, [f.createJsxText(n.content)], close)
+  }
+  // Fallback: styled span (when textStyleId missing or unknown).
   const styles: Record<string, unknown> = {
     fontSize: n.fontSize,
     lineHeight: `${n.lineHeight}px`,
@@ -154,11 +168,25 @@ function emitUnknown(n: IRUnknown): ts.JsxSelfClosingElement {
   )
 }
 
-function emitNode(n: IRNode): ts.JsxChild {
+interface CodegenCtx {
+  typographyMap: Record<string, string>
+  usedTypography: Set<string>
+}
+
+function lookupTypoByPrefix(liveId: string, map: Record<string, string>): string | undefined {
+  // Direct match first.
+  if (map[liveId]) return map[liveId]
+  for (const key of Object.keys(map)) {
+    if (liveId.startsWith(key)) return map[key]
+  }
+  return undefined
+}
+
+function emitNode(n: IRNode, ctx: CodegenCtx): ts.JsxChild {
   switch (n.kind) {
     case 'component': return emitComponent(n)
-    case 'frame': return emitFrame(n)
-    case 'text': return emitText(n)
+    case 'frame': return emitFrame(n, ctx)
+    case 'text': return emitText(n, ctx)
     case 'vector': return emitVector(n)
     case 'unknown': return emitUnknown(n)
   }
@@ -170,12 +198,17 @@ function collectComponents(node: IRNode, set: Set<string>): void {
 }
 
 /** Generate self-contained tsx file source. */
-export function generate(root: IRNode, components: Component<unknown>[]): string {
+export function generate(
+  root: IRNode,
+  components: Component<unknown>[],
+  typographyMap: Record<string, string> = {},
+): string {
   hydrate(root, components)
   const usedComponents = new Set<string>()
   collectComponents(root, usedComponents)
+  const ctx: CodegenCtx = { typographyMap, usedTypography: new Set() }
 
-  const importStatements = [...usedComponents].sort().map((n) =>
+  const componentImports = [...usedComponents].sort().map((n) =>
     f.createImportDeclaration(undefined,
       f.createImportClause(false, undefined,
         f.createNamedImports([
@@ -184,6 +217,16 @@ export function generate(root: IRNode, components: Component<unknown>[]): string
       f.createStringLiteral(`../${n}/impl.tsx`),
     ),
   )
+  // Pre-emit body so usedTypography is populated.
+  const body = emitNode(root, ctx) as ts.Expression
+  const typographyImports = ctx.usedTypography.size > 0
+    ? [f.createImportDeclaration(undefined,
+        f.createImportClause(false, undefined,
+          f.createNamedImports([...ctx.usedTypography].sort().map((n) =>
+            f.createImportSpecifier(false, undefined, f.createIdentifier(n))))),
+        f.createStringLiteral('../typography/index.tsx'))]
+    : []
+  const importStatements = [...componentImports, ...typographyImports]
   const fcImport = f.createImportDeclaration(undefined,
     f.createImportClause(true, undefined,
       f.createNamedImports([f.createImportSpecifier(false, undefined, f.createIdentifier('FC'))])),
@@ -198,7 +241,7 @@ export function generate(root: IRNode, components: Component<unknown>[]): string
         f.createTypeReferenceNode('FC'),
         f.createArrowFunction(undefined, undefined, [], undefined,
           f.createToken(ts.SyntaxKind.EqualsGreaterThanToken),
-          f.createParenthesizedExpression(emitNode(root) as ts.Expression),
+          f.createParenthesizedExpression(body),
         ),
       ),
     ], ts.NodeFlags.Const),

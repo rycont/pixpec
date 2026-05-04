@@ -52,7 +52,14 @@ export async function runGenerate(
   // Get the wrapper dim from the source frame so the generated component
   // can be rendered into a fixed-size box for dim parity.
   const wrapper = await getNodeDim(cfg.cfigmaBin, tab, nodeId)
-  const jsx = generate(ir, components)
+  // Optional typography binding: textStyleId → wrapper component name.
+  let typographyMap: Record<string, string> = {}
+  try {
+    const path = resolve(root, componentsDir, 'typography/figma-binding.json')
+    typographyMap = JSON.parse(await (await import('node:fs/promises')).readFile(path, 'utf8'))
+    console.log(`[generate] loaded ${Object.keys(typographyMap).length} typography bindings`)
+  } catch { /* optional */ }
+  const jsx = generate(ir, components, typographyMap)
   const fileKey = await getFileKey(cfg.cfigmaBin, tab)
 
   await mkdir(componentDir, { recursive: true })

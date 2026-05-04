@@ -55,6 +55,10 @@ export interface IRText extends IRBase {
   /** Resolved CSS color (hex or rgba). Codegen maps to panda token. */
   color: string
   textAlign?: 'left' | 'center' | 'right' | 'justify'
+  /** Figma textStyle binding (S:hash,index format). If matches a registered
+   * typography wrapper, codegen emits <Wrapper>content</Wrapper> instead of
+   * a styled span. */
+  textStyleId?: string
 }
 
 export interface IRVector extends IRBase {

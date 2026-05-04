@@ -95,6 +95,7 @@ async function ir(node) {
       lineHeight: typeof node.lineHeight === 'object' && node.lineHeight.unit === 'PIXELS' ? node.lineHeight.value : node.fontSize,
       color: fill ? rgbaHex(fill.color, fill.opacity ?? 1) : '#000000',
       textAlign: node.textAlignHorizontal?.toLowerCase(),
+      textStyleId: typeof node.textStyleId === 'string' ? node.textStyleId : undefined,
     };
   }
   if (node.type === 'VECTOR' || node.type === 'BOOLEAN_OPERATION') {
