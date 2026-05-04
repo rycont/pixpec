@@ -81,6 +81,38 @@ export interface Component<P> {
    * (= tab). Default 4. Increase for more cores; decrease if memory-bound.
    */
   batchParallel?: number
+  /**
+   * Optional figma binding — generator uses this to recognize INSTANCE nodes
+   * whose mainComponent.parent.key matches `componentSetKey` and convert
+   * them to <Component {...fromInstance(raw)} /> JSX.
+   */
+  figma?: FigmaBinding<P>
+}
+
+/**
+ * Serialized figma INSTANCE shape (extracted by walker, no live figma API).
+ * `props`: componentProperties values, keyed by both qualified ("Size") and
+ * full ("Label#524:131") names — fromInstance uses whichever is convenient.
+ * `exposed`: nested instances surfaced for editing (icons, etc.).
+ */
+export interface FigmaInstanceRaw {
+  id: string
+  name: string
+  mainComponentName: string
+  componentSetKey: string
+  props: Record<string, string | boolean>
+  exposed: Array<{
+    name: string
+    mainComponentName: string
+    props: Record<string, string | boolean>
+  }>
+}
+
+export interface FigmaBinding<P> {
+  /** Master ComponentSetNode.key (NOT individual variant key). */
+  componentSetKey: string
+  /** Pure function: serialized instance → React props. */
+  fromInstance: (raw: FigmaInstanceRaw) => P
 }
 
 export function defineComponent<P>(c: Component<P>): Component<P> {

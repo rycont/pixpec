@@ -14,6 +14,7 @@ import { init } from './init.ts'
 import { runDumpFigma } from './dump-figma.ts'
 import { runDumpChromium } from './dump-chromium.ts'
 import { runAnalyze } from './analyze.ts'
+import { runGenerate } from './generator/cli.ts'
 
 const [, , cmd, ...rest] = process.argv
 
@@ -49,6 +50,17 @@ async function main() {
         process.exit(2)
       }
       await runDumpChromium(componentName)
+      break
+    }
+    case 'generate': {
+      const nodeId = rest[0]
+      if (!nodeId) { console.error('usage: pixpec generate <nodeId> [--tab X] [--out path.tsx]'); process.exit(2) }
+      const tabIdx = rest.indexOf('--tab')
+      const outIdx = rest.indexOf('--out')
+      await runGenerate(nodeId, {
+        tab: tabIdx >= 0 ? rest[tabIdx + 1] : undefined,
+        out: outIdx >= 0 ? rest[outIdx + 1] : undefined,
+      })
       break
     }
     case 'analyze': {
