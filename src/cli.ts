@@ -56,10 +56,10 @@ async function main() {
       const nodeId = rest[0]
       if (!nodeId) { console.error('usage: pixpec generate <nodeId> [--tab X] [--out path.tsx]'); process.exit(2) }
       const tabIdx = rest.indexOf('--tab')
-      const outIdx = rest.indexOf('--out')
+      const nameIdx = rest.indexOf('--name')
       await runGenerate(nodeId, {
         tab: tabIdx >= 0 ? rest[tabIdx + 1] : undefined,
-        out: outIdx >= 0 ? rest[outIdx + 1] : undefined,
+        name: nameIdx >= 0 ? rest[nameIdx + 1] : undefined,
       })
       break
     }

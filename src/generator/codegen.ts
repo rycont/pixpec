@@ -1,26 +1,29 @@
 /**
- * IR → React + PandaCSS JSX codegen.
+ * IR → React + PandaCSS JSX codegen using TypeScript factory + printer.
  *
- * Conservative starting strategy:
- *   - IRComponent → <Name {...props} />
- *   - IRFrame → <div className={css({...})}>{children}</div>
- *   - IRText → <span style={{fontSize, lineHeight, fontWeight, color}}>content</span>
- *   - IRVector / IRUnknown → <div style={{width,height,bg:'red'}} />  (placeholder)
+ *   - Type-safe AST construction (ts.factory.*)
+ *   - Printer handles escaping, indentation, JSX text/expression boundaries
+ *   - No string concatenation
  *
- * Phase 0 doesn't try to map figma colors → panda tokens — emits hex
- * literals. Token mapping is Phase 4.
+ * Phase 0 mappings:
+ *   IRComponent → <Name {...props} />
+ *   IRFrame     → <div style={{...}}>{children}</div>
+ *   IRText      → <span style={{...}}>content</span>
+ *   IRVector / IRUnknown → placeholder div
+ *
+ * fromInstance() runs in hydrate() pass before codegen.
  */
+import * as ts from 'typescript'
 import type { Component } from '../types.ts'
 import type { IRNode, IRComponent, IRFrame, IRText, IRVector, IRUnknown } from './ir.ts'
 
+const f = ts.factory
+
 interface IRComponentRaw extends IRComponent {
-  raw: unknown  // emitted by walker before fromInstance() applied
+  raw: unknown
 }
 
-/**
- * Apply each registered component's fromInstance to IRComponentRaw nodes
- * to fill in their .props field. Mutates the tree.
- */
+/** Apply each registered component's fromInstance to fill .props. Mutates. */
 export function hydrate(node: IRNode, components: Component<unknown>[]): IRNode {
   if (node.kind === 'component') {
     const c = node as IRComponentRaw
@@ -28,106 +31,197 @@ export function hydrate(node: IRNode, components: Component<unknown>[]): IRNode 
     if (comp?.figma) c.props = comp.figma.fromInstance(c.raw as never) as Record<string, unknown>
     delete (c as Partial<IRComponentRaw>).raw
   }
-  if (node.kind === 'frame') {
-    for (const child of node.children) hydrate(child, components)
-  }
+  if (node.kind === 'frame') for (const ch of node.children) hydrate(ch, components)
   return node
 }
 
-const indent = (depth: number) => '  '.repeat(depth)
+const IDENT_RE = /^[A-Za-z_$][A-Za-z0-9_$]*$/
 
-function emit(node: IRNode, depth: number): string {
-  const pad = indent(depth)
-  switch (node.kind) {
-    case 'component':
-      return emitComponent(node, pad)
-    case 'frame':
-      return emitFrame(node, depth)
-    case 'text':
-      return emitText(node, pad)
-    case 'vector':
-      return emitVector(node, pad)
-    case 'unknown':
-      return emitUnknown(node, pad)
+/** JS value → ts AST expression. Handles primitives, arrays, plain objects. */
+function valueToExpr(v: unknown): ts.Expression {
+  if (v === null) return f.createNull()
+  if (v === undefined) return f.createIdentifier('undefined')
+  if (typeof v === 'boolean') return v ? f.createTrue() : f.createFalse()
+  if (typeof v === 'number') return f.createNumericLiteral(v)
+  if (typeof v === 'string') return f.createStringLiteral(v)
+  if (Array.isArray(v)) return f.createArrayLiteralExpression(v.map(valueToExpr))
+  if (typeof v === 'object') {
+    const props = Object.entries(v as Record<string, unknown>).map(([k, val]) => {
+      const name = IDENT_RE.test(k) ? f.createIdentifier(k) : f.createStringLiteral(k)
+      return f.createPropertyAssignment(name, valueToExpr(val))
+    })
+    return f.createObjectLiteralExpression(props, false)
   }
+  return f.createStringLiteral(String(v))
 }
 
-function emitComponent(n: IRComponent, pad: string): string {
-  // Split props into JSX-safe (identifier names) and rest (spaces, etc → spread).
-  const safe: string[] = []
+/** Build JSX attributes; identifier-safe keys go inline, rest go via spread. */
+function attrsFromObject(obj: Record<string, unknown>): ts.JsxAttributeLike[] {
+  const inline: ts.JsxAttribute[] = []
   const rest: Record<string, unknown> = {}
-  for (const [k, v] of Object.entries(n.props)) {
-    if (/^[A-Za-z_$][A-Za-z0-9_$]*$/.test(k)) {
-      safe.push(`${k}={${JSON.stringify(v)}}`)
+  for (const [k, v] of Object.entries(obj)) {
+    if (IDENT_RE.test(k)) {
+      inline.push(f.createJsxAttribute(
+        f.createIdentifier(k),
+        f.createJsxExpression(undefined, valueToExpr(v)),
+      ))
     } else {
       rest[k] = v
     }
   }
-  const restStr = Object.keys(rest).length ? ` {...${JSON.stringify(rest)}}` : ''
-  return `${pad}<${n.componentName}${safe.length ? ' ' + safe.join(' ') : ''}${restStr} />`
-}
-
-function emitFrame(n: IRFrame, depth: number): string {
-  const pad = indent(depth)
-  const flexDir = n.layout.direction === 'none' ? null : n.layout.direction
-  const styles: Record<string, string | number | undefined> = {
-    display: flexDir ? 'flex' : undefined,
-    flexDirection: flexDir ?? undefined,
-    paddingTop: n.layout.paddingTop || undefined,
-    paddingRight: n.layout.paddingRight || undefined,
-    paddingBottom: n.layout.paddingBottom || undefined,
-    paddingLeft: n.layout.paddingLeft || undefined,
-    gap: n.layout.gap || undefined,
-    alignItems: flexDir && n.layout.alignItems !== 'start' ? n.layout.alignItems : undefined,
-    justifyContent: flexDir && n.layout.justifyContent !== 'start' ? n.layout.justifyContent : undefined,
-    width: n.width,
-    height: n.height,
-    background: n.background,
-    borderRadius: n.borderRadius,
+  if (Object.keys(rest).length) {
+    inline.push(f.createJsxSpreadAttribute(valueToExpr(rest)) as ts.JsxAttributeLike as ts.JsxAttribute)
   }
-  const styleStr = Object.entries(styles)
-    .filter(([, v]) => v !== undefined)
-    .map(([k, v]) => `${k}: ${typeof v === 'number' ? v : JSON.stringify(v)}`)
-    .join(', ')
-  const styleAttr = styleStr ? ` style={{ ${styleStr} }}` : ''
-  if (n.children.length === 0) return `${pad}<div${styleAttr} />`
-  const inner = n.children.map((c) => emit(c, depth + 1)).join('\n')
-  return `${pad}<div${styleAttr}>\n${inner}\n${pad}</div>`
+  return inline
 }
 
-function emitText(n: IRText, pad: string): string {
-  const styles = [
-    `fontSize: ${n.fontSize}`,
-    `lineHeight: ${JSON.stringify(`${n.lineHeight}px`)}`,
-    `fontWeight: ${n.fontWeight}`,
-    `color: ${JSON.stringify(n.color)}`,
-    n.textAlign ? `textAlign: ${JSON.stringify(n.textAlign)}` : '',
-  ].filter(Boolean).join(', ')
-  return `${pad}<span style={{ ${styles} }}>${escapeJsx(n.content)}</span>`
+function emitComponent(n: IRComponent): ts.JsxSelfClosingElement {
+  return f.createJsxSelfClosingElement(
+    f.createIdentifier(n.componentName),
+    undefined,
+    f.createJsxAttributes(attrsFromObject(n.props)),
+  )
 }
 
-function emitVector(n: IRVector, pad: string): string {
-  return `${pad}<div style={{ width: ${n.width}, height: ${n.height}, background: ${JSON.stringify(n.fills[0] ?? '#ccc')} }} /> {/* vector ${n.figmaName} */}`
+function emitFrame(n: IRFrame): ts.JsxElement {
+  const flexDir = n.layout.direction === 'none' ? null : n.layout.direction
+  const styles: Record<string, unknown> = {}
+  if (flexDir) {
+    styles.display = 'flex'
+    styles.flexDirection = flexDir
+    if (n.layout.alignItems !== 'start') styles.alignItems = n.layout.alignItems
+    if (n.layout.justifyContent !== 'start') styles.justifyContent = n.layout.justifyContent
+    if (n.layout.gap) styles.gap = n.layout.gap
+  }
+  if (n.layout.paddingTop) styles.paddingTop = n.layout.paddingTop
+  if (n.layout.paddingRight) styles.paddingRight = n.layout.paddingRight
+  if (n.layout.paddingBottom) styles.paddingBottom = n.layout.paddingBottom
+  if (n.layout.paddingLeft) styles.paddingLeft = n.layout.paddingLeft
+  if (n.width !== undefined) styles.width = n.width
+  if (n.height !== undefined) styles.height = n.height
+  if (n.background) styles.background = n.background
+  if (n.borderRadius) styles.borderRadius = n.borderRadius
+
+  const styleAttr = Object.keys(styles).length
+    ? [f.createJsxAttribute(f.createIdentifier('style'), f.createJsxExpression(undefined, valueToExpr(styles)))]
+    : []
+  const open = f.createJsxOpeningElement(
+    f.createIdentifier('div'), undefined, f.createJsxAttributes(styleAttr),
+  )
+  const close = f.createJsxClosingElement(f.createIdentifier('div'))
+  const children = n.children.map(emitNode)
+  return f.createJsxElement(open, children, close)
 }
 
-function emitUnknown(n: IRUnknown, pad: string): string {
-  return `${pad}<div style={{ width: ${n.width}, height: ${n.height}, background: '#f00' }} /> {/* unknown ${n.type}: ${n.figmaName} */}`
+function emitText(n: IRText): ts.JsxElement {
+  const styles: Record<string, unknown> = {
+    fontSize: n.fontSize,
+    lineHeight: `${n.lineHeight}px`,
+    fontWeight: n.fontWeight,
+    color: n.color,
+  }
+  if (n.textAlign) styles.textAlign = n.textAlign
+  const open = f.createJsxOpeningElement(
+    f.createIdentifier('span'), undefined,
+    f.createJsxAttributes([
+      f.createJsxAttribute(f.createIdentifier('style'),
+        f.createJsxExpression(undefined, valueToExpr(styles))),
+    ]),
+  )
+  const close = f.createJsxClosingElement(f.createIdentifier('span'))
+  return f.createJsxElement(open, [f.createJsxText(n.content)], close)
 }
 
-function escapeJsx(s: string): string {
-  return s.replace(/[<>{}]/g, (c) => `{'${c}'}`)
+function emitVector(n: IRVector): ts.JsxSelfClosingElement {
+  const styles = { width: n.width, height: n.height, background: n.fills[0] ?? '#ccc' }
+  return f.createJsxSelfClosingElement(
+    f.createIdentifier('div'), undefined,
+    f.createJsxAttributes([
+      f.createJsxAttribute(f.createIdentifier('style'),
+        f.createJsxExpression(undefined, valueToExpr(styles))),
+    ]),
+  )
 }
 
-/** Generate a self-contained tsx file for the given IR root. */
-export function generate(root: IRNode, components: Component<unknown>[]): string {
-  hydrate(root, components)
-  const usedComponents = new Set<string>()
-  collectComponents(root, usedComponents)
-  const imports = [...usedComponents].sort().map((n) => `import { ${n} } from 'danah'`).join('\n')
-  return `${imports}\n\nexport const Generated = () => (\n${emit(root, 1)}\n)\n`
+function emitUnknown(n: IRUnknown): ts.JsxSelfClosingElement {
+  const styles = { width: n.width, height: n.height, background: '#f00' }
+  return f.createJsxSelfClosingElement(
+    f.createIdentifier('div'), undefined,
+    f.createJsxAttributes([
+      f.createJsxAttribute(f.createIdentifier('style'),
+        f.createJsxExpression(undefined, valueToExpr(styles))),
+    ]),
+  )
+}
+
+function emitNode(n: IRNode): ts.JsxChild {
+  switch (n.kind) {
+    case 'component': return emitComponent(n)
+    case 'frame': return emitFrame(n)
+    case 'text': return emitText(n)
+    case 'vector': return emitVector(n)
+    case 'unknown': return emitUnknown(n)
+  }
 }
 
 function collectComponents(node: IRNode, set: Set<string>): void {
   if (node.kind === 'component') set.add(node.componentName)
   if (node.kind === 'frame') for (const c of node.children) collectComponents(c, set)
+}
+
+/** Generate self-contained tsx file source. */
+export function generate(root: IRNode, components: Component<unknown>[]): string {
+  hydrate(root, components)
+  const usedComponents = new Set<string>()
+  collectComponents(root, usedComponents)
+
+  const importStatements = [...usedComponents].sort().map((n) =>
+    f.createImportDeclaration(undefined,
+      f.createImportClause(false, undefined,
+        f.createNamedImports([
+          f.createImportSpecifier(false, f.createIdentifier('impl'), f.createIdentifier(n)),
+        ])),
+      f.createStringLiteral(`../${n}/impl.tsx`),
+    ),
+  )
+  const fcImport = f.createImportDeclaration(undefined,
+    f.createImportClause(true, undefined,
+      f.createNamedImports([f.createImportSpecifier(false, undefined, f.createIdentifier('FC'))])),
+    f.createStringLiteral('react'),
+  )
+  const generatedFn = f.createVariableStatement(
+    [f.createModifier(ts.SyntaxKind.ExportKeyword)],
+    f.createVariableDeclarationList([
+      f.createVariableDeclaration(
+        f.createIdentifier('Generated'),
+        undefined,
+        f.createTypeReferenceNode('FC'),
+        f.createArrowFunction(undefined, undefined, [], undefined,
+          f.createToken(ts.SyntaxKind.EqualsGreaterThanToken),
+          f.createParenthesizedExpression(emitNode(root) as ts.Expression),
+        ),
+      ),
+    ], ts.NodeFlags.Const),
+  )
+  const implExport = f.createVariableStatement(
+    [f.createModifier(ts.SyntaxKind.ExportKeyword)],
+    f.createVariableDeclarationList([
+      f.createVariableDeclaration(
+        f.createIdentifier('impl'),
+        undefined,
+        f.createTypeReferenceNode('FC'),
+        f.createArrowFunction(undefined, undefined, [], undefined,
+          f.createToken(ts.SyntaxKind.EqualsGreaterThanToken),
+          f.createJsxSelfClosingElement(f.createIdentifier('Generated'), undefined, f.createJsxAttributes([])),
+        ),
+      ),
+    ], ts.NodeFlags.Const),
+  )
+  const sourceFile = f.createSourceFile(
+    [fcImport, ...importStatements, generatedFn, implExport],
+    f.createToken(ts.SyntaxKind.EndOfFileToken),
+    ts.NodeFlags.None,
+  )
+  const printer = ts.createPrinter({ newLine: ts.NewLineKind.LineFeed })
+  return printer.printFile(sourceFile)
 }
