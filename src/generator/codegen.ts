@@ -14,8 +14,9 @@
  * fromInstance() runs in hydrate() pass before codegen.
  */
 import * as ts from 'typescript'
+import { getSvgPath } from 'figma-squircle'
 import type { Component } from '../types.ts'
-import type { IRNode, IRComponent, IRFrame, IRText, IRVector, IRUnknown } from './ir.ts'
+import type { IRNode, IRComponent, IRFrame, IRText, IRVector, IRShape, IRImage, IRUnknown } from './ir.ts'
 
 const f = ts.factory
 
@@ -23,12 +24,22 @@ interface IRComponentRaw extends IRComponent {
   raw: unknown
 }
 
-/** Apply each registered component's fromInstance to fill .props. Mutates. */
+/** Apply each registered component's fromInstance to fill .props. Mutates.
+ * fromInstance is allowed to return `undefined` for missing-in-figma fields;
+ * we drop those keys here so the rendering component naturally falls back to
+ * its declared `defaults` at runtime.
+ * If the component declares `defaults`, copy it to IR — codegen will elide
+ * instance props whose values match the declared defaults. Without defaults
+ * declared, NO elision happens (safe fallback for un-migrated components). */
 export function hydrate(node: IRNode, components: Component<unknown>[]): IRNode {
   if (node.kind === 'component') {
     const c = node as IRComponentRaw
     const comp = components.find((x) => x.name === c.componentName)
-    if (comp?.figma) c.props = comp.figma.fromInstance(c.raw as never) as Record<string, unknown>
+    if (comp?.figma) {
+      const raw = comp.figma.fromInstance(c.raw as never) as Record<string, unknown>
+      c.props = Object.fromEntries(Object.entries(raw).filter(([, v]) => v !== undefined))
+    }
+    if (comp?.defaults) c.defaultProps = comp.defaults as Record<string, unknown>
     delete (c as Partial<IRComponentRaw>).raw
   }
   if (node.kind === 'frame') for (const ch of node.children) hydrate(ch, components)
@@ -55,16 +66,18 @@ function valueToExpr(v: unknown): ts.Expression {
   return f.createStringLiteral(String(v))
 }
 
-/** Build JSX attributes; identifier-safe keys go inline, rest go via spread. */
+/** Build JSX attributes; identifier-safe keys go inline, rest go via spread.
+ * String values render as `prop="value"` (no curly braces) — matches the
+ * idiomatic JSX style. Other types (number, boolean, object) use `{...}`. */
 function attrsFromObject(obj: Record<string, unknown>): ts.JsxAttributeLike[] {
   const inline: ts.JsxAttribute[] = []
   const rest: Record<string, unknown> = {}
   for (const [k, v] of Object.entries(obj)) {
     if (IDENT_RE.test(k)) {
-      inline.push(f.createJsxAttribute(
-        f.createIdentifier(k),
-        f.createJsxExpression(undefined, valueToExpr(v)),
-      ))
+      const initializer: ts.JsxAttributeValue = typeof v === 'string'
+        ? f.createStringLiteral(v)
+        : f.createJsxExpression(undefined, valueToExpr(v))
+      inline.push(f.createJsxAttribute(f.createIdentifier(k), initializer))
     } else {
       rest[k] = v
     }
@@ -75,75 +88,388 @@ function attrsFromObject(obj: Record<string, unknown>): ts.JsxAttributeLike[] {
   return inline
 }
 
-function emitComponent(n: IRComponent): ts.JsxSelfClosingElement {
-  return f.createJsxSelfClosingElement(
-    f.createIdentifier(n.componentName),
-    undefined,
-    f.createJsxAttributes(attrsFromObject(n.props)),
-  )
+/** Deep-equal for primitives + plain JSON-shaped objects/arrays. */
+function deepEq(a: unknown, b: unknown): boolean {
+  if (a === b) return true
+  if (typeof a !== typeof b) return false
+  if (a && b && typeof a === 'object') {
+    if (Array.isArray(a) !== Array.isArray(b)) return false
+    const ka = Object.keys(a), kb = Object.keys(b as object)
+    if (ka.length !== kb.length) return false
+    return ka.every((k) => deepEq((a as Record<string, unknown>)[k], (b as Record<string, unknown>)[k]))
+  }
+  return false
 }
 
-function emitFrame(n: IRFrame, ctx: CodegenCtx): ts.JsxElement {
+function emitComponent(n: IRComponent, _parent: ParentCtx = { dir: 'none', mainSizing: 'fixed' }): ts.JsxChild {
+  // Elide props that match the component-set's default — figma's
+  // `componentPropertyDefinitions[name].defaultValue` semantically equals
+  // "what you'd get if you didn't override it." Cuts visual noise on
+  // generated JSX without losing fidelity.
+  const props = n.defaultProps
+    ? Object.fromEntries(Object.entries(n.props).filter(([k, v]) => !deepEq(v, n.defaultProps![k])))
+    : n.props
+  const inner = f.createJsxSelfClosingElement(
+    f.createIdentifier(n.componentName),
+    undefined,
+    f.createJsxAttributes(attrsFromObject(props)),
+  )
+  // Layout wrapping (flex-shrink:0 / flex:1 / alignSelf:stretch) is applied
+  // by emitNode AFTER plugin emitWrap so it's always the outermost layer —
+  // the outer span is the one the parent flex container sees, so its
+  // shrink/grow behavior must not be hidden by plugin wrappers.
+  let wrapped: ts.JsxChild = inner
+  // figma rotation (counterclockwise degrees) → CSS rotate (clockwise positive).
+  // Wrap with inline-flex div so rotate doesn't affect parent layout.
+  if (n.rotation !== undefined) {
+    // The rotation wrap holds the PRE-rotation box (figma `.width`×`.height`).
+    // Outer layout-wrap reserves the post-rotation axis-aligned bbox; the
+    // rotation here just paints the inner box at that visual orientation.
+    //
+    // transform-origin defaults to 50%/50%, which puts the rotated visual off
+    // the layout slot when w ≠ h. Use top-left origin (0 0) and a translate
+    // to bring the post-rotation bbox back to (0,0) of the slot:
+    //   corners → rotate → minX, minY → translate(-minX, -minY)
+    // This places the rotated visual flush with the layout-wrap span's box,
+    // matching figma's render of rotated children inside autolayout.
+    const css = (-n.rotation) * Math.PI / 180  // CSS rotate is clockwise; figma counterclockwise
+
+    const w0 = typeof n.width === 'number' ? n.width : 0
+    const h0 = typeof n.height === 'number' ? n.height : 0
+    const cos = Math.cos(css), sin = Math.sin(css)
+    const corners: [number, number][] = [[0, 0], [w0, 0], [w0, h0], [0, h0]]
+    const rotated = corners.map(([x, y]): [number, number] => [x * cos - y * sin, x * sin + y * cos])
+    const minX = Math.min(...rotated.map((p) => p[0]))
+    const minY = Math.min(...rotated.map((p) => p[1]))
+    // Thin rotated shape (post-rotation w ≤ 1 css) at sub-pixel x in flex
+    // → Skia HTML rasterizer snaps to integer raw px. Empirically translate
+    // half a css px LESS than the geometric `-minX` puts the rendered ink at
+    // figma's sub-pixel position (verified via SnapGridProbe + Gen_3707_4081
+    // divider). Geometric: translate(1, 0) → snap to css 63. Adjusted:
+    // translate(0.5, 0) → ink at css 62.5 = match figma. The trick works only
+    // for thin shapes; thicker rotated shapes don't snap.
+    const rotPostW = Math.abs(w0 * Math.cos(css)) + Math.abs(h0 * Math.sin(css))
+    const isThin = rotPostW <= 1.01
+    const tx = isThin ? -minX - 0.5 : -minX
+    const rotateStyle: Record<string, unknown> = {
+      display: 'inline-flex',
+      alignSelf: 'flex-start',
+      // inline-flex sits on baseline by default → ~18 css px Y offset inside an
+      // inline-block layout-wrap parent. `vertical-align: top` aligns the
+      // rotation box to the parent's content-top, matching figma's render.
+      verticalAlign: 'top',
+      transformOrigin: '0 0',
+      transform: `translate(${tx.toFixed(4)}px, ${(-minY).toFixed(4)}px) rotate(${-n.rotation}deg)`,
+    }
+    if (typeof n.width === 'number') rotateStyle.width = `${n.width}px`
+    if (typeof n.height === 'number') rotateStyle.height = `${n.height}px`
+    const open = f.createJsxOpeningElement(
+      f.createIdentifier('div'), undefined,
+      f.createJsxAttributes([
+        f.createJsxAttribute(f.createIdentifier('style'),
+          f.createJsxExpression(undefined, valueToExpr(rotateStyle))),
+      ]),
+    )
+    const close = f.createJsxClosingElement(f.createIdentifier('div'))
+    return f.createJsxElement(open, [wrapped], close)
+  }
+  return wrapped
+}
+
+function emitFrame(n: IRFrame, ctx: CodegenCtx, parent: ParentCtx = { dir: 'none', mainSizing: 'fixed' }): ts.JsxElement {
+  const parentDir = parent.dir
   const flexDir = n.layout.direction === 'none' ? null : n.layout.direction
   const styles: Record<string, unknown> = {}
-  if (flexDir) {
-    styles.display = 'flex'
-    styles.flexDirection = flexDir
-    if (n.layout.alignItems !== 'start') styles.alignItems = n.layout.alignItems
-    if (n.layout.justifyContent !== 'start') styles.justifyContent = n.layout.justifyContent
-    if (n.layout.gap) styles.gap = n.layout.gap
+  // FILL semantics depend on parent main-axis: same axis → flex:1; cross axis → alignSelf:stretch.
+  // BUT if parent's main-axis is HUG, "fill" along that axis is meaningless in figma
+  // (HUG sizes to content), so collapse to HUG behaviour (no flex:1) — matches figma render.
+  const fillStyle = (axis: 'h' | 'v'): 'main' | 'cross' | null => {
+    // No IR parent → assume the harness wrapper (boxWrapper) is row-flex.
+    // Root FILL-H → flex:1, FILL-V → alignSelf:stretch. This preserves figma's
+    // FILL semantic in CSS without baking the resolved pixel dim.
+    if (parentDir === 'none') return axis === 'h' ? 'main' : 'cross'
+    const parentMainIsH = parentDir === 'row'
+    const isMain = (axis === 'h' && parentMainIsH) || (axis === 'v' && !parentMainIsH)
+    if (isMain && parent.mainSizing === 'hug') return null
+    return isMain ? 'main' : 'cross'
   }
-  if (n.layout.paddingTop) styles.paddingTop = n.layout.paddingTop
-  if (n.layout.paddingRight) styles.paddingRight = n.layout.paddingRight
-  if (n.layout.paddingBottom) styles.paddingBottom = n.layout.paddingBottom
-  if (n.layout.paddingLeft) styles.paddingLeft = n.layout.paddingLeft
-  if (n.width !== undefined) styles.width = n.width
-  if (n.height !== undefined) styles.height = n.height
-  if (n.background) styles.background = n.background
-  if (n.borderRadius) styles.borderRadius = n.borderRadius
+  // Auto-layout containers map to panda's Flex (row) / Stack (column) / Box.
+  // Each pattern's intrinsic default matches its name — Flex defaults to
+  // flex-direction:row, Stack defaults to column. Skip emitting `direction`
+  // when it matches the pattern's default.
+  // Token-aware emission: when a styled property is bound to a figma variable,
+  // emit the panda token path (e.g. 'spacing.200', 'background.standard.primary')
+  // instead of raw px/hex. Resolves via ctx.tokenMap (figma var id → panda path).
+  const tids = n.tokenIds || {}
+  if (flexDir) {
+    // direction omitted: Flex pattern defaults to row, Stack to column —
+    // and we always pair (row→Flex, column→Stack), so the prop is redundant.
+    // Always emit align/justify — CSS flex default for align-items is `stretch`
+    // (NOT `start`), so omitting figma's `start` would leak `stretch` onto
+    // children that would otherwise be intrinsic-sized. Same risk for justify
+    // is smaller (default `start` matches figma's MIN), but emit for symmetry.
+    styles.align = n.layout.alignItems
+    styles.justify = n.layout.justifyContent
+    // Always emit gap (even when 0) — Stack pattern in panda has default
+    // gap='8px' which would silently apply when figma says 0.
+    styles.gap = resolveValue(n.layout.gap, tids.gap, ctx.tokenMap)
+  }
+  if (n.layout.paddingTop) styles.paddingTop = resolveValue(n.layout.paddingTop, tids.paddingTop, ctx.tokenMap)
+  if (n.layout.paddingRight) styles.paddingRight = resolveValue(n.layout.paddingRight, tids.paddingRight, ctx.tokenMap)
+  if (n.layout.paddingBottom) styles.paddingBottom = resolveValue(n.layout.paddingBottom, tids.paddingBottom, ctx.tokenMap)
+  if (n.layout.paddingLeft) styles.paddingLeft = resolveValue(n.layout.paddingLeft, tids.paddingLeft, ctx.tokenMap)
+  // FIXED → explicit figma resolved width/height (CSS default stretch != figma).
+  // FILL → flex:1 (main) or alignSelf:stretch (cross). HUG → omit (intrinsic).
+  // At root (parent.dir === 'none') there is no enclosing flex container in IR,
+  // but the test harness wraps with boxWrapper (inline-flex row). Treat the
+  // wrapper as a row-flex parent so FILL-H → flex:1, FILL-V → alignSelf:stretch.
+  // This keeps the generated JSX semantically responsive (no fixed-px regression).
+  if (n.layout.sizingH === 'fill') {
+    const r = fillStyle('h')
+    // `minWidth: 0` lets flex children shrink below their intrinsic min-content
+    // (figma's autolayout doesn't enforce min-content, but CSS flexbox defaults
+    // to `min-width: auto` which can push children to overflow their parent).
+    if (r === 'main') { styles.flex = 1; styles.minWidth = 0 }
+    else if (r === 'cross') { styles.alignSelf = 'stretch'; styles.minWidth = 0 }
+  } else if (n.layout.sizingH === 'fixed' && n.width !== undefined) {
+    styles.width = n.width
+  }
+  if (n.layout.sizingV === 'fill') {
+    const r = fillStyle('v')
+    if (r === 'main') { styles.flex = 1; styles.minHeight = 0 }
+    else if (r === 'cross') { styles.alignSelf = 'stretch'; styles.minHeight = 0 }
+  } else if (n.layout.sizingV === 'fixed' && n.height !== undefined) {
+    styles.height = n.height
+  }
+  if (n.background) styles.background = resolveValue(n.background, tids.background, ctx.tokenMap)
+  // figma cornerSmoothing > 0 → render the rounded shape via clip-path with
+  // figma-squircle's path. CSS `border-radius` is a circular arc; figma uses
+  // a G2-continuous (smoothed) corner that fades into the side gradually.
+  // For fixed-dim frames we can bake the path string at codegen time.
+  let squirclePath: string | undefined
+  if (n.borderRadius && n.cornerSmoothing && n.cornerSmoothing > 0
+      && typeof n.width === 'number' && typeof n.height === 'number') {
+    squirclePath = getSvgPath({
+      width: n.width, height: n.height,
+      cornerRadius: n.borderRadius, cornerSmoothing: n.cornerSmoothing,
+    }).replace(/\n/g, ' ').trim()
+    styles.clipPath = `path('${squirclePath}')`
+  } else if (n.borderRadius) {
+    styles.borderRadius = n.borderRadius
+  }
+  // Stroke. Two cases:
+  //   - non-squircle: use `inset boxShadow` (matches figma INSIDE alignment,
+  //     no layout perturbation since `border` would expand the box).
+  //   - squircle: clip-path cuts the inset shadow at the squircle edge, so
+  //     corners lose their stroke pixels. Render an absolute SVG overlay
+  //     with the same path stroked at 2× weight; clip-path clips the outer
+  //     half, leaving exactly `strokeWeight` px of stroke inside the squircle.
+  let strokeOverlay: ts.JsxChild | undefined
+  if (n.strokeColor && n.strokeWeight) {
+    if (squirclePath) {
+      styles.position = 'relative'
+      const overlayStyle = {
+        position: 'absolute', inset: 0,
+        width: '100%', height: '100%',
+        pointerEvents: 'none' as const,
+      }
+      strokeOverlay = f.createJsxElement(
+        f.createJsxOpeningElement(f.createIdentifier('svg'), undefined,
+          f.createJsxAttributes([
+            f.createJsxAttribute(f.createIdentifier('viewBox'),
+              f.createStringLiteral(`0 0 ${n.width} ${n.height}`)),
+            f.createJsxAttribute(f.createIdentifier('preserveAspectRatio'),
+              f.createStringLiteral('none')),
+            f.createJsxAttribute(f.createIdentifier('style'),
+              f.createJsxExpression(undefined, valueToExpr(overlayStyle))),
+          ])),
+        [f.createJsxSelfClosingElement(f.createIdentifier('path'), undefined,
+          f.createJsxAttributes([
+            f.createJsxAttribute(f.createIdentifier('d'), f.createStringLiteral(squirclePath)),
+            f.createJsxAttribute(f.createIdentifier('fill'), f.createStringLiteral('none')),
+            f.createJsxAttribute(f.createIdentifier('stroke'), f.createStringLiteral(n.strokeColor)),
+            f.createJsxAttribute(f.createIdentifier('strokeWidth'),
+              f.createJsxExpression(undefined, valueToExpr(n.strokeWeight * 2))),
+          ]))],
+        f.createJsxClosingElement(f.createIdentifier('svg')),
+      )
+    } else {
+      styles.boxShadow = `inset 0 0 0 ${n.strokeWeight}px ${n.strokeColor}`
+    }
+  }
+  if (n.clipsContent) styles.overflow = 'hidden'
+  if (n.children?.some((c) => c.absolute)) styles.position = 'relative'
 
-  const styleAttr = Object.keys(styles).length
-    ? [f.createJsxAttribute(f.createIdentifier('style'), f.createJsxExpression(undefined, valueToExpr(styles)))]
+  // Pick the panda pattern: Flex (row) / Stack (column) / Box (no flex).
+  // pattern's component name is tracked so we can emit the import.
+  const tag =
+    flexDir === 'row' ? 'Flex' :
+    flexDir === 'column' ? 'Stack' :
+    'Box'
+  ctx.usedJsxPatterns.add(tag)
+  const attrs = Object.keys(styles).length
+    ? attrsFromObject(pandaize(styles))
     : []
   const open = f.createJsxOpeningElement(
-    f.createIdentifier('div'), undefined, f.createJsxAttributes(styleAttr),
+    f.createIdentifier(tag), undefined, f.createJsxAttributes(attrs),
   )
-  const close = f.createJsxClosingElement(f.createIdentifier('div'))
-  const children = n.children.map((c) => emitNode(c, ctx))
+  const close = f.createJsxClosingElement(f.createIdentifier(tag))
+  // Build child parent ctx — main-axis sizing for this frame.
+  const mainSizing: 'fixed' | 'hug' | 'fill' = n.layout.direction === 'row' ? n.layout.sizingH
+    : n.layout.direction === 'column' ? n.layout.sizingV : 'fixed'
+  const childParent: ParentCtx = { dir: n.layout.direction, mainSizing }
+  const children = n.children.map((c) => emitNode(c, ctx, childParent))
+  if (strokeOverlay) children.push(strokeOverlay)
   return f.createJsxElement(open, children, close)
 }
 
-function emitText(n: IRText, ctx: CodegenCtx): ts.JsxElement {
+function emitText(n: IRText, ctx: CodegenCtx, parent: ParentCtx = { dir: 'none', mainSizing: 'fixed' }): ts.JsxElement {
+  const parentDir = parent.dir
   // If textStyleId matches a registered typography wrapper, use it.
   // The wrapper handles fontSize/lineHeight/weight/y-shift internally.
   // Live textStyleId format: "S:<hash>,<nodeSuffix>"; binding keys end in
   // ",", so binding key is a prefix of the live id.
   const wrapperName = n.textStyleId ? lookupTypoByPrefix(n.textStyleId, ctx.typographyMap) : undefined
+  // Only constrain width when figma forces wrap; HUG = omit so intrinsic governs.
+  // figma HUG text doesn't wrap (overflows parent if needed). Mirror that semantically.
+  const isHug = n.autoResize === 'hug'
+  // figma `paragraphSpacing`: distance between paragraphs (split by `\n`).
+  // For typography-wrapper path, the wrapper itself reads paragraphSpacing
+  // from `tokens/panda-tokens.ts` and emits per-paragraph blocks — we just
+  // pass the raw string. For the fallback (raw <span>) path, codegen handles
+  // the split here using `n.paragraphSpacing` from the IR.
+  const paragraphs = n.content.split('\n')
+  const needsParagraphBlocks = paragraphs.length > 1 && n.paragraphSpacing > 0
+  // sizingH=FILL on text (autolayout sibling growing to fill row) → flex:1 (main axis) or
+  // alignSelf:stretch (cross axis); explicit width breaks wrap behavior so omit it.
+  // figma FILL on main axis is meaningless if parent is HUG (parent sizes to content,
+  // so child has no space to grow into). Collapse to HUG so text uses intrinsic width.
+  const parentHugMain = parent.mainSizing === 'hug'
+  const fillMain = n.sizingH === 'fill' && parentDir === 'row' && !parentHugMain
+  const fillCross = n.sizingH === 'fill' && parentDir === 'column' && !parentHugMain
+  // When sizingH=FILL but parent is HUG, treat as intrinsic (no width). Otherwise honor n.width
+  // for FIXED autoResize. HUG autoResize never sets width.
+  const collapsedFill = n.sizingH === 'fill' && parentHugMain
+  const fixedWidth = !isHug && !fillMain && !fillCross && !collapsedFill ? n.width : undefined
   if (wrapperName) {
     ctx.usedTypography.add(wrapperName)
+    const attrs: ts.JsxAttributeLike[] = []
+    const wrapperStyles: Record<string, unknown> = {}
+    if (fixedWidth !== undefined) wrapperStyles.width = fixedWidth
+    if (fillMain) { wrapperStyles.flex = 1; wrapperStyles.minWidth = 0 }
+    if (fillCross) wrapperStyles.alignSelf = 'stretch'
+    // figma HUG: width = intrinsic max-content, parent overflows. CSS equivalent:
+    // whiteSpace:nowrap (don't soft-wrap) + flex-shrink:0 (don't shrink below natural).
+    // figma HUG: width = intrinsic max-content. `nowrap` prevents soft-wrap;
+    // explicit `<br/>` (see textChildren) still creates the figma-authored
+    // hard breaks regardless of nowrap.
+    if (isHug) { wrapperStyles.whiteSpace = 'nowrap'; wrapperStyles.flexShrink = 0 }
+    // Typography wrappers extend HTMLStyledProps<'span'>, so panda style props
+    // (color, bg, etc.) pass through `splitCssProps` and merge into className
+    // via css(). Prefer the bound token path (resolves to var(--colors-...))
+    // — falls back to raw hex/rgba when no figma variable is bound.
+    const colorTokenPath = n.colorTokenId ? ctx.tokenMap[n.colorTokenId] : undefined
+    if (colorTokenPath) {
+      attrs.push(f.createJsxAttribute(f.createIdentifier('color'),
+        f.createStringLiteral(colorTokenPath)))
+    } else if (n.color) {
+      wrapperStyles.color = n.color
+    }
+    // figma can override fontName.style on a TEXT instance independently of
+    // its bound textStyle (designer applies Bold on top of Body/Regular). The
+    // wrapper enforces the textStyle's weight, so we override inline when the
+    // IR's fontWeight diverges. Wrapper name suffix encodes its expected
+    // weight (Strong=700, Regular=500). Mismatch → inline override.
+    const expectedWeight = /Strong$/.test(wrapperName) ? 700 : 500
+    if (n.fontWeight !== expectedWeight) wrapperStyles.fontWeight = n.fontWeight
+    // figma's HUG width = ceil(advance) creates 0..1 css slack. textAlignHorizontal
+    // distributes that slack: LEFT→right, CENTER→half each side, RIGHT→left. Chromium
+    // default text-align: start (= LEFT) leaves slack on the right, mismatching figma's
+    // CENTER/RIGHT placement by slack/2 or slack css. Mirror figma's choice when not LEFT.
+    // JUSTIFIED on single-line falls back to start in CSS, matching figma's behavior.
+    if (n.textAlign && n.textAlign !== 'left' && n.textAlign !== 'justified') {
+      wrapperStyles.textAlign = n.textAlign
+    }
+    if (Object.keys(wrapperStyles).length) {
+      attrs.push(f.createJsxAttribute(f.createIdentifier('style'),
+        f.createJsxExpression(undefined, valueToExpr(wrapperStyles))))
+    }
     const open = f.createJsxOpeningElement(
-      f.createIdentifier(wrapperName), undefined, f.createJsxAttributes([]),
+      f.createIdentifier(wrapperName), undefined, f.createJsxAttributes(attrs),
     )
     const close = f.createJsxClosingElement(f.createIdentifier(wrapperName))
-    return f.createJsxElement(open, [f.createJsxText(n.content)], close)
+    // Pass raw string (with `\n`) to typography wrapper; wrapper handles
+    // paragraph splitting itself per design-system metadata. Use a template
+    // literal so non-ASCII characters (Korean, emoji, etc.) survive the TS
+    // printer's default \uXXXX escape behavior.
+    const child: ts.JsxChild = n.content.includes('\n')
+      ? f.createJsxExpression(undefined, f.createNoSubstitutionTemplateLiteral(n.content))
+      : f.createJsxText(n.content)
+    return f.createJsxElement(open, [child], close)
   }
   // Fallback: styled span (when textStyleId missing or unknown).
   const styles: Record<string, unknown> = {
     fontSize: n.fontSize,
     lineHeight: `${n.lineHeight}px`,
     fontWeight: n.fontWeight,
-    color: n.color,
+    color: resolveValue(n.color, n.colorTokenId, ctx.tokenMap),
   }
   if (n.textAlign) styles.textAlign = n.textAlign
+  if (fixedWidth !== undefined) styles.width = fixedWidth
+  if (fillMain) { styles.flex = 1; styles.minWidth = 0 }
+  if (fillCross) styles.alignSelf = 'stretch'
+  if (isHug) { styles.whiteSpace = 'nowrap'; styles.flexShrink = 0 }
   const open = f.createJsxOpeningElement(
     f.createIdentifier('span'), undefined,
-    f.createJsxAttributes([
-      f.createJsxAttribute(f.createIdentifier('style'),
-        f.createJsxExpression(undefined, valueToExpr(styles))),
-    ]),
+    f.createJsxAttributes([cssAttr(styles, ctx)]),
   )
   const close = f.createJsxClosingElement(f.createIdentifier('span'))
-  return f.createJsxElement(open, [f.createJsxText(n.content)], close)
+  return f.createJsxElement(open, paragraphChildren(n.content, n.paragraphSpacing), close)
+}
+
+/** Multi-paragraph block split with `marginBottom: paragraphSpacing` between
+ * paragraphs (no spacing on last). Single-paragraph content returns plain text. */
+function paragraphChildren(content: string, paragraphSpacing: number): ts.JsxChild[] {
+  const paragraphs = content.split('\n')
+  if (paragraphs.length <= 1 || paragraphSpacing <= 0) return textChildren(content)
+  return paragraphs.map((p, i) => {
+    const isLast = i === paragraphs.length - 1
+    const styles: Record<string, unknown> = {
+      display: 'block',
+      whiteSpace: 'inherit',
+      ...(isLast ? {} : { marginBottom: `${paragraphSpacing}px` }),
+    }
+    const open = f.createJsxOpeningElement(
+      f.createIdentifier('span'), undefined,
+      f.createJsxAttributes([
+        f.createJsxAttribute(f.createIdentifier('style'),
+          f.createJsxExpression(undefined, valueToExpr(styles))),
+      ]),
+    )
+    return f.createJsxElement(open, [f.createJsxText(p)],
+      f.createJsxClosingElement(f.createIdentifier('span')))
+  })
+}
+
+/**
+ * Convert figma `characters` to JSX children. Hard breaks (\n) become explicit
+ * `<br/>` so they survive HTML whitespace collapsing regardless of the
+ * surrounding white-space CSS — relying on `pre`/`pre-line` is fragile inside
+ * `inline-block + width: max-content(...)`.
+ */
+function textChildren(content: string): ts.JsxChild[] {
+  if (!content.includes('\n')) return [f.createJsxText(content)]
+  const out: ts.JsxChild[] = []
+  const parts = content.split('\n')
+  parts.forEach((p, i) => {
+    if (p) out.push(f.createJsxText(p))
+    if (i < parts.length - 1) {
+      out.push(f.createJsxSelfClosingElement(
+        f.createIdentifier('br'), undefined, f.createJsxAttributes([]),
+      ))
+    }
+  })
+  return out
 }
 
 function emitVector(n: IRVector): ts.JsxSelfClosingElement {
@@ -157,7 +483,121 @@ function emitVector(n: IRVector): ts.JsxSelfClosingElement {
   )
 }
 
+/**
+ * Emit a figma shape primitive as inline SVG. SVG preserves sub-pixel
+ * rasterization (HTML <div> snaps left-edge to integer css px in chromium —
+ * see SnapGridProbe). For shapes inside flex layouts that may end up at
+ * sub-pixel x positions (odd parity), this is the only way to match figma.
+ *
+ * Layout: outer <svg> takes flex slot of width×height; <rect>/<ellipse>/etc
+ * are at (0,0) within. Rotation handled via SVG transform attribute (figma
+ * CCW deg ↔ SVG rotate CW negative).
+ */
+function emitShape(n: IRShape, ctx: CodegenCtx, parent: ParentCtx = { dir: 'none', mainSizing: 'fixed' }): ts.JsxElement {
+  const { width: w, height: h } = n
+  // SVG `fill=` is a raw attribute — panda token paths like
+  // `content.standard.secondary` would not resolve. Use the raw hex/rgba.
+  const fill = n.fill ?? 'none'
+  const svgAttrs: Record<string, unknown> = {
+    width: w, height: h,
+    viewBox: `0 0 ${w} ${h}`,
+    style: { display: 'block', flexShrink: 0 },
+  }
+  // Compute child element attrs based on shape kind
+  let inner: ts.JsxChild
+  const innerAttrs: Record<string, unknown> = {}
+  if (fill !== 'none') innerAttrs.fill = fill
+  if (n.strokeColor) {
+    innerAttrs.stroke = n.strokeColor
+    innerAttrs['strokeWidth'] = n.strokeWeight ?? 1
+  }
+  // figma rotation: rotate around shape center (figma rotates around top-left
+  // of pre-rotation bounding box, but with absoluteBoundingBox already
+  // post-rotation in IR, we render at (0,0) and rotate within the box).
+  if (n.rotation && Math.abs(n.rotation) > 0.01) {
+    innerAttrs.transform = `rotate(${-n.rotation} ${w / 2} ${h / 2})`
+  }
+  if (n.shape === 'rect') {
+    if (n.borderRadius) { innerAttrs.rx = n.borderRadius; innerAttrs.ry = n.borderRadius }
+    inner = f.createJsxSelfClosingElement(
+      f.createIdentifier('rect'), undefined,
+      f.createJsxAttributes([
+        f.createJsxAttribute(f.createIdentifier('width'), f.createJsxExpression(undefined, valueToExpr(w))),
+        f.createJsxAttribute(f.createIdentifier('height'), f.createJsxExpression(undefined, valueToExpr(h))),
+        ...Object.entries(innerAttrs).map(([k, v]) =>
+          f.createJsxAttribute(f.createIdentifier(k), f.createJsxExpression(undefined, valueToExpr(v))),
+        ),
+      ]),
+    )
+  } else if (n.shape === 'ellipse') {
+    inner = f.createJsxSelfClosingElement(
+      f.createIdentifier('ellipse'), undefined,
+      f.createJsxAttributes([
+        f.createJsxAttribute(f.createIdentifier('cx'), f.createJsxExpression(undefined, valueToExpr(w / 2))),
+        f.createJsxAttribute(f.createIdentifier('cy'), f.createJsxExpression(undefined, valueToExpr(h / 2))),
+        f.createJsxAttribute(f.createIdentifier('rx'), f.createJsxExpression(undefined, valueToExpr(w / 2))),
+        f.createJsxAttribute(f.createIdentifier('ry'), f.createJsxExpression(undefined, valueToExpr(h / 2))),
+        ...Object.entries(innerAttrs).map(([k, v]) =>
+          f.createJsxAttribute(f.createIdentifier(k), f.createJsxExpression(undefined, valueToExpr(v))),
+        ),
+      ]),
+    )
+  } else {
+    // polygon/star/line — fallback to filled rect (will be a coarse approx)
+    inner = f.createJsxSelfClosingElement(
+      f.createIdentifier('rect'), undefined,
+      f.createJsxAttributes([
+        f.createJsxAttribute(f.createIdentifier('width'), f.createJsxExpression(undefined, valueToExpr(w))),
+        f.createJsxAttribute(f.createIdentifier('height'), f.createJsxExpression(undefined, valueToExpr(h))),
+        ...Object.entries(innerAttrs).map(([k, v]) =>
+          f.createJsxAttribute(f.createIdentifier(k), f.createJsxExpression(undefined, valueToExpr(v))),
+        ),
+      ]),
+    )
+  }
+  const open = f.createJsxOpeningElement(
+    f.createIdentifier('svg'), undefined,
+    f.createJsxAttributes(Object.entries(svgAttrs).map(([k, v]) =>
+      f.createJsxAttribute(f.createIdentifier(k), f.createJsxExpression(undefined, valueToExpr(v))),
+    )),
+  )
+  const close = f.createJsxClosingElement(f.createIdentifier('svg'))
+  return f.createJsxElement(open, [inner], close)
+}
+
+/** Inline figma vector export (GROUP/VECTOR/BOOLEAN_OPERATION) as an
+ * <img src="data:image/svg+xml;base64,...">. SVG keeps vector fidelity at
+ * any DPR; the data URL embedding keeps the generated component
+ * self-contained (no external asset dir to ship). */
+function emitImage(n: IRImage): ts.JsxSelfClosingElement {
+  const styles: Record<string, unknown> = { display: 'block', flexShrink: 0 }
+  return f.createJsxSelfClosingElement(
+    f.createIdentifier('img'), undefined,
+    f.createJsxAttributes([
+      f.createJsxAttribute(f.createIdentifier('src'),
+        f.createStringLiteral(n.dataUrl ?? '')),
+      f.createJsxAttribute(f.createIdentifier('width'),
+        f.createJsxExpression(undefined, valueToExpr(n.width))),
+      f.createJsxAttribute(f.createIdentifier('height'),
+        f.createJsxExpression(undefined, valueToExpr(n.height))),
+      f.createJsxAttribute(f.createIdentifier('alt'), f.createStringLiteral('')),
+      f.createJsxAttribute(f.createIdentifier('style'),
+        f.createJsxExpression(undefined, valueToExpr(styles))),
+    ]),
+  )
+}
+
 function emitUnknown(n: IRUnknown): ts.JsxSelfClosingElement {
+  // Zero-area unknowns (lines, hover-state placeholders) shouldn't perturb flex layout.
+  if (n.width === 0 || n.height === 0) {
+    return f.createJsxSelfClosingElement(
+      f.createIdentifier('div'), undefined,
+      f.createJsxAttributes([
+        f.createJsxAttribute(f.createIdentifier('style'),
+          f.createJsxExpression(undefined, valueToExpr({ display: 'none' }))),
+      ]),
+    )
+  }
   const styles = { width: n.width, height: n.height, background: '#f00' }
   return f.createJsxSelfClosingElement(
     f.createIdentifier('div'), undefined,
@@ -171,6 +611,73 @@ function emitUnknown(n: IRUnknown): ts.JsxSelfClosingElement {
 interface CodegenCtx {
   typographyMap: Record<string, string>
   usedTypography: Set<string>
+  /** Set when any emitted style is wrapped in `css({...})` — adds the panda
+   * import to the generated file. */
+  usesCss: boolean
+  /** Panda jsx patterns referenced (Flex, Stack, Box). One import per use. */
+  usedJsxPatterns: Set<string>
+  /** figma variable id → panda token path (e.g. "background.standard.primary"). */
+  tokenMap: Record<string, string>
+  /** DS-specific codegen extensions (Icon currentColor, etc.). Each plugin's
+   * `emitWrap` runs after the default JSX is built per node. */
+  plugins: import('../types.ts').CodegenPlugin[]
+}
+
+/** Wrap a JSX child in a `<span style={...}>`. Exposed to plugins via EmitContext. */
+function wrapWithStyle(jsx: ts.JsxChild, style: Record<string, unknown>): ts.JsxChild {
+  const open = f.createJsxOpeningElement(
+    f.createIdentifier('span'), undefined,
+    f.createJsxAttributes([
+      f.createJsxAttribute(f.createIdentifier('style'),
+        f.createJsxExpression(undefined, valueToExpr(style))),
+    ]),
+  )
+  return f.createJsxElement(open, [jsx],
+    f.createJsxClosingElement(f.createIdentifier('span')))
+}
+
+/** Token-or-px helper: when a figma variable id is bound, emit the panda
+ * token path. Otherwise emit `<n>px` (or pass-through string). */
+function resolveValue(rawValue: number | string | undefined, tokenId: string | undefined, tokenMap: Record<string, string>): string | number | undefined {
+  if (tokenId && tokenMap[tokenId]) return tokenMap[tokenId]
+  return rawValue
+}
+
+/**
+ * Numeric → '<n>px' string for properties that panda interprets as token
+ * references when given a bare number (spacing/sizing/radius/border). Other
+ * properties (flex, opacity, fontWeight, lineHeight when string) pass through.
+ */
+const PX_PROPS = new Set([
+  'gap', 'rowGap', 'columnGap',
+  'padding', 'paddingTop', 'paddingRight', 'paddingBottom', 'paddingLeft', 'paddingInline', 'paddingBlock',
+  'margin', 'marginTop', 'marginRight', 'marginBottom', 'marginLeft', 'marginInline', 'marginBlock',
+  'width', 'height', 'minWidth', 'minHeight', 'maxWidth', 'maxHeight',
+  'top', 'right', 'bottom', 'left', 'inset',
+  'borderRadius', 'borderTopLeftRadius', 'borderTopRightRadius', 'borderBottomLeftRadius', 'borderBottomRightRadius',
+  'borderWidth', 'borderTopWidth', 'borderRightWidth', 'borderBottomWidth', 'borderLeftWidth',
+  'fontSize',
+])
+function pandaize(styles: Record<string, unknown>): Record<string, unknown> {
+  const out: Record<string, unknown> = {}
+  for (const [k, v] of Object.entries(styles)) {
+    out[k] = typeof v === 'number' && PX_PROPS.has(k) ? `${v}px` : v
+  }
+  return out
+}
+
+/** Build `className={css({...})}` JSX attribute (panda CSS). */
+function cssAttr(styles: Record<string, unknown>, ctx: CodegenCtx): ts.JsxAttribute {
+  ctx.usesCss = true
+  const obj = pandaize(styles)
+  const call = f.createCallExpression(
+    f.createIdentifier('css'), undefined,
+    [valueToExpr(obj)],
+  )
+  return f.createJsxAttribute(
+    f.createIdentifier('className'),
+    f.createJsxExpression(undefined, call),
+  )
 }
 
 function lookupTypoByPrefix(liveId: string, map: Record<string, string>): string | undefined {
@@ -182,14 +689,77 @@ function lookupTypoByPrefix(liveId: string, map: Record<string, string>): string
   return undefined
 }
 
-function emitNode(n: IRNode, ctx: CodegenCtx): ts.JsxChild {
+interface ParentCtx {
+  dir: 'row' | 'column' | 'none'
+  /** Parent main-axis sizing — when 'hug', child FILL on main axis collapses to HUG (no flex:1) */
+  mainSizing: 'fixed' | 'hug' | 'fill'
+}
+
+function emitNode(n: IRNode, ctx: CodegenCtx, parent: ParentCtx = { dir: 'none', mainSizing: 'fixed' }): ts.JsxChild {
+  let jsx: ts.JsxChild
   switch (n.kind) {
-    case 'component': return emitComponent(n)
-    case 'frame': return emitFrame(n, ctx)
-    case 'text': return emitText(n, ctx)
-    case 'vector': return emitVector(n)
-    case 'unknown': return emitUnknown(n)
+    case 'component': jsx = emitComponent(n, parent); break
+    case 'frame': jsx = emitFrame(n, ctx, parent); break
+    case 'text': jsx = emitText(n, ctx, parent); break
+    case 'vector': jsx = emitVector(n); break
+    case 'shape': jsx = emitShape(n, ctx, parent); break
+    case 'image': jsx = emitImage(n); break
+    case 'unknown': jsx = emitUnknown(n); break
   }
+  // Plugin emitWrap chain — DS-specific wrapping (e.g. Icon currentColor).
+  // Runs BEFORE layout wrap so plugin spans sit between the component and
+  // its outer layout span.
+  if (ctx.plugins.length) {
+    const ectx = { parentDir: parent.dir, f, wrapWithStyle }
+    for (const p of ctx.plugins) {
+      if (p.emitWrap) jsx = p.emitWrap(n, jsx, ectx)
+    }
+  }
+  // Layout wrap — figma sizing → CSS flex (flex-shrink:0 for FIXED, flex:1 /
+  // alignSelf:stretch for FILL). Always the OUTERMOST layer so the parent
+  // flex container sees these layout properties directly. Only applies to
+  // component instances (frames already emit their own layout in styles).
+  // Components don't always honor a `width`/`height` prop (e.g. Divider uses
+  // width:100% to fill parent). Emit explicit dim on the wrapper span when
+  // the instance is FIXED so the inner component has a concrete bounding box.
+  if (n.kind === 'component' && parent.dir !== 'none') {
+    const ws: Record<string, unknown> = {}
+    if (n.sizingH === 'fixed' && n.sizingV === 'fixed') ws.flexShrink = 0
+    else if (n.sizingH === 'fill' && parent.dir === 'row') ws.flex = 1
+    else if (n.sizingV === 'fill' && parent.dir === 'column') ws.flex = 1
+    else if (n.sizingH === 'fill' && parent.dir === 'column') ws.alignSelf = 'stretch'
+    else if (n.sizingV === 'fill' && parent.dir === 'row') ws.alignSelf = 'stretch'
+    // Rotation-aware dim: figma autolayout uses the POST-rotation axis-aligned
+    // bounding box, but CSS `transform: rotate` doesn't affect layout flow.
+    // Compute the rotated bbox so the wrapper reserves the correct space:
+    //   rotW = |w cos θ| + |h sin θ|;  rotH = |w sin θ| + |h cos θ|
+    // For θ=0 → (w,h), θ=90 → (h,w), θ=45 → ((w+h)/√2, (w+h)/√2), generic θ
+    // gets the diagonal-projection dim figma uses.
+    const w = n.width, h = n.height
+    let rotW = w, rotH = h
+    if (typeof n.rotation === 'number' && Math.abs(n.rotation) > 0.01 && typeof w === 'number' && typeof h === 'number') {
+      const r = (n.rotation * Math.PI) / 180
+      const cs = Math.abs(Math.cos(r)), sn = Math.abs(Math.sin(r))
+      rotW = w * cs + h * sn
+      rotH = w * sn + h * cs
+      // Math.cos(π/2) = 6.12e-17 (not exactly 0) → for 90° rotation, w*cs leaks
+      // a 1.0000000000000016 instead of 1. Such sub-femto-pixel values become
+      // sub-pixel layout positions in chromium and shift downstream items.
+      // Round near-integer values to integer (within 1e-9 = nano-pixel).
+      const snap = (v: number) => Math.abs(v - Math.round(v)) < 1e-9 ? Math.round(v) : v
+      rotW = snap(rotW)
+      rotH = snap(rotH)
+    }
+    if (n.sizingH === 'fixed' && typeof rotW === 'number') ws.width = rotW
+    if (n.sizingV === 'fixed' && typeof rotH === 'number') ws.height = rotH
+    if (Object.keys(ws).length) {
+      // inline-block (not inline-flex) so an inner element with its own
+      // explicit width/height (e.g. a rotation wrap) isn't shrunk by a
+      // would-be flex container's main-axis sizing.
+      jsx = wrapWithStyle(jsx, { ...ws, display: 'inline-block' })
+    }
+  }
+  return jsx
 }
 
 function collectComponents(node: IRNode, set: Set<string>): void {
@@ -202,11 +772,18 @@ export function generate(
   root: IRNode,
   components: Component<unknown>[],
   typographyMap: Record<string, string> = {},
+  tokenMap: Record<string, string> = {},
+  plugins: import('../types.ts').CodegenPlugin[] = [],
 ): string {
   hydrate(root, components)
   const usedComponents = new Set<string>()
   collectComponents(root, usedComponents)
-  const ctx: CodegenCtx = { typographyMap, usedTypography: new Set() }
+  const ctx: CodegenCtx = {
+    typographyMap, usedTypography: new Set(),
+    usesCss: false, usedJsxPatterns: new Set(),
+    tokenMap,
+    plugins,
+  }
 
   const componentImports = [...usedComponents].sort().map((n) =>
     f.createImportDeclaration(undefined,
@@ -226,7 +803,20 @@ export function generate(
             f.createImportSpecifier(false, undefined, f.createIdentifier(n))))),
         f.createStringLiteral('../typography/index.tsx'))]
     : []
-  const importStatements = [...componentImports, ...typographyImports]
+  const cssImport = ctx.usesCss
+    ? [f.createImportDeclaration(undefined,
+        f.createImportClause(false, undefined,
+          f.createNamedImports([f.createImportSpecifier(false, undefined, f.createIdentifier('css'))])),
+        f.createStringLiteral('../../../styled-system/css'))]
+    : []
+  const jsxPatternImport = ctx.usedJsxPatterns.size > 0
+    ? [f.createImportDeclaration(undefined,
+        f.createImportClause(false, undefined,
+          f.createNamedImports([...ctx.usedJsxPatterns].sort().map((n) =>
+            f.createImportSpecifier(false, undefined, f.createIdentifier(n))))),
+        f.createStringLiteral('../../../styled-system/jsx'))]
+    : []
+  const importStatements = [...componentImports, ...typographyImports, ...cssImport, ...jsxPatternImport]
   const fcImport = f.createImportDeclaration(undefined,
     f.createImportClause(true, undefined,
       f.createNamedImports([f.createImportSpecifier(false, undefined, f.createIdentifier('FC'))])),
@@ -266,5 +856,12 @@ export function generate(
     ts.NodeFlags.None,
   )
   const printer = ts.createPrinter({ newLine: ts.NewLineKind.LineFeed })
-  return printer.printFile(sourceFile)
+  // TS printer escapes non-ASCII as \uXXXX. Restore so Korean/emoji content
+  // reads naturally in the generated source. Safe because the codegen never
+  // intentionally emits a `\u` escape sequence — all non-ASCII originates
+  // from figma `characters` which we want as raw glyphs.
+  return printer.printFile(sourceFile).replace(
+    /\\u([0-9a-fA-F]{4})/g,
+    (_, hex) => String.fromCharCode(parseInt(hex, 16)),
+  )
 }

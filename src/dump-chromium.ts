@@ -1,13 +1,21 @@
 /**
- * pixpec dump-chromium — renders DS impl via Vite + Chromium and screenshots
- * each case to PNG. Output: <root>/.pixpec-out/<ComponentName>/chromium/<case>.png
+ * pixpec dump-chromium — renders DS impl via an EXTERNAL Vite dev server +
+ * Chromium and screenshots each case to PNG.
+ * Output: <root>/.pixpec-out/<ComponentName>/chromium/<case>.png
  *
- * Chunks DOM to keep per-shot capture fast (page DOM size dominates cost).
+ * The Vite server is NOT started by this command — the user runs it
+ * separately (`pnpm dev` or the project's preferred script) with VR_TEST=1
+ * set so vite.config.ts swaps leaf components for their impl.vr-aligned
+ * variants (ADR-0024 sub-pixel parity). Decoupling avoids ~3-5s of vite cold
+ * start on every dump call, critical for breakdown loops.
+ *
+ * The dev server URL is read from `pixpec.toml` (`devServerUrl`) or the
+ * `PIXPEC_DEV_URL` env var, defaulting to `http://localhost:5180`.
+ *
  * Lib function + CLI entrypoint.
  */
 import { mkdir } from 'node:fs/promises'
 import { join, resolve } from 'node:path'
-import { createServer, type ViteDevServer } from 'vite'
 import type { Component } from './types.ts'
 import { Renderer } from './render.ts'
 import { loadConfig } from './init.ts'
@@ -15,22 +23,30 @@ import { loadConfig } from './init.ts'
 export interface DumpChromiumOptions {
   component: Component<unknown>
   outDir: string
-  projectRoot: string
+  /** Base URL of an externally-launched Vite dev server. Required. */
+  devUrl: string
   scale?: number
   verbose?: boolean
 }
 
 export async function dumpChromium(opts: DumpChromiumOptions): Promise<void> {
-  const { component: comp, outDir, projectRoot, scale, verbose } = opts
+  const { component: comp, outDir, devUrl, scale, verbose } = opts
   await mkdir(outDir, { recursive: true })
 
-  const server: ViteDevServer = await createServer({
-    root: projectRoot,
-    server: { port: 0 },
-    logLevel: 'warn',
-  })
-  await server.listen()
-  const baseUrl = server.resolvedUrls?.local[0]?.replace(/\/$/, '') ?? 'http://localhost'
+  // Probe the dev server up-front so the failure mode is a clear message
+  // ("vite not running") rather than a generic playwright timeout 60s later.
+  const baseUrl = devUrl.replace(/\/$/, '')
+  try {
+    const res = await fetch(baseUrl, { method: 'GET' })
+    if (!res.ok && res.status !== 404) throw new Error(`HTTP ${res.status}`)
+  } catch (e) {
+    throw new Error(
+      `dump-chromium: cannot reach dev server at ${baseUrl}\n` +
+      `  Start it first: VR_TEST=1 pnpm dev   (or your project's dev script)\n` +
+      `  Override URL via pixpec.toml \`devServerUrl\` or PIXPEC_DEV_URL env.\n` +
+      `  Underlying: ${(e as Error).message}`,
+    )
+  }
   const renderer = await Renderer.create()
   try {
     const CHUNK = comp.batchChunk ?? 500
@@ -89,7 +105,6 @@ export async function dumpChromium(opts: DumpChromiumOptions): Promise<void> {
     await Promise.all(Array.from({ length: Math.min(PARALLEL, chunks.length) }, worker))
   } finally {
     await renderer.close()
-    await server.close()
   }
 }
 
@@ -109,12 +124,15 @@ export async function runDumpChromium(componentName: string): Promise<void> {
     { cwd: root, stdio: 'inherit' },
   )
   const outDir = resolve(root, `.pixpec-out/${comp.name}/chromium`)
-  console.log(`[dump-chromium] ${comp.name}: ${comp.cases.length} cases → ${outDir}`)
+  const devUrl = process.env.PIXPEC_DEV_URL
+    ?? (cfg as { devServerUrl?: string }).devServerUrl
+    ?? 'http://localhost:5180'
+  console.log(`[dump-chromium] ${comp.name}: ${comp.cases.length} cases → ${outDir} (vite=${devUrl})`)
   const t0 = Date.now()
   await dumpChromium({
     component: comp,
     outDir,
-    projectRoot: root,
+    devUrl,
     scale: cfg.scale,
     verbose: true,
   })

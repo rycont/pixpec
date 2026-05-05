@@ -1,16 +1,23 @@
-//! pixpec-measure — raw HSB-Euclidean dE between two PNG dirs.
+//! pixpec-measure — pairwise CIEDE2000 (ΔE00) between two PNG dirs.
 //!
-//! Compares figma/<name>.png ↔ chromium/<name>.png pair-wise (matching basenames).
+//! Compares figma/<name>.png ↔ chromium/<name>.png (matching basenames).
 //! No alignment, no warp — assumes equal-size PNGs (verified upstream). Emits
-//! results.json {case, dE_hsb, dH, dS, dV, artifacts} in the input dir.
+//! results.json {case, dE00, dE00_mean, n_px, artifacts} in the input dir.
 //!
-//! HSB convention matches OpenCV: H∈[0,179], S∈[0,255], V∈[0,255]. Hue is
-//! circular (180° wrap) and weighted by min(saturation) so grayscale text
-//! contributes 0 to ΔH (only saturated-pixel hue mismatches count).
+//! ΔE00 (Sharma 2005) is the canonical perceptual color-difference metric.
+//! JNT (just-noticeable threshold) ≈ 1.0/pixel for trained observers.
 //!
 //! Usage:
-//!   pixpec-measure <component_dir>
+//!   pixpec-measure <component_dir> [--downsample <N>]
 //!     where component_dir contains figma/, chromium/
+//!
+//! Default: --downsample 8. Both PNGs are box-filtered 8→1 before measuring.
+//! Pixpec renders at 8x supersample by default (scale=8 in pixpec.toml); the
+//! 8→1 box average cancels per-rasterizer AA noise so dE00 reflects the
+//! perceived 1x output, not Skia-vs-figma sub-pixel disagreements.
+//!
+//! Pass --downsample 1 to compare PNGs at their stored resolution (debugging,
+//! or non-supersampled fixtures).
 
 use anyhow::{Context, Result, bail};
 use image::ImageReader;
@@ -23,24 +30,21 @@ use std::{env, fs};
 #[derive(Serialize)]
 struct Record {
     case: String,
-    #[serde(rename = "dE_hsb")]
-    de_hsb: f64,
-    #[serde(rename = "dH")]
-    d_h: f64,
-    #[serde(rename = "dS")]
-    d_s: f64,
-    #[serde(rename = "dV")]
-    d_v: f64,
-    /// Sum of CIE76 ΔE per pixel — perceptually uniform color difference.
-    /// Per-pixel ΔE = sqrt(ΔL² + Δa² + Δb²). 인지 임계값 ≈ 2.3/pixel.
-    #[serde(rename = "dE_lab")]
-    de_lab: f64,
-    /// Mean ΔE per pixel = de_lab / pixel_count. Sanity-check value.
-    #[serde(rename = "dE_lab_mean")]
-    de_lab_mean: f64,
-    /// Pixel count (for averaging downstream).
+    /// Sum of CIEDE2000 ΔE per pixel.
+    #[serde(rename = "dE00")]
+    de00: f64,
+    /// Max per-pixel ΔE00 — the canonical regression check. Ensures no single
+    /// pixel exceeds threshold. (Mean per-pixel is misleading: edge errors
+    /// average out across uniform regions.)
+    #[serde(rename = "dE00_max")]
+    de00_max: f64,
     #[serde(rename = "n_px")]
     n_px: usize,
+    /// Largest connected blob of pixels with ΔE00 > 5 (8-connectivity). Distinguishes
+    /// structural diff (a 30+ px blob from a misplaced icon) from anti-alias noise
+    /// (isolated pixels). Used by `breakdown` to pass small renderer differences
+    /// while catching layout/style regressions.
+    blob_max_size: usize,
     artifacts: Artifacts,
 }
 
@@ -53,11 +57,28 @@ struct Artifacts {
 
 fn main() -> Result<()> {
     let args: Vec<String> = env::args().collect();
-    if args.len() != 2 {
-        eprintln!("usage: {} <component_dir>", args[0]);
-        std::process::exit(2);
+    let mut base_arg: Option<String> = None;
+    let mut downsample: u32 = 8;
+    let mut i = 1;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--downsample" => {
+                i += 1;
+                downsample = args.get(i)
+                    .and_then(|s| s.parse().ok())
+                    .filter(|&n: &u32| n >= 1)
+                    .ok_or_else(|| anyhow::anyhow!("--downsample requires positive integer"))?;
+            }
+            other => {
+                if base_arg.is_some() { bail!("unexpected arg: {}", other); }
+                base_arg = Some(other.to_string());
+            }
+        }
+        i += 1;
     }
-    let base = PathBuf::from(&args[1]);
+    let base = PathBuf::from(base_arg.ok_or_else(|| anyhow::anyhow!(
+        "usage: pixpec-measure <component_dir> [--downsample <N>]"
+    ))?);
     let figma_dir = base.join("figma");
     let chrom_dir = base.join("chromium");
     if !figma_dir.is_dir() {
@@ -87,16 +108,13 @@ fn main() -> Result<()> {
         .map(|name| -> Result<Record> {
             let f = figma_dir.join(format!("{name}.png"));
             let c = chrom_dir.join(format!("{name}.png"));
-            let m = measure(&f, &c).with_context(|| format!("measure {name}"))?;
+            let m = measure(&f, &c, downsample).with_context(|| format!("measure {name}"))?;
             Ok(Record {
                 case: (*name).clone(),
-                de_hsb: m.combined,
-                d_h: m.dh,
-                d_s: m.ds,
-                d_v: m.dv,
-                de_lab: m.de_lab,
-                de_lab_mean: if m.n_px > 0 { m.de_lab / m.n_px as f64 } else { 0.0 },
+                de00: m.de00,
+                de00_max: m.de00_max,
                 n_px: m.n_px,
+                blob_max_size: m.blob_max_size,
                 artifacts: Artifacts {
                     figma: f,
                     impl_: c,
@@ -109,31 +127,24 @@ fn main() -> Result<()> {
     let out = base.join("results.json");
     fs::write(&out, serde_json::to_string_pretty(&records)?)?;
 
-    let mut hsb: Vec<f64> = records.iter().map(|r| r.de_hsb).collect();
-    let mut lab: Vec<f64> = records.iter().map(|r| r.de_lab).collect();
-    let mut lab_mean: Vec<f64> = records.iter().map(|r| r.de_lab_mean).collect();
-    hsb.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    lab.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    lab_mean.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let mut e00: Vec<f64> = records.iter().map(|r| r.de00).collect();
+    let mut e00_max: Vec<f64> = records.iter().map(|r| r.de00_max).collect();
+    e00.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    e00_max.sort_by(|a, b| a.partial_cmp(b).unwrap());
     let m = |v: &[f64]| (v[v.len() / 2], v[v.len() - 1], v.iter().sum::<f64>() / v.len() as f64);
-    let (h_med, h_max, h_mean) = m(&hsb);
-    let (l_med, l_max, l_mean) = m(&lab);
-    let (lm_med, lm_max, lm_mean) = m(&lab_mean);
+    let (e_med, e_max, e_mean) = m(&e00);
+    let (mx_med, mx_max, mx_mean) = m(&e00_max);
     eprintln!(
         "measured {} in {:.2}s ({:.1}/s)",
         records.len(), elapsed, records.len() as f64 / elapsed,
     );
     eprintln!(
-        "  HSB:        median={:.1} mean={:.1} max={:.1}",
-        h_med, h_mean, h_max,
+        "  ΔE00:        median={:.1} mean={:.1} max={:.1}  (sum per case)",
+        e_med, e_mean, e_max,
     );
     eprintln!(
-        "  Lab ΔE76:   median={:.1} mean={:.1} max={:.1}  (sum per case)",
-        l_med, l_mean, l_max,
-    );
-    eprintln!(
-        "  Lab mean/px: median={:.3} mean={:.3} max={:.3}  (perceptual: <1 invisible, >2.3 noticeable)",
-        lm_med, lm_mean, lm_max,
+        "  ΔE00 max/px:  median={:.2} mean={:.2} max={:.2}  (worst pixel — regression check)",
+        mx_med, mx_mean, mx_max,
     );
     eprintln!("→ {}", out.display());
     Ok(())
@@ -151,81 +162,144 @@ fn list_pngs(dir: &Path) -> Result<std::collections::HashSet<String>> {
     Ok(out)
 }
 
-struct Result4 {
-    dh: f64,
-    ds: f64,
-    dv: f64,
-    combined: f64,
-    de_lab: f64,
+struct Measurement {
+    de00: f64,
+    de00_max: f64,
     n_px: usize,
+    blob_max_size: usize,
 }
 
-fn measure(figma: &Path, chrom: &Path) -> Result<Result4> {
-    let f = load_rgb(figma)?;
-    let c = load_rgb(chrom)?;
-    if f.w != c.w || f.h != c.h {
+fn measure(figma: &Path, chrom: &Path, downsample: u32) -> Result<Measurement> {
+    // Composite alpha against white FIRST, then box-filter. Compose-then-avg
+    // is the perceptually-meaningful pipeline: each input pixel's contribution
+    // to its output cell equals what a viewer would see at that location.
+    let fa = load_rgba(figma)?;
+    let ca = load_rgba(chrom)?;
+    if fa.w != ca.w || fa.h != ca.h {
+        bail!("dim mismatch: figma {}x{} vs chrom {}x{}", fa.w, fa.h, ca.w, ca.h);
+    }
+    if downsample > 1 && (fa.w % downsample != 0 || fa.h % downsample != 0) {
         bail!(
-            "dim mismatch: figma {}x{} vs chrom {}x{}",
-            f.w,
-            f.h,
-            c.w,
-            c.h
+            "downsample {} does not divide image {}x{}",
+            downsample, fa.w, fa.h
         );
     }
-    let f_hsv = rgb_to_hsv(&f.data);
-    let c_hsv = rgb_to_hsv(&c.data);
+    let f = composite_and_downsample(&fa, downsample);
+    let c = composite_and_downsample(&ca, downsample);
     let f_lab = rgb_to_lab(&f.data);
     let c_lab = rgb_to_lab(&c.data);
-    let mut dh = 0.0_f64;
-    let mut ds = 0.0_f64;
-    let mut dv = 0.0_f64;
-    let mut comb = 0.0_f64;
-    let mut de_lab_sum = 0.0_f64;
-    let n = (f.w * f.h) as usize;
+    let w = f.w as usize;
+    let h = f.h as usize;
+    let n = w * h;
+    let mut de00_sum = 0.0_f64;
+    let mut de00_max = 0.0_f64;
+    // Per-pixel ΔE00 array (kept for blob analysis below — small at 1x scale).
+    let mut de = vec![0.0_f32; n];
     for i in 0..n {
-        // HSV — kept for backward compat with existing models.
-        let bh = f_hsv[i * 3] as i32;
-        let bs = f_hsv[i * 3 + 1] as i32;
-        let bv = f_hsv[i * 3 + 2] as i32;
-        let ih = c_hsv[i * 3] as i32;
-        let is_ = c_hsv[i * 3 + 1] as i32;
-        let iv = c_hsv[i * 3 + 2] as i32;
-        let mut dhv = (bh - ih).abs();
-        if dhv > 90 {
-            dhv = 180 - dhv;
-        }
-        let dhn = dhv as f64 / 180.0;
-        let dsn = (bs - is_).abs() as f64 / 255.0;
-        let dvn = (bv - iv).abs() as f64 / 255.0;
-        let sat_min = bs.min(is_) as f64 / 255.0;
-        let dhw = dhn * sat_min;
-        dh += dhw;
-        ds += dsn;
-        dv += dvn;
-        comb += (dhw * dhw + dsn * dsn + dvn * dvn).sqrt();
-
-        // Lab CIE76 ΔE — perceptually uniform.
-        let dl = f_lab[i * 3] - c_lab[i * 3];
-        let da = f_lab[i * 3 + 1] - c_lab[i * 3 + 1];
-        let db = f_lab[i * 3 + 2] - c_lab[i * 3 + 2];
-        de_lab_sum += ((dl * dl + da * da + db * db).sqrt()) as f64;
+        let l1 = f_lab[i * 3] as f64;
+        let a1 = f_lab[i * 3 + 1] as f64;
+        let b1 = f_lab[i * 3 + 2] as f64;
+        let l2 = c_lab[i * 3] as f64;
+        let a2 = c_lab[i * 3 + 1] as f64;
+        let b2 = c_lab[i * 3 + 2] as f64;
+        let d = ciede2000(l1, a1, b1, l2, a2, b2);
+        de00_sum += d;
+        if d > de00_max { de00_max = d; }
+        de[i] = d as f32;
     }
-    Ok(Result4 {
-        dh,
-        ds,
-        dv,
-        combined: comb,
-        de_lab: de_lab_sum,
-        n_px: n,
-    })
+    // Largest connected blob of pixels with ΔE00 > BLOB_THRESHOLD. 8-connectivity
+    // (diagonal neighbors count). Used by the breakdown harness to distinguish
+    // structural mismatches (clustered residual) from anti-alias noise (isolated
+    // pixels). A high `de00_max` from one stray pixel is rendering noise; the
+    // same `de00_max` clustered into a 9+ pixel blob is a real layout/style bug.
+    let blob_threshold: f32 = std::env::var("PIXPEC_BLOB_THRESHOLD")
+        .ok().and_then(|s| s.parse().ok()).unwrap_or(5.0);
+    let mut visited = vec![false; n];
+    let mut max_blob = 0usize;
+    let mut stack = Vec::with_capacity(n);
+    for start in 0..n {
+        if visited[start] || de[start] <= blob_threshold { continue; }
+        stack.clear();
+        stack.push(start);
+        visited[start] = true;
+        let mut count = 0usize;
+        while let Some(idx) = stack.pop() {
+            count += 1;
+            let x = (idx % w) as i32;
+            let y = (idx / w) as i32;
+            for dy in -1..=1 {
+                for dx in -1..=1 {
+                    if dx == 0 && dy == 0 { continue; }
+                    let nx = x + dx; let ny = y + dy;
+                    if nx < 0 || ny < 0 || nx >= w as i32 || ny >= h as i32 { continue; }
+                    let ni = ny as usize * w + nx as usize;
+                    if visited[ni] || de[ni] <= blob_threshold { continue; }
+                    visited[ni] = true;
+                    stack.push(ni);
+                }
+            }
+        }
+        if count > max_blob { max_blob = count; }
+    }
+    Ok(Measurement { de00: de00_sum, de00_max, n_px: n, blob_max_size: max_blob })
 }
 
-/// sRGB(0..255) → CIE Lab (D65 white). Returns flat `[L, a, b, L, a, b, ...]`
-/// as f32 (per-pixel triple, NOT byte). L ∈ [0, 100], a/b ∈ ~[-128, 127].
+/// CIEDE2000 (ΔE00) — Sharma 2005 implementation. Inputs in CIE Lab (D65).
+/// kL = kC = kH = 1 (default).
+fn ciede2000(l1: f64, a1: f64, b1: f64, l2: f64, a2: f64, b2: f64) -> f64 {
+    let c1 = (a1 * a1 + b1 * b1).sqrt();
+    let c2 = (a2 * a2 + b2 * b2).sqrt();
+    let c_bar = 0.5 * (c1 + c2);
+    let c_bar7 = c_bar.powi(7);
+    let g = 0.5 * (1.0 - (c_bar7 / (c_bar7 + 25f64.powi(7))).sqrt());
+    let a1p = (1.0 + g) * a1;
+    let a2p = (1.0 + g) * a2;
+    let c1p = (a1p * a1p + b1 * b1).sqrt();
+    let c2p = (a2p * a2p + b2 * b2).sqrt();
+    let h1p = atan2_deg(b1, a1p);
+    let h2p = atan2_deg(b2, a2p);
+    let dlp = l2 - l1;
+    let dcp = c2p - c1p;
+    let dhp_raw = if c1p * c2p == 0.0 { 0.0 } else {
+        let d = h2p - h1p;
+        if d > 180.0 { d - 360.0 } else if d < -180.0 { d + 360.0 } else { d }
+    };
+    let dhp = 2.0 * (c1p * c2p).sqrt() * (dhp_raw.to_radians() / 2.0).sin();
+    let l_bar_p = 0.5 * (l1 + l2);
+    let c_bar_p = 0.5 * (c1p + c2p);
+    let h_bar_p = if c1p * c2p == 0.0 { h1p + h2p } else {
+        let d = (h1p - h2p).abs();
+        if d <= 180.0 { 0.5 * (h1p + h2p) }
+        else if h1p + h2p < 360.0 { 0.5 * (h1p + h2p + 360.0) }
+        else { 0.5 * (h1p + h2p - 360.0) }
+    };
+    let t = 1.0
+        - 0.17 * (h_bar_p - 30.0).to_radians().cos()
+        + 0.24 * (2.0 * h_bar_p).to_radians().cos()
+        + 0.32 * (3.0 * h_bar_p + 6.0).to_radians().cos()
+        - 0.20 * (4.0 * h_bar_p - 63.0).to_radians().cos();
+    let dtheta = 30.0 * (-((h_bar_p - 275.0) / 25.0).powi(2)).exp();
+    let c_bar_p7 = c_bar_p.powi(7);
+    let rc = 2.0 * (c_bar_p7 / (c_bar_p7 + 25f64.powi(7))).sqrt();
+    let sl = 1.0 + (0.015 * (l_bar_p - 50.0).powi(2)) / (20.0 + (l_bar_p - 50.0).powi(2)).sqrt();
+    let sc = 1.0 + 0.045 * c_bar_p;
+    let sh = 1.0 + 0.015 * c_bar_p * t;
+    let rt = -(2.0 * dtheta).to_radians().sin() * rc;
+    let term_l = dlp / sl;
+    let term_c = dcp / sc;
+    let term_h = dhp / sh;
+    (term_l * term_l + term_c * term_c + term_h * term_h + rt * term_c * term_h).max(0.0).sqrt()
+}
+
+fn atan2_deg(y: f64, x: f64) -> f64 {
+    let r = y.atan2(x).to_degrees();
+    if r < 0.0 { r + 360.0 } else { r }
+}
+
+/// sRGB(0..255) → CIE Lab (D65 white).
 fn rgb_to_lab(rgb: &[u8]) -> Vec<f32> {
     let n = rgb.len() / 3;
     let mut out = vec![0.0_f32; n * 3];
-    // D65 reference white
     const XN: f32 = 95.047;
     const YN: f32 = 100.000;
     const ZN: f32 = 108.883;
@@ -243,7 +317,6 @@ fn rgb_to_lab(rgb: &[u8]) -> Vec<f32> {
         let r = srgb_to_linear(rgb[i * 3]);
         let g = srgb_to_linear(rgb[i * 3 + 1]);
         let b = srgb_to_linear(rgb[i * 3 + 2]);
-        // sRGB D65 → XYZ matrix (× 100 since linear ∈ [0,1] gives XYZ relative to white)
         let x = (0.4124564 * r + 0.3575761 * g + 0.1804375 * b) * 100.0;
         let y = (0.2126729 * r + 0.7151522 * g + 0.0721750 * b) * 100.0;
         let z = (0.0193339 * r + 0.1191920 * g + 0.9503041 * b) * 100.0;
@@ -263,61 +336,56 @@ struct Rgb {
     h: u32,
 }
 
-fn load_rgb(path: &Path) -> Result<Rgb> {
+struct Rgba {
+    data: Vec<u8>,
+    w: u32,
+    h: u32,
+}
+
+fn load_rgba(path: &Path) -> Result<Rgba> {
     let img = ImageReader::open(path)
         .with_context(|| format!("open {}", path.display()))?
         .decode()
         .with_context(|| format!("decode {}", path.display()))?;
     let (w, h) = (img.width(), img.height());
     let rgba = img.to_rgba8();
-    let mut rgb = Vec::with_capacity((w * h * 3) as usize);
-    for p in rgba.pixels() {
-        let [r, g, b, a] = p.0;
-        let af = a as f32 / 255.0;
-        let blend = |c: u8| -> u8 {
-            let v = c as f32 * af + 255.0 * (1.0 - af);
-            v.clamp(0.0, 255.0) as u8
-        };
-        rgb.push(blend(r));
-        rgb.push(blend(g));
-        rgb.push(blend(b));
-    }
-    Ok(Rgb { data: rgb, w, h })
+    Ok(Rgba { data: rgba.into_raw(), w, h })
 }
 
-/// RGB → HSV using OpenCV's 8-bit convention (H∈[0,179], S∈[0,255], V∈[0,255]).
-fn rgb_to_hsv(rgb: &[u8]) -> Vec<u8> {
-    let n = rgb.len() / 3;
-    let mut out = vec![0u8; n * 3];
-    for i in 0..n {
-        let r = rgb[i * 3] as f32;
-        let g = rgb[i * 3 + 1] as f32;
-        let b = rgb[i * 3 + 2] as f32;
-        let max = r.max(g).max(b);
-        let min = r.min(g).min(b);
-        let delta = max - min;
-        let v = max;
-        let s = if max > 0.0 { delta / max * 255.0 } else { 0.0 };
-        let mut h = if delta == 0.0 {
-            0.0
-        } else if max == r {
-            60.0 * rem_euclid_f32((g - b) / delta, 6.0)
-        } else if max == g {
-            60.0 * ((b - r) / delta + 2.0)
-        } else {
-            60.0 * ((r - g) / delta + 4.0)
-        };
-        if h < 0.0 {
-            h += 360.0;
+/// Composite-and-box-filter in one pass. Each input pixel is composited
+/// against white in f32, then averaged within an f×f cell, with a single
+/// round-to-u8 at the end. Avoids the double-rounding that compose-then-
+/// box-then-round causes (~0.2 dE00 on tight comparisons). With f=1 this
+/// degenerates to plain composite_white.
+fn composite_and_downsample(src: &Rgba, f: u32) -> Rgb {
+    if f > 1 {
+        assert!(src.w % f == 0 && src.h % f == 0);
+    }
+    let nw = src.w / f.max(1);
+    let nh = src.h / f.max(1);
+    let f2 = (f.max(1) * f.max(1)) as f32;
+    let mut out = vec![0u8; (nw * nh * 3) as usize];
+    for oy in 0..nh {
+        for ox in 0..nw {
+            let mut s = [0f32; 3];
+            for dy in 0..f.max(1) {
+                for dx in 0..f.max(1) {
+                    let sx = ox * f.max(1) + dx;
+                    let sy = oy * f.max(1) + dy;
+                    let i = ((sy * src.w + sx) * 4) as usize;
+                    let af = src.data[i + 3] as f32 / 255.0;
+                    let one_m = 1.0 - af;
+                    s[0] += src.data[i] as f32 * af + 255.0 * one_m;
+                    s[1] += src.data[i + 1] as f32 * af + 255.0 * one_m;
+                    s[2] += src.data[i + 2] as f32 * af + 255.0 * one_m;
+                }
+            }
+            let oi = ((oy * nw + ox) * 3) as usize;
+            for c in 0..3 {
+                out[oi + c] = (s[c] / f2).round().clamp(0.0, 255.0) as u8;
+            }
         }
-        out[i * 3] = (h / 2.0).round() as u8;
-        out[i * 3 + 1] = s.round().clamp(0.0, 255.0) as u8;
-        out[i * 3 + 2] = v.round().clamp(0.0, 255.0) as u8;
     }
-    out
+    Rgb { data: out, w: nw, h: nh }
 }
 
-fn rem_euclid_f32(a: f32, m: f32) -> f32 {
-    let r = a % m;
-    if r < 0.0 { r + m } else { r }
-}

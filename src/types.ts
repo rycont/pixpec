@@ -1,4 +1,26 @@
 /**
+ * Branded numeric type for CIEDE2000 ΔE values. The `__dE00` brand makes
+ * `DE00` and `number` non-interchangeable at the type level — author can't
+ * accidentally return a raw number from a noise function or compare a
+ * dE_lab/dE_hsb scalar against a dE00 threshold.
+ *
+ *   const t = dE00(15.5)              // OK
+ *   const t: DE00 = 15.5              // type error
+ *   noise: () => 15.5                 // type error (must return DE00)
+ *   noise: () => dE00(15.5)           // OK
+ *
+ * Runtime: zero overhead — `dE00(x)` is just an identity cast. The brand is
+ * compile-time only.
+ */
+declare const dE00Brand: unique symbol
+export type DE00 = number & { readonly [dE00Brand]: never }
+
+/** Constructor — narrows a raw number into a branded DE00. */
+export function dE00(x: number): DE00 {
+  return x as DE00
+}
+
+/**
  * pixpec types — the contract between framework and DS packages.
  *
  * A Component is metadata only: `{ name, cases, noise }`. Nothing more.
@@ -20,7 +42,7 @@
  * Conceptually: "what's the largest dE this case can produce while still
  * being a faithful render?"
  */
-export type NoiseFn<P> = (props: P) => number
+export type NoiseFn<P> = (props: P) => DE00
 
 /**
  * One verifiable instance of a component: a props value paired with the
@@ -35,21 +57,20 @@ export interface Case<P> {
   fileKey: string
   nodeId: string
   /**
-   * Optional fixed-size wrapper around the impl. Eliminates dim mismatch
-   * between figma frame width and chromium calc-size width — the two
-   * renderers' "hug-content" algorithms diverge at sub-pixel level
-   * occasionally, but if both are rendered into a known fixed-size box,
-   * dim parity is guaranteed and only inner ink differs.
+   * Optional React component that wraps the impl during render. Owns all
+   * styling concerns (dim, padding, bg, color, layout) so the harness/type
+   * system doesn't need to know every CSS property. Harness puts `data-case`
+   * on an outer div around the wrapper, so the screenshot region = wrapper bounds.
    *
-   *   width/height — outer box dim in css px (must match figma frame post-padding)
-   *   padding      — inner padding in css px (default 4)
-   *   bg           — wrapper background (default white)
+   *   import type { ComponentType, ReactNode } from 'react'
+   *   wrapper: ({ children }) => <div style={{...}}>{children}</div>
    *
-   * Figma seed must wrap text/component in an auto-layout frame with the
-   * same padding so figma's frame.width = inner_content + 2*padding.
-   * Then this width is captured into `wrapper.width`.
+   * Use to:
+   *   - lock dim (figma frame size in CSS px, no sub-pixel hug variance)
+   *   - apply parent CSS context (color for currentColor SVGs, font, etc.)
+   *   - simulate consumer environment (e.g., flex parent direction)
    */
-  wrapper?: { width: number; height: number; padding?: number; bg?: string }
+  wrapper?: import('react').ComponentType<{ children: import('react').ReactNode }>
 }
 
 /**
@@ -87,6 +108,23 @@ export interface Component<P> {
    * them to <Component {...fromInstance(raw)} /> JSX.
    */
   figma?: FigmaBinding<P>
+  /**
+   * Effective default props for this component. Single source of truth for
+   * BOTH:
+   *   1. Runtime: the component's impl spreads `defaults` over incoming props
+   *      so omitted keys fall back here.
+   *   2. Codegen: the generator elides any prop on an instance whose value
+   *      equals `defaults[key]` — keeping the generated JSX terse.
+   *
+   * Without `defaults` declared, the generator emits all fromInstance props
+   * verbatim (no elision) — safe fallback for un-migrated components.
+   *
+   * Recommended source: `figmaDefaults(componentSetKey)` from the design-
+   * system's tokens pipeline, plus any JS-only props (e.g. `height: 24`)
+   * and exposed-instance props (e.g. `Icon: { Type: 'default' }`) that the
+   * impl needs to render correctly when the prop is omitted.
+   */
+  defaults?: Partial<P>
 }
 
 /**
@@ -106,6 +144,14 @@ export interface FigmaInstanceRaw {
     mainComponentName: string
     props: Record<string, string | boolean>
   }>
+  /** Figma node-set defaults (componentPropertyDefinitions). Available for
+   * fromInstance to compare against and decide which props to emit. */
+  defaults?: Record<string, unknown>
+  /** Resolved instance dim. Differs from master when the instance was resized
+   * (e.g., 24×24 Icon master used at 20×20). Lets fromInstance pass the
+   * actual rendered size as a prop. */
+  width?: number
+  height?: number
 }
 
 export interface FigmaBinding<P> {
@@ -119,25 +165,74 @@ export function defineComponent<P>(c: Component<P>): Component<P> {
   return c
 }
 
+/**
+ * Codegen plugin — extension point for design-system-specific quirks that
+ * shouldn't live in the pixpec core (e.g. "Icon uses currentColor so its
+ * parent's CSS color must be set"). Plugins hook into the walker (via raw
+ * JS injected into the cfigma exec script) and the codegen (via post-emit
+ * JSX wrapping). Loaded from `pixpec.config.ts` in the project root.
+ */
+export interface CodegenPlugin {
+  /** Stable name for logs and debugging. */
+  name: string
+  /**
+   * Raw JS source spliced into the walker's plugin script (cfigma exec
+   * context — running INSIDE figma plugin). Has `node` (current FigmaNode)
+   * and `ir` (the IR object being built for this node) in scope. Mutate
+   * `ir` to attach extra fields. Runs after pixpec's built-in extraction.
+   *
+   *   walkExtend: `
+   *     if (node.type === 'INSTANCE') {
+   *       const fill = findFirstSolidFill(node);
+   *       if (fill) ir.effectiveFill = rgbaHex(fill.color, fill.opacity);
+   *     }
+   *   `
+   */
+  walkExtend?: string
+  /**
+   * Codegen hook — called once per emitted IR node (frame/component/text/etc.)
+   * AFTER the default JSX is built. Return a replacement JSX (typically a
+   * wrapping span) to alter, or the input unchanged to pass through.
+   *
+   * The TypeScript factory `f` and helper to build a styled span wrapper
+   * `wrapWithStyle(jsx, style)` are exposed via the context.
+   */
+  emitWrap?: (
+    n: import('./generator/ir.ts').IRNode,
+    jsx: import('typescript').JsxChild,
+    ctx: EmitContext,
+  ) => import('typescript').JsxChild
+}
+
+export interface EmitContext {
+  parentDir: 'row' | 'column' | 'none'
+  /** TypeScript factory — for plugins that need to build AST nodes. */
+  f: typeof import('typescript').factory
+  /** Convenience: wrap an existing JSX element in a `<span style={{...}}>`. */
+  wrapWithStyle: (
+    jsx: import('typescript').JsxChild,
+    style: Record<string, unknown>,
+  ) => import('typescript').JsxChild
+}
+
 /** Result for one (component, case) verification. */
 export interface CaseResult {
   component: string
   case: string
-  actualDE: number
-  /** Per-axis HSV breakdown of the residual that summed into actualDE. */
-  axis: { dH: number; dS: number; dV: number }
+  /** Measured ΔE00 (sum per case). */
+  actualDE: DE00
   /** PASS threshold = noise(props). actualDE <= threshold → pass. */
-  threshold: number
+  threshold: DE00
   pass: boolean
-  /** Paths to the rendered PNGs, for debug RGG generation if FAIL. */
+  /** Paths to the rendered PNGs, for debug visualization if FAIL. */
   artifacts: { figma: string; impl: string }
 }
 
 /**
  * Pluggable metric. Receives RGB buffers (HxWx3 uint8) for both sides;
- * returns a single dE scalar. pixpec ships an HSB default in `measure.ts`.
+ * returns a ΔE00 scalar.
  */
 export type Metric = (
   figma: { width: number; height: number; data: Buffer },
   impl: { width: number; height: number; data: Buffer },
-) => Promise<number> | number
+) => Promise<DE00> | DE00

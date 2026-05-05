@@ -17,7 +17,7 @@ import { loadConfig } from './init.ts'
 
 interface MeasureRecord {
   case: string
-  dE_hsb: number
+  dE00: number
   artifacts: { figma: string; impl: string }
 }
 
@@ -34,7 +34,7 @@ async function main() {
   const baseDir = resolve(root, `.pixpec-out/${componentName}`)
   const resultsPath = join(baseDir, 'results.json')
   const records = JSON.parse(await readFile(resultsPath, 'utf8')) as MeasureRecord[]
-  const top = [...records].sort((a, b) => b.dE_hsb - a.dE_hsb).slice(0, topN)
+  const top = [...records].sort((a, b) => b.dE00 - a.dE00).slice(0, topN)
   console.log(`[rgg] ${componentName}: top-${top.length} of ${records.length}`)
   for (const r of top) {
     const rggDir = join(baseDir, 'rgg', r.case)
@@ -43,7 +43,7 @@ async function main() {
       shiftX: 0,
       shiftY: 0,
     })
-    console.log(`  ${r.case}  dE=${r.dE_hsb.toFixed(1)}`)
+    console.log(`  ${r.case}  ΔE00=${r.dE00.toFixed(1)}`)
   }
 }
 
