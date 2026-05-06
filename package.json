@@ -22,12 +22,14 @@
   "dependencies": {
     "@playwright/test": "^1.48.0",
     "@techstark/opencv-js": "^4.12.0-release.1",
+    "@types/ws": "^8.18.1",
     "@vitejs/plugin-react": "^6.0.1",
     "figma-squircle": "^1.1.0",
     "prettier": "^3.8.3",
     "sharp": "^0.33.5",
     "smol-toml": "^1.6.1",
-    "vite": "^8.0.10"
+    "vite": "^8.0.10",
+    "ws": "^8.20.0"
   },
   "devDependencies": {
     "@types/node": "^20.0.0",
