@@ -280,14 +280,22 @@ function emitFrame(n: IRFrame, ctx: CodegenCtx, parent: ParentCtx = { dir: 'none
   // figma-squircle's path. CSS `border-radius` is a circular arc; figma uses
   // a G2-continuous (smoothed) corner that fades into the side gradually.
   // For fixed-dim frames we can bake the path string at codegen time.
+  //
+  // CSS `clip-path: path(...)` uses px coordinates — when verify-mode scales
+  // the box via html font-size, the px-coord path no longer covers the full
+  // scaled box. Emit a per-frame SVG <clipPath clipPathUnits="objectBoundingBox">
+  // whose path is normalized to 0..1, then reference via clip-path: url(#id).
+  // SVG clipPath auto-scales to the box dim regardless of html font-size.
   let squirclePath: string | undefined
+  let squircleClipId: string | undefined
   if (n.borderRadius && n.cornerSmoothing && n.cornerSmoothing > 0
       && typeof n.width === 'number' && typeof n.height === 'number') {
     squirclePath = getSvgPath({
       width: n.width, height: n.height,
       cornerRadius: n.borderRadius, cornerSmoothing: n.cornerSmoothing,
     }).replace(/\n/g, ' ').trim()
-    styles.clipPath = `path('${squirclePath}')`
+    squircleClipId = `pxp-clip-${n.figmaId.replace(/[^A-Za-z0-9]/g, '_')}`
+    styles.clipPath = `url(#${squircleClipId})`
   } else if (n.borderRadius) {
     styles.borderRadius = n.borderRadius
   }
@@ -354,6 +362,40 @@ function emitFrame(n: IRFrame, ctx: CodegenCtx, parent: ParentCtx = { dir: 'none
   const childParent: ParentCtx = { dir: n.layout.direction, mainSizing }
   const children = n.children.map((c) => emitNode(c, ctx, childParent))
   if (strokeOverlay) children.push(strokeOverlay)
+  // Inject SVG <defs><clipPath> for squircle (objectBoundingBox so it scales
+  // with the box dim regardless of html font-size).
+  if (squircleClipId && squirclePath && typeof n.width === 'number' && typeof n.height === 'number') {
+    const clipDef = f.createJsxElement(
+      f.createJsxOpeningElement(f.createIdentifier('svg'), undefined,
+        f.createJsxAttributes([
+          f.createJsxAttribute(f.createIdentifier('width'), f.createStringLiteral('0')),
+          f.createJsxAttribute(f.createIdentifier('height'), f.createStringLiteral('0')),
+          f.createJsxAttribute(f.createIdentifier('style'),
+            f.createJsxExpression(undefined, valueToExpr({ position: 'absolute' }))),
+          f.createJsxAttribute(f.createIdentifier('aria-hidden'), f.createStringLiteral('true')),
+        ])),
+      [f.createJsxElement(
+        f.createJsxOpeningElement(f.createIdentifier('defs'), undefined, f.createJsxAttributes([])),
+        [f.createJsxElement(
+          f.createJsxOpeningElement(f.createIdentifier('clipPath'), undefined,
+            f.createJsxAttributes([
+              f.createJsxAttribute(f.createIdentifier('id'), f.createStringLiteral(squircleClipId)),
+              f.createJsxAttribute(f.createIdentifier('clipPathUnits'), f.createStringLiteral('objectBoundingBox')),
+            ])),
+          [f.createJsxSelfClosingElement(f.createIdentifier('path'), undefined,
+            f.createJsxAttributes([
+              f.createJsxAttribute(f.createIdentifier('d'), f.createStringLiteral(squirclePath)),
+              f.createJsxAttribute(f.createIdentifier('transform'),
+                f.createStringLiteral(`scale(${(1 / n.width).toFixed(8)} ${(1 / n.height).toFixed(8)})`)),
+            ]))],
+          f.createJsxClosingElement(f.createIdentifier('clipPath')),
+        )],
+        f.createJsxClosingElement(f.createIdentifier('defs')),
+      )],
+      f.createJsxClosingElement(f.createIdentifier('svg')),
+    )
+    children.push(clipDef)
+  }
   let jsx: ts.JsxElement = f.createJsxElement(open, children, close)
   // figma rotation on FRAME — wrap in inline-block with transform.
   // Same approach as emitComponent rotation handling: pre-rotation box
@@ -431,10 +473,16 @@ function emitText(n: IRText, ctx: CodegenCtx, parent: ParentCtx = { dir: 'none',
   // so child has no space to grow into). Collapse to HUG so text uses intrinsic width.
   const parentHugMain = parent.mainSizing === 'hug'
   const fillMain = n.sizingH === 'fill' && parentDir === 'row' && !parentHugMain
-  const fillCross = n.sizingH === 'fill' && parentDir === 'column' && !parentHugMain
-  // When sizingH=FILL but parent is HUG, treat as intrinsic (no width). Otherwise honor n.width
-  // for FIXED autoResize. HUG autoResize never sets width.
-  const collapsedFill = n.sizingH === 'fill' && parentHugMain
+  // Cross-axis FILL is independent of parent main sizing — even if parent
+  // HUGs vertically (column flex main axis), the horizontal cross size is
+  // determined by the widest child, and `alignSelf: stretch` on this text
+  // makes it match that width. Without this, parent's `align="center"`
+  // (figma counterAxisAlignItems=CENTER) would center the intrinsic-width
+  // text instead of stretching it edge-to-edge.
+  const fillCross = n.sizingH === 'fill' && parentDir === 'column'
+  // Main-axis FILL is meaningless when parent is HUG main (no space to grow);
+  // collapse to intrinsic.
+  const collapsedFill = n.sizingH === 'fill' && parentDir === 'row' && parentHugMain
   const fixedWidth = !isHug && !fillMain && !fillCross && !collapsedFill ? n.width : undefined
   if (wrapperName) {
     ctx.usedTypography.add(wrapperName)
@@ -858,6 +906,16 @@ function emitNode(n: IRNode, ctx: CodegenCtx, parent: ParentCtx = { dir: 'none',
       // would-be flex container's main-axis sizing.
       jsx = wrapWithStyle(jsx, { ...ws, display: 'inline-block' })
     }
+  }
+  // figma layoutPositioning=ABSOLUTE → child overlays parent at (x,y).
+  // Wrap with position:absolute + left/top so the child sits outside flex
+  // flow but still in DOM. Parent gets position:relative emitted in emitFrame.
+  if (n.absolute) {
+    jsx = wrapWithStyle(jsx, {
+      position: 'absolute',
+      left: typeof n.absX === 'number' ? px2rem(n.absX, ctx.remBase) : '0rem',
+      top: typeof n.absY === 'number' ? px2rem(n.absY, ctx.remBase) : '0rem',
+    })
   }
   return jsx
 }

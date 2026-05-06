@@ -155,10 +155,14 @@ async function __pixpecIr(node) {
       if (!c.visible) continue;
       const child = await ir(c);
       if (!child) continue;
-      // figma layoutPositioning: ABSOLUTE → out of flex flow (e.g., hover overlay,
-      // 0-height divider line). Skip rendering: visually invisible/decorative, and
-      // including them as flow content corrupts wrap behavior of siblings.
-      if (c.layoutPositioning === 'ABSOLUTE') continue;
+      // figma layoutPositioning: ABSOLUTE → child sits outside flex flow.
+      // Codegen emits position:absolute + left/top from c.x/c.y so it
+      // overlays the parent without contributing to layout sizing.
+      if (c.layoutPositioning === 'ABSOLUTE') {
+        child.absolute = true;
+        child.absX = c.x;
+        child.absY = c.y;
+      }
       children.push(child);
     }
     return {
