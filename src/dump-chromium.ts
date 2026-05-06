@@ -49,10 +49,7 @@ export async function dumpChromium(opts: DumpChromiumOptions): Promise<void> {
       `  Underlying: ${(e as Error).message}`,
     )
   }
-  // Viewport set at chrome launch — Emulation.setDeviceMetricsOverride
-  // perturbs Skia advance, so viewport must be process-level via flags.
-  const viewport = comp.viewport ?? { width: 4000, height: 8000 }
-  const renderer = await Renderer.create([], viewport)
+  const renderer = await Renderer.create()
   try {
     const CHUNK = comp.batchChunk ?? 500
     const N = comp.cases.length
