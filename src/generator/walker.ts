@@ -181,6 +181,7 @@ async function __pixpecIr(node) {
       cornerSmoothing: node.cornerSmoothing || 0,
       clipsContent: !!node.clipsContent,
       tokenIds,
+      rotation: typeof node.rotation === 'number' && Math.abs(node.rotation) >= 0.01 ? node.rotation : undefined,
       children,
     };
   }

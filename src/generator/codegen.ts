@@ -234,10 +234,19 @@ function emitFrame(n: IRFrame, ctx: CodegenCtx, parent: ParentCtx = { dir: 'none
       }
     }
   }
-  if (n.layout.paddingTop) styles.paddingTop = resolveValue(n.layout.paddingTop, tids.paddingTop, ctx.tokenMap)
-  if (n.layout.paddingRight) styles.paddingRight = resolveValue(n.layout.paddingRight, tids.paddingRight, ctx.tokenMap)
-  if (n.layout.paddingBottom) styles.paddingBottom = resolveValue(n.layout.paddingBottom, tids.paddingBottom, ctx.tokenMap)
-  if (n.layout.paddingLeft) styles.paddingLeft = resolveValue(n.layout.paddingLeft, tids.paddingLeft, ctx.tokenMap)
+  // figma allows degenerate frames where padding-sum > FIXED size on an
+  // axis (e.g. h=4 with padTop=10 padBottom=10). Figma clips and renders at
+  // the FIXED size; CSS clamps box dim up to padding-sum and can't be
+  // overridden by box-sizing/max-height/overflow. Drop padding on the
+  // offending axis when it would be degenerate. Logged for diagnostics.
+  const dropV = n.layout.sizingV === 'fixed' && typeof n.height === 'number'
+    && (n.layout.paddingTop + n.layout.paddingBottom > n.height)
+  const dropH = n.layout.sizingH === 'fixed' && typeof n.width === 'number'
+    && (n.layout.paddingLeft + n.layout.paddingRight > n.width)
+  if (n.layout.paddingTop && !dropV) styles.paddingTop = resolveValue(n.layout.paddingTop, tids.paddingTop, ctx.tokenMap)
+  if (n.layout.paddingRight && !dropH) styles.paddingRight = resolveValue(n.layout.paddingRight, tids.paddingRight, ctx.tokenMap)
+  if (n.layout.paddingBottom && !dropV) styles.paddingBottom = resolveValue(n.layout.paddingBottom, tids.paddingBottom, ctx.tokenMap)
+  if (n.layout.paddingLeft && !dropH) styles.paddingLeft = resolveValue(n.layout.paddingLeft, tids.paddingLeft, ctx.tokenMap)
   // FIXED → explicit figma resolved width/height (CSS default stretch != figma).
   // FILL → flex:1 (main) or alignSelf:stretch (cross). HUG → omit (intrinsic).
   // At root (parent.dir === 'none') there is no enclosing flex container in IR,
@@ -253,6 +262,10 @@ function emitFrame(n: IRFrame, ctx: CodegenCtx, parent: ParentCtx = { dir: 'none
     else if (r === 'cross') { styles.alignSelf = 'stretch'; styles.minWidth = 0 }
   } else if (n.layout.sizingH === 'fixed' && n.width !== undefined) {
     styles.width = n.width
+    // figma's FIXED sizing means "this dim is the truth" even if padding +
+    // children would normally push the flex container larger. Override CSS
+    // flex auto-min-size so the explicit dim wins.
+    styles.minWidth = 0
   }
   if (n.layout.sizingV === 'fill') {
     const r = fillStyle('v')
@@ -260,6 +273,7 @@ function emitFrame(n: IRFrame, ctx: CodegenCtx, parent: ParentCtx = { dir: 'none
     else if (r === 'cross') { styles.alignSelf = 'stretch'; styles.minHeight = 0 }
   } else if (n.layout.sizingV === 'fixed' && n.height !== undefined) {
     styles.height = n.height
+    styles.minHeight = 0
   }
   if (n.background) styles.background = resolveValue(n.background, tids.background, ctx.tokenMap)
   // figma cornerSmoothing > 0 → render the rounded shape via clip-path with
@@ -340,7 +354,58 @@ function emitFrame(n: IRFrame, ctx: CodegenCtx, parent: ParentCtx = { dir: 'none
   const childParent: ParentCtx = { dir: n.layout.direction, mainSizing }
   const children = n.children.map((c) => emitNode(c, ctx, childParent))
   if (strokeOverlay) children.push(strokeOverlay)
-  return f.createJsxElement(open, children, close)
+  let jsx: ts.JsxElement = f.createJsxElement(open, children, close)
+  // figma rotation on FRAME — wrap in inline-block with transform.
+  // Same approach as emitComponent rotation handling: pre-rotation box
+  // + transform + translate to compensate origin shift.
+  if (typeof n.rotation === 'number' && Math.abs(n.rotation) >= 0.01
+      && typeof n.width === 'number' && typeof n.height === 'number') {
+    const css = (-n.rotation) * Math.PI / 180
+    const w0 = n.width, h0 = n.height
+    const cos = Math.cos(css), sn = Math.sin(css)
+    const corners: [number, number][] = [[0, 0], [w0, 0], [w0, h0], [0, h0]]
+    const rotated = corners.map(([x, y]): [number, number] => [x * cos - y * sn, x * sn + y * cos])
+    const minX = Math.min(...rotated.map((p) => p[0]))
+    const minY = Math.min(...rotated.map((p) => p[1]))
+    const maxX = Math.max(...rotated.map((p) => p[0]))
+    const maxY = Math.max(...rotated.map((p) => p[1]))
+    const rotW = maxX - minX
+    const rotH = maxY - minY
+    // Outer wrapper: post-rotation axis-aligned bbox dim. Inner rotation
+    // origin (0,0) translated by (-minX,-minY) so painted bbox lines up
+    // with wrapper's (0,0).
+    const rotateStyle: Record<string, unknown> = {
+      display: 'inline-block',
+      verticalAlign: 'top',
+      width: px2rem(rotW, ctx.remBase),
+      height: px2rem(rotH, ctx.remBase),
+    }
+    const innerStyle: Record<string, unknown> = {
+      transformOrigin: '0 0',
+      transform: `translate(${px2rem(-minX, ctx.remBase)}, ${px2rem(-minY, ctx.remBase)}) rotate(${-n.rotation}deg)`,
+    }
+    // Apply transform to existing jsx by wrapping in another div (or merging).
+    // Simpler: wrap jsx with inner-transform div, then outer-bbox div.
+    const innerOpen = f.createJsxOpeningElement(
+      f.createIdentifier('div'), undefined,
+      f.createJsxAttributes([
+        f.createJsxAttribute(f.createIdentifier('style'),
+          f.createJsxExpression(undefined, valueToExpr(innerStyle))),
+      ]),
+    )
+    const innerClose = f.createJsxClosingElement(f.createIdentifier('div'))
+    const innerJsx = f.createJsxElement(innerOpen, [jsx], innerClose)
+    const rotOpen = f.createJsxOpeningElement(
+      f.createIdentifier('div'), undefined,
+      f.createJsxAttributes([
+        f.createJsxAttribute(f.createIdentifier('style'),
+          f.createJsxExpression(undefined, valueToExpr(rotateStyle))),
+      ]),
+    )
+    const rotClose = f.createJsxClosingElement(f.createIdentifier('div'))
+    jsx = f.createJsxElement(rotOpen, [innerJsx], rotClose)
+  }
+  return jsx
 }
 
 function emitText(n: IRText, ctx: CodegenCtx, parent: ParentCtx = { dir: 'none', mainSizing: 'fixed' }): ts.JsxElement {

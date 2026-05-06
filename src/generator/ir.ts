@@ -108,6 +108,8 @@ export interface IRFrame extends IRBase {
   }
   /** figma clipsContent → overflow:hidden; off-bounds children get clipped (e.g., 126x0 separator). */
   clipsContent?: boolean
+  /** figma rotation (CCW degrees). Codegen wraps in rotated transform. */
+  rotation?: number
   children: IRNode[]
 }
 

@@ -263,15 +263,24 @@ async function getNodeDim(cfigmaBin: string, tab: string, nodeId: string): Promi
   const { promisify } = await import('node:util')
   const execFileAsync = promisify(execFile)
   const { stdout } = await execFileAsync(cfigmaBin,
-    ['--tab', tab, 'exec', `const n = await figma.getNodeByIdAsync(${JSON.stringify(nodeId)}); return { width: n.width, height: n.height, sH: n.layoutSizingHorizontal, sV: n.layoutSizingVertical };`],
+    ['--tab', tab, 'exec', `const n = await figma.getNodeByIdAsync(${JSON.stringify(nodeId)}); return { width: n.width, height: n.height, sH: n.layoutSizingHorizontal, sV: n.layoutSizingVertical, rotation: typeof n.rotation === 'number' ? n.rotation : 0 };`],
     { encoding: 'utf8',
       env: { ...process.env, CFIGMA_CDP_PORT: process.env.CFIGMA_CDP_PORT ?? '9222' } })
-  const r = JSON.parse(stdout) as { width: number; height: number; sH: 'FIXED' | 'HUG' | 'FILL'; sV: 'FIXED' | 'HUG' | 'FILL' }
-  return {
-    width: r.sH === 'HUG' ? undefined : r.width,
-    height: r.sV === 'HUG' ? undefined : r.height,
-    padding: 0, bg: '#ffffff', sH: r.sH, sV: r.sV,
+  const r = JSON.parse(stdout) as { width: number; height: number; sH: 'FIXED' | 'HUG' | 'FILL'; sV: 'FIXED' | 'HUG' | 'FILL'; rotation: number }
+  // Rotated frames need POST-rotation axis-aligned bbox as the wrapper
+  // dim — the codegen rotation wrap renders that bbox.
+  let w = r.sH === 'HUG' ? undefined : r.width
+  let h = r.sV === 'HUG' ? undefined : r.height
+  if (Math.abs(r.rotation) >= 0.01 && typeof w === 'number' && typeof h === 'number') {
+    const css = (-r.rotation) * Math.PI / 180
+    const c = Math.abs(Math.cos(css)), s = Math.abs(Math.sin(css))
+    const rotW = w * c + h * s
+    const rotH = w * s + h * c
+    const snap = (v: number) => Math.abs(v - Math.round(v)) < 1e-9 ? Math.round(v) : v
+    w = snap(rotW)
+    h = snap(rotH)
   }
+  return { width: w, height: h, padding: 0, bg: '#ffffff', sH: r.sH, sV: r.sV }
 }
 
 /** Walk IR collecting 'image' kind nodes (figma GROUP/VECTOR/BOOLEAN_OPERATION).
