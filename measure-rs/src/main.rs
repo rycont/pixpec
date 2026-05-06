@@ -40,7 +40,7 @@ struct Record {
     de00_max: f64,
     #[serde(rename = "n_px")]
     n_px: usize,
-    /// Largest connected blob of pixels with ΔE00 > 5 (8-connectivity). Distinguishes
+    /// Largest connected blob of pixels with ΔE00 > 1.8 (8-connectivity). Distinguishes
     /// structural diff (a 30+ px blob from a misplaced icon) from anti-alias noise
     /// (isolated pixels). Used by `breakdown` to pass small renderer differences
     /// while catching layout/style regressions.
@@ -212,8 +212,10 @@ fn measure(figma: &Path, chrom: &Path, downsample: u32) -> Result<Measurement> {
     // structural mismatches (clustered residual) from anti-alias noise (isolated
     // pixels). A high `de00_max` from one stray pixel is rendering noise; the
     // same `de00_max` clustered into a 9+ pixel blob is a real layout/style bug.
-    let blob_threshold: f32 = std::env::var("PIXPEC_BLOB_THRESHOLD")
-        .ok().and_then(|s| s.parse().ok()).unwrap_or(5.0);
+    // Blob threshold hardcoded at 1.8: any pixel ΔE00 > 1.8 contributes to
+    // blob membership. Above the JNT (1.0); avoids text/svg edge AA noise
+    // contributing to blobs. See breakdown-verify default --max-blob 16.
+    let blob_threshold: f32 = 1.8;
     let mut visited = vec![false; n];
     let mut max_blob = 0usize;
     let mut stack = Vec::with_capacity(n);

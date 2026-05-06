@@ -48,11 +48,11 @@ const rootNodeId = args[0]
 const opt = (k: string, d?: string) => {
   const i = args.indexOf(k); return i >= 0 ? args[i + 1] : d
 }
-// Pass criterion: largest connected blob of pixels with ΔE00 > 5 must NOT
+// Pass criterion: largest connected blob of pixels with ΔE00 > 1.8 must NOT
 // exceed `--max-blob`. Default 8 → "9+ connected pixels above threshold = fail".
 // Distinguishes anti-alias rendering noise (isolated pixels) from real
 // structural mismatches (clustered residuals from mispositioned elements).
-const maxBlob = parseInt(opt('--max-blob', '8')!, 10)
+const maxBlob = parseInt(opt('--max-blob', '16')!, 10)
 const maxDe = parseFloat(opt('--max-de', 'Infinity')!)
 const skipPassed = args.includes('--skip-passed')
 const projectRoot = resolve(opt('--root', process.cwd())!)
@@ -155,13 +155,13 @@ console.log(`[breakdown] export done in ${Date.now() - tBatch0}ms`)
 const idToPath = new Map<string, string>()
 for (const r of exportRes) {
   if (r.error) throw new Error(`export ${r.id}: ${r.error}`)
-  const path = resolve(figmaTempDir, `${r.id.replace(':', '_')}.png`)
+  const path = resolve(figmaTempDir, `${r.id.replace(/[^A-Za-z0-9]/g, '_')}.png`)
   await writeFile(path, Buffer.from(r.b64!, 'base64'))
   idToPath.set(r.id, path)
 }
 
 // ───────── Step 2: for each node, run the round-trip ─────────
-const safeName = (id: string) => `Gen_${id.replace(':', '_')}`
+const safeName = (id: string) => `Gen_${id.replace(/[^A-Za-z0-9]/g, '_')}`
 const indexEntry = (name: string) =>
   `export { ${name} } from './components/${name}/index.ts'`
 const ensureExport = async (name: string) => {
@@ -221,7 +221,7 @@ const measure = async (componentName: string): Promise<{ max: number; sum: numbe
 
 await mkdir(dirname(reportPath), { recursive: true })
 await writeFile(reportPath,
-  `# Breakdown report — root ${rootNodeId}\n\nthreshold: largest connected blob (ΔE00 > 5) <= ${maxBlob}, max ΔE00/px <= ${maxDe}\n\n`)
+  `# Breakdown report — root ${rootNodeId}\n\nthreshold: largest connected blob (ΔE00 > 1.8) <= ${maxBlob}, max ΔE00/px <= ${maxDe}\n\n`)
 
 let firstFailure: { node: Node; max: number; sum: number; blob: number; componentName: string } | null = null
 let passed = 0, skipped = 0
@@ -243,7 +243,7 @@ for (const n of targets) {
     // Direct function calls (vs spawning `pnpm exec tsx pixpec ...` subprocess)
     // — eliminates ~2.5s tsx-loader cold start per step. For a 15-node tree
     // with 2 steps each, that's ~75s saved.
-    await runGenerate(n.id)
+    await runGenerate(n.id, { tab: defaultTab })
     await ensureExport(componentName)
     await runDumpChromium(componentName)
     await placeFigmaPng(n,
@@ -278,4 +278,4 @@ if (firstFailure) {
   console.log(`\nFull report: ${reportPath}`)
   process.exit(1)
 }
-console.log(`\n✓ All ${passed} nodes passed (largest blob <= ${maxBlob} pixels above ΔE=5). Full report: ${reportPath}`)
+console.log(`\n✓ All ${passed} nodes passed (largest blob <= ${maxBlob} pixels above ΔE=1.8). Full report: ${reportPath}`)
