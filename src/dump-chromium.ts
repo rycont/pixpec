@@ -29,6 +29,8 @@ export interface DumpChromiumOptions {
   /** Design system rem base in CSS px. Default 16. */
   remBase?: number
   verbose?: boolean
+  /** Reuse an existing Chromium instance across repeated dump calls. */
+  renderer?: Renderer
 }
 
 export async function dumpChromium(opts: DumpChromiumOptions): Promise<void> {
@@ -49,7 +51,8 @@ export async function dumpChromium(opts: DumpChromiumOptions): Promise<void> {
       `  Underlying: ${(e as Error).message}`,
     )
   }
-  const renderer = await Renderer.create()
+  const renderer = opts.renderer ?? await Renderer.create()
+  const ownsRenderer = !opts.renderer
   try {
     const CHUNK = comp.batchChunk ?? 500
     const N = comp.cases.length
@@ -107,11 +110,14 @@ export async function dumpChromium(opts: DumpChromiumOptions): Promise<void> {
     }
     await Promise.all(Array.from({ length: Math.min(PARALLEL, chunks.length) }, worker))
   } finally {
-    await renderer.close()
+    if (ownsRenderer) await renderer.close()
   }
 }
 
-export async function runDumpChromium(componentName: string): Promise<void> {
+export async function runDumpChromium(
+  componentName: string,
+  opts: { renderer?: Renderer } = {},
+): Promise<void> {
   const { cfg, root } = await loadConfig()
   const componentsDir = cfg.componentsDir ?? 'src/components'
   const componentMod = (await import(resolve(root, componentsDir, componentName, 'index.ts'))) as Record<string, unknown>
@@ -119,13 +125,6 @@ export async function runDumpChromium(componentName: string): Promise<void> {
   if (!comp || !Array.isArray(comp.cases)) {
     throw new Error(`Component '${componentName}' not exported from ${componentsDir}/${componentName}/index.ts`)
   }
-  // Re-extract Panda CSS so impl style changes show up.
-  const { spawnSync } = await import('node:child_process')
-  spawnSync(
-    './node_modules/.bin/panda',
-    ['cssgen', '--outfile', 'styled-system/styles.css'],
-    { cwd: root, stdio: 'inherit' },
-  )
   const outDir = resolve(root, `.pixpec-out/${comp.name}/chromium`)
   const devUrl = process.env.PIXPEC_DEV_URL
     ?? (cfg as { devServerUrl?: string }).devServerUrl
@@ -139,6 +138,7 @@ export async function runDumpChromium(componentName: string): Promise<void> {
     scale: cfg.scale,
     remBase: cfg.remBase,
     verbose: true,
+    renderer: opts.renderer,
   })
   console.log(`[dump-chromium] done in ${Date.now() - t0}ms`)
 }

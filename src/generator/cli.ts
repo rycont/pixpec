@@ -122,14 +122,16 @@ export async function runGenerate(
   let tokenMap: Record<string, string> = {}
   try {
     const path = resolve(root, 'tokens/figma-tokens.json')
-    const ft = JSON.parse(await (await import('node:fs/promises')).readFile(path, 'utf8')) as { variables: { id: string; name: string; resolvedType: string }[] }
+    const ft = JSON.parse(await (await import('node:fs/promises')).readFile(path, 'utf8')) as { variables: { id: string; name: string; key?: string; resolvedType: string }[] }
     for (const v of ft.variables) {
-      tokenMap[v.id] = v.name
+      const tokenPath = v.name
         // Strip control characters (figma variable names sometimes carry a
         // leading \b sort marker) and whitespace within segments.
         .replace(/[\x00-\x1f]/g, '')
         .split('/').map((s) => s.replace(/\s+/g, '').replace(/^./, (c) => c.toLowerCase()))
         .join('.')
+      tokenMap[v.id] = tokenPath
+      if (v.key) tokenMap[v.key] = tokenPath
     }
     console.log(`[generate] loaded ${Object.keys(tokenMap).length} design-token bindings`)
   } catch { /* optional */ }
@@ -236,11 +238,22 @@ export function wrapperFromIr(ir: IRNode): FigmaPayload['wrapper'] {
     ?? (ir as { sizingH?: string }).sizingH
   const sV = (ir as { layout?: { sizingV?: string } }).layout?.sizingV
     ?? (ir as { sizingV?: string }).sizingV
-  const w = (ir as { width?: number }).width
-  const h = (ir as { height?: number }).height
+  let w = sH === 'hug' ? undefined : (ir as { width?: number }).width
+  let h = sV === 'hug' ? undefined : (ir as { height?: number }).height
+  const rotation = (ir as { rotation?: number }).rotation
+  if (typeof rotation === 'number' && Math.abs(rotation) >= 0.01
+      && typeof w === 'number' && typeof h === 'number') {
+    const css = (-rotation) * Math.PI / 180
+    const c = Math.abs(Math.cos(css)), s = Math.abs(Math.sin(css))
+    const snap = (v: number) => Math.abs(v - Math.round(v)) < 1e-9 ? Math.round(v) : v
+    const rotW = snap(w * c + h * s)
+    const rotH = snap(w * s + h * c)
+    w = rotW
+    h = rotH
+  }
   return {
-    width: sH === 'hug' ? undefined : w,
-    height: sV === 'hug' ? undefined : h,
+    width: w,
+    height: h,
     padding: 0, bg: '#ffffff',
   }
 }
@@ -249,10 +262,19 @@ export function wrapperFromIr(ir: IRNode): FigmaPayload['wrapper'] {
  * `breakdown-prepare` uses this to write a per-subtree cache file from a
  * single root walk. */
 export function* walkIrSubtrees(ir: IRNode): Iterable<{ id: string; ir: IRNode }> {
-  yield { id: ir.figmaId, ir }
+  yield { id: ir.figmaId, ir: standaloneRoot(ir) }
   if (ir.kind === 'frame') {
     for (const c of ir.children) yield* walkIrSubtrees(c)
   }
+}
+
+function standaloneRoot(ir: IRNode): IRNode {
+  if (!ir.absolute) return ir
+  const clone = { ...ir }
+  delete clone.absolute
+  delete clone.absX
+  delete clone.absY
+  return clone
 }
 
 async function getNodeDim(cfigmaBin: string, tab: string, nodeId: string): Promise<{

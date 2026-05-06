@@ -56,6 +56,12 @@ export interface IRComponent extends IRBase {
    * differ from CSS flex defaults). */
   sizingH?: 'fixed' | 'hug' | 'fill'
   sizingV?: 'fixed' | 'hug' | 'fill'
+  /** Main component root sizing/dim. Used to distinguish real instance
+   * layout overrides from HUG resolved-size changes caused by props/text. */
+  mainSizingH?: 'fixed' | 'hug' | 'fill'
+  mainSizingV?: 'fixed' | 'hug' | 'fill'
+  mainWidth?: number
+  mainHeight?: number
   width?: number
   height?: number
   /** Open extension slot — plugin walkExtend hooks attach DS-specific data
@@ -104,6 +110,17 @@ export interface IRFrame extends IRBase {
     paddingTop?: string; paddingRight?: string; paddingBottom?: string; paddingLeft?: string
     width?: string; height?: string
     borderRadius?: string
+    strokeColor?: string
+    strokeWeight?: string
+  }
+  /** Panda token paths resolved directly from live Figma variable names. */
+  tokenPaths?: {
+    background?: string
+    gap?: string
+    paddingTop?: string; paddingRight?: string; paddingBottom?: string; paddingLeft?: string
+    width?: string; height?: string
+    borderRadius?: string
+    strokeColor?: string
     strokeWeight?: string
   }
   /** figma clipsContent → overflow:hidden; off-bounds children get clipped (e.g., 126x0 separator). */
@@ -129,6 +146,13 @@ export interface IRText extends IRBase {
   /** figma boundVariables — variable id per styled property. Codegen uses
    * `figma-tokens.json` to resolve id → panda token path. */
   tokenIds?: {
+    color?: string
+    lineHeight?: string
+    paragraphSpacing?: string
+    fontSize?: string
+  }
+  /** Panda token paths resolved directly from live Figma variable names. */
+  tokenPaths?: {
     color?: string
     lineHeight?: string
     paragraphSpacing?: string

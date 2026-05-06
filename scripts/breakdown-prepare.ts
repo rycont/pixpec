@@ -35,6 +35,7 @@ const opt = (k: string, d?: string) => {
   const i = args.indexOf(k); return i >= 0 ? args[i + 1] : d
 }
 const projectRoot = resolve(opt('--root', process.cwd())!)
+const pngChunk = Math.max(1, Number(opt('--png-chunk', '24')) || 24)
 
 const tomlText = await readFile(resolve(projectRoot, 'pixpec.toml'), 'utf8')
 const tomlGet = (k: string) => tomlText.match(new RegExp(`^${k}\\s*=\\s*"([^"]+)"`, 'm'))?.[1]
@@ -116,10 +117,10 @@ for (const n of targets) {
 console.log(`[prepare] wrote ${written} IR cache files (missing: ${missing})`)
 
 // ───── batch-export reference PNGs (DPR=8) ─────
-console.log(`[prepare] exporting ${targets.length} reference PNGs (DPR=8)…`)
+console.log(`[prepare] exporting ${targets.length} reference PNGs (DPR=8, chunk=${pngChunk})…`)
 const tPng = Date.now()
-const pngCode = `
-const ids = ${JSON.stringify(targets.map((n) => n.id))};
+const makePngCode = (ids: string[]) => `
+const ids = ${JSON.stringify(ids)};
 const out = [];
 for (const id of ids) {
   const n = await figma.getNodeByIdAsync(id);
@@ -131,13 +132,18 @@ for (const id of ids) {
 }
 return out;
 `
-const exportRes = await bridge.exec<Array<{ id: string; b64?: string; error?: string }>>(tab, pngCode)
 let pngOk = 0
-for (const r of exportRes) {
-  if (r.error || !r.b64) { console.warn(`[prepare] export ${r.id}: ${r.error}`); continue }
-  const safe = r.id.replace(/[^A-Za-z0-9]/g, '_')
-  await writeFile(resolve(pngDir, `${safe}.png`), Buffer.from(r.b64, 'base64'))
-  pngOk++
+const ids = targets.map((n) => n.id)
+for (let i = 0; i < ids.length; i += pngChunk) {
+  const chunk = ids.slice(i, i + pngChunk)
+  const exportRes = await bridge.exec<Array<{ id: string; b64?: string; error?: string }>>(tab, makePngCode(chunk))
+  for (const r of exportRes) {
+    if (r.error || !r.b64) { console.warn(`[prepare] export ${r.id}: ${r.error}`); continue }
+    const safe = r.id.replace(/[^A-Za-z0-9]/g, '_')
+    await writeFile(resolve(pngDir, `${safe}.png`), Buffer.from(r.b64, 'base64'))
+    pngOk++
+  }
+  console.log(`[prepare]   png chunk ${Math.min(i + pngChunk, ids.length)}/${ids.length} (${pngOk} ok)`)
 }
 console.log(`[prepare] PNG export done in ${Date.now() - tPng}ms (${pngOk}/${targets.length})`)
 

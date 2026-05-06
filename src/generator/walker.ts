@@ -30,6 +30,21 @@ export interface WalkOptions {
 export async function walk(opts: WalkOptions): Promise<IRNode> {
   const code = `
 const REGISTRY = ${JSON.stringify(opts.registry)};
+function pixpecPropName(name) {
+  const stripped = String(name).replace(/[\\x00-\\x1f\\x7f]/g, '').replace(/#[^#]*$/, '').trim();
+  const parts = stripped.split(/[^A-Za-z0-9]+/).filter(Boolean);
+  if (!parts.length) return 'prop';
+  const normalized = parts[0][0].toLowerCase() + parts[0].slice(1)
+    + parts.slice(1).map((p) => p[0].toUpperCase() + p.slice(1)).join('');
+  return normalized === 'style' ? 'styleVariant' : normalized;
+}
+function pixpecSetProp(out, name, value) {
+  out[name] = value;
+  const short = String(name).split('#')[0];
+  if (!(short in out)) out[short] = value;
+  const camel = pixpecPropName(name);
+  if (!(camel in out)) out[camel] = value;
+}
 async function ir(node) {
   const result = await __pixpecIr(node);
   if (result && typeof result === 'object' && !result.__unregisteredInstance) {
@@ -86,39 +101,41 @@ async function __pixpecIr(node) {
     } else {
     const props = {};
     for (const [k, v] of Object.entries(node.componentProperties)) {
-      props[k] = v.value;
-      const short = k.split('#')[0];
-      if (!(short in props)) props[short] = v.value;
+      pixpecSetProp(props, k, v.value);
     }
     // Component-set-level defaults (componentPropertyDefinitions). Codegen
     // uses these to omit redundant prop emissions on the instance.
     const defaults = {};
     if (p?.componentPropertyDefinitions) {
       for (const [k, def] of Object.entries(p.componentPropertyDefinitions)) {
-        defaults[k] = def.defaultValue;
-        const short = k.split('#')[0];
-        if (!(short in defaults)) defaults[short] = def.defaultValue;
+        pixpecSetProp(defaults, k, def.defaultValue);
       }
     }
     const exposed = (node.exposedInstances || []).map(e => {
       const ep = {};
       for (const [k, v] of Object.entries(e.componentProperties)) {
-        ep[k] = v.value;
-        const short = k.split('#')[0];
-        if (!(short in ep)) ep[short] = v.value;
+        pixpecSetProp(ep, k, v.value);
       }
       return { name: e.name, mainComponentName: e.mainComponent?.name, props: ep };
     });
+    const sizingH = mapSizing(node.layoutSizingHorizontal);
+    const sizingV = mapSizing(node.layoutSizingVertical);
+    const mainSizingH = mapSizing(node.mainComponent?.layoutSizingHorizontal);
+    const mainSizingV = mapSizing(node.mainComponent?.layoutSizingVertical);
     return {
       ...base,
       kind: 'component',
       componentName: REGISTRY[key],
       raw: { id: node.id, name: node.name, mainComponentName: node.mainComponent?.name,
              componentSetKey: key, props, exposed, defaults,
-             width: node.width, height: node.height },
+             width: node.width, height: node.height,
+             sizingH, sizingV,
+             mainWidth: node.mainComponent?.width, mainHeight: node.mainComponent?.height,
+             mainSizingH, mainSizingV },
       rotation: typeof node.rotation === 'number' && Math.abs(node.rotation) >= 0.01 ? node.rotation : undefined,
-      sizingH: mapSizing(node.layoutSizingHorizontal),
-      sizingV: mapSizing(node.layoutSizingVertical),
+      sizingH, sizingV,
+      mainSizingH, mainSizingV,
+      mainWidth: node.mainComponent?.width, mainHeight: node.mainComponent?.height,
       width: node.width, height: node.height,
     };
     } // close else branch — falls through to FRAME walk for detached instances
@@ -140,6 +157,7 @@ async function __pixpecIr(node) {
     // token, we capture the variable id so codegen can emit a panda token
     // reference (e.g. 'background.standard.primary') instead of raw hex/px.
     const bgTokenId = fill?.boundVariables?.color?.id;
+    const strokeColorTokenId = stroke?.boundVariables?.color?.id;
     const bv = node.boundVariables || {};
     const tokenIds = {
       background: bgTokenId,
@@ -148,6 +166,7 @@ async function __pixpecIr(node) {
       paddingBottom: bv.paddingBottom?.id, paddingLeft: bv.paddingLeft?.id,
       width: bv.width?.id, height: bv.height?.id,
       borderRadius: bv.topLeftRadius?.id,
+      strokeColor: strokeColorTokenId,
       strokeWeight: bv.strokeWeight?.id,
     };
     const children = [];

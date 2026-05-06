@@ -101,7 +101,51 @@ function deepEq(a: unknown, b: unknown): boolean {
   return false
 }
 
-function emitComponent(n: IRComponent, ctx: CodegenCtx, _parent: ParentCtx = { dir: 'none', mainSizing: 'fixed' }): ts.JsxChild {
+function componentLayoutStyles(n: IRComponent, parent: ParentCtx, ctx: CodegenCtx): Record<string, unknown> {
+  if (parent.dir === 'none') return {}
+  const ws: Record<string, unknown> = {}
+  // Registered components own their root layout by default. Codegen only
+  // expresses axes where the instance differs from the main component root.
+  // HUG resolved-size changes from text/prop overrides are intentionally
+  // ignored; the component implementation should produce those naturally.
+  const changedH = n.sizingH !== undefined && (
+    (n.mainSizingH !== undefined && n.sizingH !== n.mainSizingH) ||
+    (n.sizingH === 'fixed' && typeof n.width === 'number' && typeof n.mainWidth === 'number' && n.width !== n.mainWidth)
+  )
+  const changedV = n.sizingV !== undefined && (
+    (n.mainSizingV !== undefined && n.sizingV !== n.mainSizingV) ||
+    (n.sizingV === 'fixed' && typeof n.height === 'number' && typeof n.mainHeight === 'number' && n.height !== n.mainHeight)
+  )
+  if (changedH) {
+    if (n.sizingH === 'fixed' && typeof n.width === 'number') {
+      ws.width = n.width
+    } else if (n.sizingH === 'fill') {
+      if (parent.dir === 'row' && parent.mainSizing !== 'hug') {
+        ws.flex = 1
+        ws.minWidth = 0
+      } else if (parent.dir === 'column') {
+        ws.alignSelf = 'stretch'
+        ws.minWidth = 0
+      }
+    }
+  }
+  if (changedV) {
+    if (n.sizingV === 'fixed' && typeof n.height === 'number') {
+      ws.height = n.height
+    } else if (n.sizingV === 'fill') {
+      if (parent.dir === 'column' && parent.mainSizing !== 'hug') {
+        ws.flex = 1
+        ws.minHeight = 0
+      } else if (parent.dir === 'row') {
+        ws.alignSelf = 'stretch'
+        ws.minHeight = 0
+      }
+    }
+  }
+  return ws
+}
+
+function emitComponent(n: IRComponent, ctx: CodegenCtx, parent: ParentCtx = { dir: 'none', mainSizing: 'fixed' }): ts.JsxChild {
   // Elide props that match the component-set's default — figma's
   // `componentPropertyDefinitions[name].defaultValue` semantically equals
   // "what you'd get if you didn't override it." Cuts visual noise on
@@ -109,15 +153,22 @@ function emitComponent(n: IRComponent, ctx: CodegenCtx, _parent: ParentCtx = { d
   const props = n.defaultProps
     ? Object.fromEntries(Object.entries(n.props).filter(([k, v]) => !deepEq(v, n.defaultProps![k])))
     : n.props
+  const attrs = attrsFromObject(props)
+  // When this component is a direct child of an autolayout frame, put Figma's
+  // flex item sizing on the component itself as Panda style props. Registered
+  // DS components are expected to split/forward Panda style props to their
+  // root element. This removes the old "safe span" wrapper for FIXED/FILL/HUG
+  // cases.
+  const layoutStyles = n.rotation === undefined ? componentLayoutStyles(n, parent, ctx) : {}
+  for (const k of Object.keys(n.props)) delete layoutStyles[k]
+  if ('width' in n.props) delete layoutStyles.minWidth
+  if ('height' in n.props) delete layoutStyles.minHeight
+  if (Object.keys(layoutStyles).length) attrs.push(...attrsFromObject(pandaize(layoutStyles, ctx.remBase)))
   const inner = f.createJsxSelfClosingElement(
     f.createIdentifier(n.componentName),
     undefined,
-    f.createJsxAttributes(attrsFromObject(props)),
+    f.createJsxAttributes(attrs),
   )
-  // Layout wrapping (flex-shrink:0 / flex:1 / alignSelf:stretch) is applied
-  // by emitNode AFTER plugin emitWrap so it's always the outermost layer —
-  // the outer span is the one the parent flex container sees, so its
-  // shrink/grow behavior must not be hidden by plugin wrappers.
   let wrapped: ts.JsxChild = inner
   // figma rotation (counterclockwise degrees) → CSS rotate (clockwise positive).
   // Wrap with inline-flex div so rotate doesn't affect parent layout.
@@ -184,10 +235,7 @@ function emitFrame(n: IRFrame, ctx: CodegenCtx, parent: ParentCtx = { dir: 'none
   // BUT if parent's main-axis is HUG, "fill" along that axis is meaningless in figma
   // (HUG sizes to content), so collapse to HUG behaviour (no flex:1) — matches figma render.
   const fillStyle = (axis: 'h' | 'v'): 'main' | 'cross' | null => {
-    // No IR parent → assume the harness wrapper (boxWrapper) is row-flex.
-    // Root FILL-H → flex:1, FILL-V → alignSelf:stretch. This preserves figma's
-    // FILL semantic in CSS without baking the resolved pixel dim.
-    if (parentDir === 'none') return axis === 'h' ? 'main' : 'cross'
+    if (parentDir === 'none') return null
     const parentMainIsH = parentDir === 'row'
     const isMain = (axis === 'h' && parentMainIsH) || (axis === 'v' && !parentMainIsH)
     if (isMain && parent.mainSizing === 'hug') return null
@@ -204,23 +252,25 @@ function emitFrame(n: IRFrame, ctx: CodegenCtx, parent: ParentCtx = { dir: 'none
   if (flexDir) {
     // direction omitted: Flex pattern defaults to row, Stack to column —
     // and we always pair (row→Flex, column→Stack), so the prop is redundant.
-    // Always emit align/justify — CSS flex default for align-items is `stretch`
+    // Always emit align — CSS flex default for align-items is `stretch`
     // (NOT `start`), so omitting figma's `start` would leak `stretch` onto
-    // children that would otherwise be intrinsic-sized. Same risk for justify
-    // is smaller (default `start` matches figma's MIN), but emit for symmetry.
+    // children that would otherwise be intrinsic-sized.
     styles.align = n.layout.alignItems
     // figma SPACE_BETWEEN with a single child renders as "center" (figma
     // distributes equal space on both sides). CSS flex `space-between` with
     // a single child collapses to `start`, so it would shift the child
     // left by (frameW - childW)/2 vs figma. Substitute when only 1 child.
     const visibleChildren = n.children.filter((c) => !c.absolute)
-    styles.justify =
+    const justify =
       n.layout.justifyContent === 'space-between' && visibleChildren.length === 1
         ? 'center'
         : n.layout.justifyContent
-    // Always emit gap (even when 0) — Stack pattern in panda has default
-    // gap='8px' which would silently apply when figma says 0.
-    styles.gap = resolveValue(n.layout.gap, tids.gap, ctx.tokenMap)
+    if (justify !== 'start') styles.justify = justify
+    // Stack pattern may carry a default gap, so preserve column gap=0. Flex
+    // row has no default gap, so omit zero for terser generated JSX.
+    if (n.layout.gap !== 0 || n.layout.direction === 'column') {
+      styles.gap = resolveValue(n.layout.gap, tids.gap, ctx.tokenMap, `${n.figmaId}.gap`)
+    }
     // figma layoutWrap=WRAP → flex-wrap:wrap. counterAxisSpacing maps to
     // rowGap (horizontal flow) or columnGap (vertical flow). The single
     // `gap` property emitted above sets BOTH axes; override the wrap-axis
@@ -243,39 +293,46 @@ function emitFrame(n: IRFrame, ctx: CodegenCtx, parent: ParentCtx = { dir: 'none
     && (n.layout.paddingTop + n.layout.paddingBottom > n.height)
   const dropH = n.layout.sizingH === 'fixed' && typeof n.width === 'number'
     && (n.layout.paddingLeft + n.layout.paddingRight > n.width)
-  if (n.layout.paddingTop && !dropV) styles.paddingTop = resolveValue(n.layout.paddingTop, tids.paddingTop, ctx.tokenMap)
-  if (n.layout.paddingRight && !dropH) styles.paddingRight = resolveValue(n.layout.paddingRight, tids.paddingRight, ctx.tokenMap)
-  if (n.layout.paddingBottom && !dropV) styles.paddingBottom = resolveValue(n.layout.paddingBottom, tids.paddingBottom, ctx.tokenMap)
-  if (n.layout.paddingLeft && !dropH) styles.paddingLeft = resolveValue(n.layout.paddingLeft, tids.paddingLeft, ctx.tokenMap)
+  if (n.layout.paddingTop && !dropV) styles.paddingTop = resolveValue(n.layout.paddingTop, tids.paddingTop, ctx.tokenMap, `${n.figmaId}.paddingTop`)
+  if (n.layout.paddingRight && !dropH) styles.paddingRight = resolveValue(n.layout.paddingRight, tids.paddingRight, ctx.tokenMap, `${n.figmaId}.paddingRight`)
+  if (n.layout.paddingBottom && !dropV) styles.paddingBottom = resolveValue(n.layout.paddingBottom, tids.paddingBottom, ctx.tokenMap, `${n.figmaId}.paddingBottom`)
+  if (n.layout.paddingLeft && !dropH) styles.paddingLeft = resolveValue(n.layout.paddingLeft, tids.paddingLeft, ctx.tokenMap, `${n.figmaId}.paddingLeft`)
   // FIXED → explicit figma resolved width/height (CSS default stretch != figma).
   // FILL → flex:1 (main) or alignSelf:stretch (cross). HUG → omit (intrinsic).
-  // At root (parent.dir === 'none') there is no enclosing flex container in IR,
-  // but the test harness wraps with boxWrapper (inline-flex row). Treat the
-  // wrapper as a row-flex parent so FILL-H → flex:1, FILL-V → alignSelf:stretch.
-  // This keeps the generated JSX semantically responsive (no fixed-px regression).
+  // At root (parent.dir === 'none') there is no real auto-layout parent, so
+  // represent FILL as filling the rendered boundary instead of assuming the
+  // verify harness's inline-flex wrapper.
   if (n.layout.sizingH === 'fill') {
-    const r = fillStyle('h')
-    // `minWidth: 0` lets flex children shrink below their intrinsic min-content
-    // (figma's autolayout doesn't enforce min-content, but CSS flexbox defaults
-    // to `min-width: auto` which can push children to overflow their parent).
-    if (r === 'main') { styles.flex = 1; styles.minWidth = 0 }
-    else if (r === 'cross') { styles.alignSelf = 'stretch'; styles.minWidth = 0 }
+    if (parentDir === 'none') {
+      styles.width = '100%'
+    } else {
+      const r = fillStyle('h')
+      // `minWidth: 0` lets flex children shrink below their intrinsic min-content
+      // (figma's autolayout doesn't enforce min-content, but CSS flexbox defaults
+      // to `min-width: auto` which can push children to overflow their parent).
+      if (r === 'main') { styles.flex = 1; styles.minWidth = 0 }
+      else if (r === 'cross') { styles.alignSelf = 'stretch'; styles.minWidth = 0 }
+    }
   } else if (n.layout.sizingH === 'fixed' && n.width !== undefined) {
-    styles.width = n.width
+    styles.width = resolveValue(n.width, tids.width, ctx.tokenMap, `${n.figmaId}.width`)
     // figma's FIXED sizing means "this dim is the truth" even if padding +
     // children would normally push the flex container larger. Override CSS
     // flex auto-min-size so the explicit dim wins.
     styles.minWidth = 0
   }
   if (n.layout.sizingV === 'fill') {
-    const r = fillStyle('v')
-    if (r === 'main') { styles.flex = 1; styles.minHeight = 0 }
-    else if (r === 'cross') { styles.alignSelf = 'stretch'; styles.minHeight = 0 }
+    if (parentDir === 'none') {
+      styles.height = '100%'
+    } else {
+      const r = fillStyle('v')
+      if (r === 'main') { styles.flex = 1; styles.minHeight = 0 }
+      else if (r === 'cross') { styles.alignSelf = 'stretch'; styles.minHeight = 0 }
+    }
   } else if (n.layout.sizingV === 'fixed' && n.height !== undefined) {
-    styles.height = n.height
+    styles.height = resolveValue(n.height, tids.height, ctx.tokenMap, `${n.figmaId}.height`)
     styles.minHeight = 0
   }
-  if (n.background) styles.background = resolveValue(n.background, tids.background, ctx.tokenMap)
+  if (n.background) styles.background = resolveValue(n.background, tids.background, ctx.tokenMap, `${n.figmaId}.background`)
   // figma cornerSmoothing > 0 → render the rounded shape via clip-path with
   // figma-squircle's path. CSS `border-radius` is a circular arc; figma uses
   // a G2-continuous (smoothed) corner that fades into the side gradually.
@@ -290,6 +347,7 @@ function emitFrame(n: IRFrame, ctx: CodegenCtx, parent: ParentCtx = { dir: 'none
   let squircleClipId: string | undefined
   if (n.borderRadius && n.cornerSmoothing && n.cornerSmoothing > 0
       && typeof n.width === 'number' && typeof n.height === 'number') {
+    requireTokenPath(tids.borderRadius, ctx.tokenMap, `${n.figmaId}.borderRadius`)
     squirclePath = getSvgPath({
       width: n.width, height: n.height,
       cornerRadius: n.borderRadius, cornerSmoothing: n.cornerSmoothing,
@@ -297,7 +355,7 @@ function emitFrame(n: IRFrame, ctx: CodegenCtx, parent: ParentCtx = { dir: 'none
     squircleClipId = `pxp-clip-${n.figmaId.replace(/[^A-Za-z0-9]/g, '_')}`
     styles.clipPath = `url(#${squircleClipId})`
   } else if (n.borderRadius) {
-    styles.borderRadius = n.borderRadius
+    styles.borderRadius = resolveValue(n.borderRadius, tids.borderRadius, ctx.tokenMap, `${n.figmaId}.borderRadius`)
   }
   // Stroke. Two cases:
   //   - non-squircle: use `inset boxShadow` (matches figma INSIDE alignment,
@@ -308,6 +366,10 @@ function emitFrame(n: IRFrame, ctx: CodegenCtx, parent: ParentCtx = { dir: 'none
   //     half, leaving exactly `strokeWeight` px of stroke inside the squircle.
   let strokeOverlay: ts.JsxChild | undefined
   if (n.strokeColor && n.strokeWeight) {
+    requireTokenPath(tids.strokeWeight, ctx.tokenMap, `${n.figmaId}.strokeWeight`)
+    const strokeTokenPath = requireTokenPath(tids.strokeColor, ctx.tokenMap, `${n.figmaId}.strokeColor`)
+    const strokeColor = strokeTokenPath ? `{colors.${strokeTokenPath}}` : n.strokeColor
+    const strokeAttrColor = strokeTokenPath ? colorTokenVar(strokeTokenPath) : n.strokeColor
     if (squirclePath) {
       styles.position = 'relative'
       const overlayStyle = {
@@ -329,14 +391,14 @@ function emitFrame(n: IRFrame, ctx: CodegenCtx, parent: ParentCtx = { dir: 'none
           f.createJsxAttributes([
             f.createJsxAttribute(f.createIdentifier('d'), f.createStringLiteral(squirclePath)),
             f.createJsxAttribute(f.createIdentifier('fill'), f.createStringLiteral('none')),
-            f.createJsxAttribute(f.createIdentifier('stroke'), f.createStringLiteral(n.strokeColor)),
+            f.createJsxAttribute(f.createIdentifier('stroke'), f.createStringLiteral(strokeAttrColor)),
             f.createJsxAttribute(f.createIdentifier('strokeWidth'),
               f.createJsxExpression(undefined, valueToExpr(n.strokeWeight * 2))),
           ]))],
         f.createJsxClosingElement(f.createIdentifier('svg')),
       )
     } else {
-      styles.boxShadow = `inset 0 0 0 ${px2rem(n.strokeWeight, ctx.remBase)} ${n.strokeColor}`
+      styles.insetBorder = `${n.strokeWeight} ${strokeTokenPath ?? n.strokeColor}`
     }
   }
   if (n.clipsContent) styles.overflow = 'hidden'
@@ -349,8 +411,9 @@ function emitFrame(n: IRFrame, ctx: CodegenCtx, parent: ParentCtx = { dir: 'none
     flexDir === 'column' ? 'Stack' :
     'Box'
   ctx.usedJsxPatterns.add(tag)
-  const attrs = Object.keys(styles).length
-    ? attrsFromObject(pandaize(styles, ctx.remBase))
+  const compactStyles = compactPaddingStyles(styles)
+  const attrs = Object.keys(compactStyles).length
+    ? attrsFromObject(pandaize(compactStyles, ctx.remBase))
     : []
   const open = f.createJsxOpeningElement(
     f.createIdentifier(tag), undefined, f.createJsxAttributes(attrs),
@@ -487,26 +550,26 @@ function emitText(n: IRText, ctx: CodegenCtx, parent: ParentCtx = { dir: 'none',
   if (wrapperName) {
     ctx.usedTypography.add(wrapperName)
     const attrs: ts.JsxAttributeLike[] = []
-    const wrapperStyles: Record<string, unknown> = {}
-    if (fixedWidth !== undefined) wrapperStyles.width = fixedWidth
-    if (fillMain) { wrapperStyles.flex = 1; wrapperStyles.minWidth = 0 }
-    if (fillCross) wrapperStyles.alignSelf = 'stretch'
+    const wrapperProps: Record<string, unknown> = {}
+    const inlineStyles: Record<string, unknown> = {}
+    if (fixedWidth !== undefined) wrapperProps.width = fixedWidth
+    if (fillMain) { wrapperProps.flex = 1; wrapperProps.minWidth = 0 }
+    if (fillCross) wrapperProps.alignSelf = 'stretch'
     // figma HUG: width = intrinsic max-content, parent overflows. CSS equivalent:
     // whiteSpace:nowrap (don't soft-wrap) + flex-shrink:0 (don't shrink below natural).
     // figma HUG: width = intrinsic max-content. `nowrap` prevents soft-wrap;
     // explicit `<br/>` (see textChildren) still creates the figma-authored
     // hard breaks regardless of nowrap.
-    if (isHug) { wrapperStyles.whiteSpace = 'nowrap'; wrapperStyles.flexShrink = 0 }
+    if (isHug) wrapperProps.whiteSpace = 'nowrap'
     // Typography wrappers extend HTMLStyledProps<'span'>, so panda style props
     // (color, bg, etc.) pass through `splitCssProps` and merge into className
     // via css(). Prefer the bound token path (resolves to var(--colors-...))
     // — falls back to raw hex/rgba when no figma variable is bound.
-    const colorTokenPath = n.tokenIds?.color ? ctx.tokenMap[n.tokenIds.color] : undefined
+    const colorTokenPath = requireTokenPath(n.tokenIds?.color, ctx.tokenMap, `${n.figmaId}.color`)
     if (colorTokenPath) {
-      attrs.push(f.createJsxAttribute(f.createIdentifier('color'),
-        f.createStringLiteral(colorTokenPath)))
+      wrapperProps.color = colorTokenPath
     } else if (n.color) {
-      wrapperStyles.color = n.color
+      inlineStyles.color = n.color
     }
     // figma can override fontName.style on a TEXT instance independently of
     // its bound textStyle (designer applies Bold on top of Body/Regular). The
@@ -514,18 +577,19 @@ function emitText(n: IRText, ctx: CodegenCtx, parent: ParentCtx = { dir: 'none',
     // IR's fontWeight diverges. Wrapper name suffix encodes its expected
     // weight (Strong=700, Regular=500). Mismatch → inline override.
     const expectedWeight = /Strong$/.test(wrapperName) ? 700 : 500
-    if (n.fontWeight !== expectedWeight) wrapperStyles.fontWeight = n.fontWeight
+    if (n.fontWeight !== expectedWeight) wrapperProps.fontWeight = n.fontWeight
     // figma's HUG width = ceil(advance) creates 0..1 css slack. textAlignHorizontal
     // distributes that slack: LEFT→right, CENTER→half each side, RIGHT→left. Chromium
     // default text-align: start (= LEFT) leaves slack on the right, mismatching figma's
     // CENTER/RIGHT placement by slack/2 or slack css. Mirror figma's choice when not LEFT.
     // JUSTIFIED on single-line falls back to start in CSS, matching figma's behavior.
-    if (n.textAlign && n.textAlign !== 'left' && n.textAlign !== 'justified') {
-      wrapperStyles.textAlign = n.textAlign
+    if (n.textAlign && n.textAlign !== 'left' && n.textAlign !== 'justify') {
+      wrapperProps.textAlign = n.textAlign
     }
-    if (Object.keys(wrapperStyles).length) {
+    attrs.push(...attrsFromObject(pandaize(wrapperProps, ctx.remBase)))
+    if (Object.keys(inlineStyles).length) {
       attrs.push(f.createJsxAttribute(f.createIdentifier('style'),
-        f.createJsxExpression(undefined, valueToExpr(wrapperStyles))))
+        f.createJsxExpression(undefined, valueToExpr(inlineStyles))))
     }
     const open = f.createJsxOpeningElement(
       f.createIdentifier(wrapperName), undefined, f.createJsxAttributes(attrs),
@@ -542,16 +606,16 @@ function emitText(n: IRText, ctx: CodegenCtx, parent: ParentCtx = { dir: 'none',
   }
   // Fallback: styled span (when textStyleId missing or unknown).
   const styles: Record<string, unknown> = {
-    fontSize: resolveValue(n.fontSize, n.tokenIds?.fontSize, ctx.tokenMap),
-    lineHeight: resolveValue(n.lineHeight, n.tokenIds?.lineHeight, ctx.tokenMap),
+    fontSize: resolveValue(n.fontSize, n.tokenIds?.fontSize, ctx.tokenMap, `${n.figmaId}.fontSize`),
+    lineHeight: resolveValue(n.lineHeight, n.tokenIds?.lineHeight, ctx.tokenMap, `${n.figmaId}.lineHeight`),
     fontWeight: n.fontWeight,
-    color: resolveValue(n.color, n.tokenIds?.color, ctx.tokenMap),
+    color: resolveValue(n.color, n.tokenIds?.color, ctx.tokenMap, `${n.figmaId}.color`),
   }
   if (n.textAlign) styles.textAlign = n.textAlign
   if (fixedWidth !== undefined) styles.width = fixedWidth
   if (fillMain) { styles.flex = 1; styles.minWidth = 0 }
   if (fillCross) styles.alignSelf = 'stretch'
-  if (isHug) { styles.whiteSpace = 'nowrap'; styles.flexShrink = 0 }
+  if (isHug) styles.whiteSpace = 'nowrap'
   const open = f.createJsxOpeningElement(
     f.createIdentifier('span'), undefined,
     f.createJsxAttributes([cssAttr(styles, ctx)]),
@@ -628,6 +692,7 @@ function emitVector(n: IRVector): ts.JsxSelfClosingElement {
  */
 function emitShape(n: IRShape, ctx: CodegenCtx, parent: ParentCtx = { dir: 'none', mainSizing: 'fixed' }): ts.JsxElement {
   const { width: w, height: h } = n
+  requireTokenPath(n.fillTokenId, ctx.tokenMap, `${n.figmaId}.fill`)
   // SVG `fill=` is a raw attribute — panda token paths like
   // `content.standard.secondary` would not resolve. Use the raw hex/rgba.
   const fill = n.fill ?? 'none'
@@ -772,10 +837,44 @@ function wrapWithStyle(jsx: ts.JsxChild, style: Record<string, unknown>): ts.Jsx
     f.createJsxClosingElement(f.createIdentifier('span')))
 }
 
+/** Wrap a JSX child in a `<span className={css({...})}>`. Token-aware. */
+function wrapWithCss(jsx: ts.JsxChild, style: Record<string, unknown>, ctx: CodegenCtx): ts.JsxChild {
+  const open = f.createJsxOpeningElement(
+    f.createIdentifier('span'), undefined,
+    f.createJsxAttributes([cssAttr(style, ctx)]),
+  )
+  return f.createJsxElement(open, [jsx],
+    f.createJsxClosingElement(f.createIdentifier('span')))
+}
+
+function resolveTokenPath(tokenId: string | undefined, tokenMap: Record<string, string>): string | undefined {
+  if (!tokenId) return undefined
+  if (tokenMap[tokenId]) return tokenMap[tokenId]
+  const key = /^VariableID:([^/]+)\//.exec(tokenId)?.[1]
+  if (key && tokenMap[key]) return tokenMap[key]
+  const localId = /^VariableID:[^/]+\/(.+)$/.exec(tokenId)?.[1]
+  if (localId && tokenMap[`VariableID:${localId}`]) return tokenMap[`VariableID:${localId}`]
+  return undefined
+}
+
+function requireTokenPath(tokenId: string | undefined, tokenMap: Record<string, string>, label: string): string | undefined {
+  if (!tokenId) return undefined
+  const tokenPath = resolveTokenPath(tokenId, tokenMap)
+  if (!tokenPath) {
+    throw new Error(`[pixpec generate] unresolved design token for ${label}: ${tokenId}`)
+  }
+  return tokenPath
+}
+
+function colorTokenVar(tokenPath: string): string {
+  return `var(--colors-${tokenPath.replace(/\./g, '-')})`
+}
+
 /** Token-or-px helper: when a figma variable id is bound, emit the panda
  * token path. Otherwise emit `<n>px` (or pass-through string). */
-function resolveValue(rawValue: number | string | undefined, tokenId: string | undefined, tokenMap: Record<string, string>): string | number | undefined {
-  if (tokenId && tokenMap[tokenId]) return tokenMap[tokenId]
+function resolveValue(rawValue: number | string | undefined, tokenId: string | undefined, tokenMap: Record<string, string>, label: string): string | number | undefined {
+  const tokenPath = requireTokenPath(tokenId, tokenMap, label)
+  if (tokenPath) return tokenPath
   return rawValue
 }
 
@@ -799,6 +898,7 @@ const px2rem = (v: number, base: number): string =>
 const PX_PROPS = new Set([
   'gap', 'rowGap', 'columnGap',
   'padding', 'paddingTop', 'paddingRight', 'paddingBottom', 'paddingLeft', 'paddingInline', 'paddingBlock',
+  'p', 'pt', 'pr', 'pb', 'pl', 'px', 'py',
   'margin', 'marginTop', 'marginRight', 'marginBottom', 'marginLeft', 'marginInline', 'marginBlock',
   'width', 'height', 'minWidth', 'minHeight', 'maxWidth', 'maxHeight',
   'top', 'right', 'bottom', 'left', 'inset',
@@ -806,6 +906,38 @@ const PX_PROPS = new Set([
   'borderWidth', 'borderTopWidth', 'borderRightWidth', 'borderBottomWidth', 'borderLeftWidth',
   'fontSize', 'lineHeight',
 ])
+
+function compactPaddingStyles(styles: Record<string, unknown>): Record<string, unknown> {
+  const top = styles.paddingTop
+  const right = styles.paddingRight
+  const bottom = styles.paddingBottom
+  const left = styles.paddingLeft
+  const out = { ...styles }
+  delete out.paddingTop
+  delete out.paddingRight
+  delete out.paddingBottom
+  delete out.paddingLeft
+
+  if (top !== undefined && right !== undefined && bottom !== undefined && left !== undefined
+      && top === right && top === bottom && top === left) {
+    out.p = top
+    return out
+  }
+  if (left !== undefined && right !== undefined && left === right) {
+    out.px = left
+  } else {
+    if (left !== undefined) out.pl = left
+    if (right !== undefined) out.pr = right
+  }
+  if (top !== undefined && bottom !== undefined && top === bottom) {
+    out.py = top
+  } else {
+    if (top !== undefined) out.pt = top
+    if (bottom !== undefined) out.pb = bottom
+  }
+  return out
+}
+
 function pandaize(styles: Record<string, unknown>, remBase: number): Record<string, unknown> {
   const out: Record<string, unknown> = {}
   for (const [k, v] of Object.entries(styles)) {
@@ -858,34 +990,30 @@ function emitNode(n: IRNode, ctx: CodegenCtx, parent: ParentCtx = { dir: 'none',
   // Runs BEFORE layout wrap so plugin spans sit between the component and
   // its outer layout span.
   if (ctx.plugins.length) {
-    const ectx = { parentDir: parent.dir, f, wrapWithStyle }
+    const ectx = {
+      parentDir: parent.dir,
+      f,
+      tokenMap: ctx.tokenMap,
+      resolveTokenPath: (tokenId: string | undefined) => requireTokenPath(tokenId, ctx.tokenMap, 'plugin token'),
+      wrapWithStyle,
+      wrapWithCss: (child: ts.JsxChild, style: Record<string, unknown>) => wrapWithCss(child, style, ctx),
+    }
     for (const p of ctx.plugins) {
       if (p.emitWrap) jsx = p.emitWrap(n, jsx, ectx)
     }
   }
-  // Layout wrap — figma sizing → CSS flex (flex-shrink:0 for FIXED, flex:1 /
-  // alignSelf:stretch for FILL). Always the OUTERMOST layer so the parent
-  // flex container sees these layout properties directly. Only applies to
-  // component instances (frames already emit their own layout in styles).
-  // Components don't always honor a `width`/`height` prop (e.g. Divider uses
-  // width:100% to fill parent). Emit explicit dim on the wrapper span when
-  // the instance is FIXED so the inner component has a concrete bounding box.
-  if (n.kind === 'component' && parent.dir !== 'none') {
+  // Rotation-aware layout wrap — CSS transform does not affect flex layout, so
+  // rotated component instances still need an outer bbox reservation. Only
+  // FIXED axes receive explicit width/height; HUG remains intrinsic and FILL
+  // remains a flex/stretch constraint.
+  if (n.kind === 'component' && parent.dir !== 'none' && n.rotation !== undefined) {
     const ws: Record<string, unknown> = {}
-    if (n.sizingH === 'fixed' && n.sizingV === 'fixed') ws.flexShrink = 0
-    else if (n.sizingH === 'fill' && parent.dir === 'row') ws.flex = 1
-    else if (n.sizingV === 'fill' && parent.dir === 'column') ws.flex = 1
-    else if (n.sizingH === 'fill' && parent.dir === 'column') ws.alignSelf = 'stretch'
-    else if (n.sizingV === 'fill' && parent.dir === 'row') ws.alignSelf = 'stretch'
-    // Rotation-aware dim: figma autolayout uses the POST-rotation axis-aligned
-    // bounding box, but CSS `transform: rotate` doesn't affect layout flow.
-    // Compute the rotated bbox so the wrapper reserves the correct space:
-    //   rotW = |w cos θ| + |h sin θ|;  rotH = |w sin θ| + |h cos θ|
-    // For θ=0 → (w,h), θ=90 → (h,w), θ=45 → ((w+h)/√2, (w+h)/√2), generic θ
-    // gets the diagonal-projection dim figma uses.
+    const fixedH = n.sizingH === 'fixed'
+    const fixedV = n.sizingV === 'fixed'
+    if (fixedH && fixedV) ws.flexShrink = 0
     const w = n.width, h = n.height
     let rotW = w, rotH = h
-    if (typeof n.rotation === 'number' && Math.abs(n.rotation) > 0.01 && typeof w === 'number' && typeof h === 'number') {
+    if (Math.abs(n.rotation) > 0.01 && typeof w === 'number' && typeof h === 'number') {
       const r = (n.rotation * Math.PI) / 180
       const cs = Math.abs(Math.cos(r)), sn = Math.abs(Math.sin(r))
       rotW = w * cs + h * sn
@@ -898,14 +1026,9 @@ function emitNode(n: IRNode, ctx: CodegenCtx, parent: ParentCtx = { dir: 'none',
       rotW = snap(rotW)
       rotH = snap(rotH)
     }
-    if (n.sizingH === 'fixed' && typeof rotW === 'number') ws.width = px2rem(rotW, ctx.remBase)
-    if (n.sizingV === 'fixed' && typeof rotH === 'number') ws.height = px2rem(rotH, ctx.remBase)
-    if (Object.keys(ws).length) {
-      // inline-block (not inline-flex) so an inner element with its own
-      // explicit width/height (e.g. a rotation wrap) isn't shrunk by a
-      // would-be flex container's main-axis sizing.
-      jsx = wrapWithStyle(jsx, { ...ws, display: 'inline-block' })
-    }
+    if (fixedH && typeof rotW === 'number') ws.width = px2rem(rotW, ctx.remBase)
+    if (fixedV && typeof rotH === 'number') ws.height = px2rem(rotH, ctx.remBase)
+    jsx = wrapWithStyle(jsx, { ...ws, display: 'inline-block' })
   }
   // figma layoutPositioning=ABSOLUTE → child overlays parent at (x,y).
   // Wrap with position:absolute + left/top so the child sits outside flex

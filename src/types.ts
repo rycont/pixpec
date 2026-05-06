@@ -83,7 +83,7 @@ export interface Case<P> {
  * Scale (deviceScaleFactor) is set at runner level so Chromium and Figma
  * exports stay in lockstep — never let component override it.
  */
-export interface Component<P> {
+interface ComponentBase<P> {
   /** Matches the directory `<componentsDir>/<name>/`. */
   name: string
   cases: Case<P>[]
@@ -102,12 +102,15 @@ export interface Component<P> {
    * (= tab). Default 4. Increase for more cores; decrease if memory-bound.
    */
   batchParallel?: number
+}
+
+export interface ComponentWithFigma<P> extends ComponentBase<P> {
   /**
-   * Optional figma binding — generator uses this to recognize INSTANCE nodes
+   * Figma binding — generator uses this to recognize INSTANCE nodes
    * whose mainComponent.parent.key matches `componentSetKey` and convert
    * them to <Component {...fromInstance(raw)} /> JSX.
    */
-  figma?: FigmaBinding<P>
+  figma: FigmaBinding<P>
   /**
    * Effective default props for this component. Single source of truth for
    * BOTH:
@@ -116,21 +119,26 @@ export interface Component<P> {
    *   2. Codegen: the generator elides any prop on an instance whose value
    *      equals `defaults[key]` — keeping the generated JSX terse.
    *
-   * Without `defaults` declared, the generator emits all fromInstance props
-   * verbatim (no elision) — safe fallback for un-migrated components.
-   *
    * Recommended source: `figmaDefaults(componentSetKey)` from the design-
    * system's tokens pipeline, plus any JS-only props (e.g. `height: 24`)
    * and exposed-instance props (e.g. `Icon: { Type: 'default' }`) that the
    * impl needs to render correctly when the prop is omitted.
    */
+  defaults: Partial<P>
+}
+
+export interface ComponentWithoutFigma<P> extends ComponentBase<P> {
+  figma?: undefined
   defaults?: Partial<P>
 }
 
+export type Component<P> = ComponentWithFigma<P> | ComponentWithoutFigma<P>
+
 /**
  * Serialized figma INSTANCE shape (extracted by walker, no live figma API).
- * `props`: componentProperties values, keyed by both qualified ("Size") and
- * full ("Label#524:131") names — fromInstance uses whichever is convenient.
+ * `props`: componentProperties values, keyed by full ("Label#524:131"),
+ * Figma-short ("Label"), and normalized camelCase ("label") names —
+ * fromInstance uses whichever is convenient.
  * `exposed`: nested instances surfaced for editing (icons, etc.).
  */
 export interface FigmaInstanceRaw {
@@ -152,6 +160,12 @@ export interface FigmaInstanceRaw {
    * actual rendered size as a prop. */
   width?: number
   height?: number
+  sizingH?: 'fixed' | 'hug' | 'fill'
+  sizingV?: 'fixed' | 'hug' | 'fill'
+  mainWidth?: number
+  mainHeight?: number
+  mainSizingH?: 'fixed' | 'hug' | 'fill'
+  mainSizingV?: 'fixed' | 'hug' | 'fill'
 }
 
 export interface FigmaBinding<P> {
@@ -194,8 +208,9 @@ export interface CodegenPlugin {
    * AFTER the default JSX is built. Return a replacement JSX (typically a
    * wrapping span) to alter, or the input unchanged to pass through.
    *
-   * The TypeScript factory `f` and helper to build a styled span wrapper
-   * `wrapWithStyle(jsx, style)` are exposed via the context.
+   * The TypeScript factory `f` and helpers to build wrapper spans are exposed
+   * via the context. Use `wrapWithCss` for Panda token-aware values, and
+   * `wrapWithStyle` for already-valid CSS inline values.
    */
   emitWrap?: (
     n: import('./generator/ir.ts').IRNode,
@@ -208,8 +223,17 @@ export interface EmitContext {
   parentDir: 'row' | 'column' | 'none'
   /** TypeScript factory — for plugins that need to build AST nodes. */
   f: typeof import('typescript').factory
+  /** figma variable id → panda token path (e.g. "core.accent"). */
+  tokenMap: Record<string, string>
+  /** Resolve figma variable ids, including live ids with remote-key prefixes. */
+  resolveTokenPath: (tokenId: string | undefined) => string | undefined
   /** Convenience: wrap an existing JSX element in a `<span style={{...}}>`. */
   wrapWithStyle: (
+    jsx: import('typescript').JsxChild,
+    style: Record<string, unknown>,
+  ) => import('typescript').JsxChild
+  /** Convenience: wrap an existing JSX element in a `<span className={css({...})}>`. */
+  wrapWithCss: (
     jsx: import('typescript').JsxChild,
     style: Record<string, unknown>,
   ) => import('typescript').JsxChild

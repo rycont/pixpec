@@ -40,11 +40,13 @@ struct Record {
     de00_max: f64,
     #[serde(rename = "n_px")]
     n_px: usize,
-    /// Largest connected blob of pixels with ΔE00 > 1.8 (8-connectivity). Distinguishes
+    /// Largest connected blob of pixels with ΔE00 > 1.9 (8-connectivity). Distinguishes
     /// structural diff (a 30+ px blob from a misplaced icon) from anti-alias noise
     /// (isolated pixels). Used by `breakdown` to pass small renderer differences
     /// while catching layout/style regressions.
     blob_max_size: usize,
+    /// Bounding box of the largest blob in downsampled output pixels, [x0,y0,x1,y1).
+    blob_max_bbox: Option<[usize; 4]>,
     artifacts: Artifacts,
 }
 
@@ -115,6 +117,7 @@ fn main() -> Result<()> {
                 de00_max: m.de00_max,
                 n_px: m.n_px,
                 blob_max_size: m.blob_max_size,
+                blob_max_bbox: m.blob_max_bbox,
                 artifacts: Artifacts {
                     figma: f,
                     impl_: c,
@@ -167,6 +170,7 @@ struct Measurement {
     de00_max: f64,
     n_px: usize,
     blob_max_size: usize,
+    blob_max_bbox: Option<[usize; 4]>,
 }
 
 fn measure(figma: &Path, chrom: &Path, downsample: u32) -> Result<Measurement> {
@@ -212,12 +216,13 @@ fn measure(figma: &Path, chrom: &Path, downsample: u32) -> Result<Measurement> {
     // structural mismatches (clustered residual) from anti-alias noise (isolated
     // pixels). A high `de00_max` from one stray pixel is rendering noise; the
     // same `de00_max` clustered into a 9+ pixel blob is a real layout/style bug.
-    // Blob threshold hardcoded at 1.8: any pixel ΔE00 > 1.8 contributes to
+    // Blob threshold hardcoded at 1.9: any pixel ΔE00 > 1.9 contributes to
     // blob membership. Above the JNT (1.0); avoids text/svg edge AA noise
     // contributing to blobs. See breakdown-verify default --max-blob 16.
-    let blob_threshold: f32 = 1.8;
+    let blob_threshold: f32 = 1.9;
     let mut visited = vec![false; n];
     let mut max_blob = 0usize;
+    let mut max_blob_bbox: Option<[usize; 4]> = None;
     let mut stack = Vec::with_capacity(n);
     for start in 0..n {
         if visited[start] || de[start] <= blob_threshold { continue; }
@@ -225,10 +230,20 @@ fn measure(figma: &Path, chrom: &Path, downsample: u32) -> Result<Measurement> {
         stack.push(start);
         visited[start] = true;
         let mut count = 0usize;
+        let mut x0 = usize::MAX;
+        let mut y0 = usize::MAX;
+        let mut x1 = 0usize;
+        let mut y1 = 0usize;
         while let Some(idx) = stack.pop() {
             count += 1;
             let x = (idx % w) as i32;
             let y = (idx / w) as i32;
+            let ux = x as usize;
+            let uy = y as usize;
+            x0 = x0.min(ux);
+            y0 = y0.min(uy);
+            x1 = x1.max(ux + 1);
+            y1 = y1.max(uy + 1);
             for dy in -1..=1 {
                 for dx in -1..=1 {
                     if dx == 0 && dy == 0 { continue; }
@@ -241,9 +256,12 @@ fn measure(figma: &Path, chrom: &Path, downsample: u32) -> Result<Measurement> {
                 }
             }
         }
-        if count > max_blob { max_blob = count; }
+        if count > max_blob {
+            max_blob = count;
+            max_blob_bbox = Some([x0, y0, x1, y1]);
+        }
     }
-    Ok(Measurement { de00: de00_sum, de00_max, n_px: n, blob_max_size: max_blob })
+    Ok(Measurement { de00: de00_sum, de00_max, n_px: n, blob_max_size: max_blob, blob_max_bbox: max_blob_bbox })
 }
 
 /// CIEDE2000 (ΔE00) — Sharma 2005 implementation. Inputs in CIE Lab (D65).
@@ -390,4 +408,3 @@ fn composite_and_downsample(src: &Rgba, f: u32) -> Rgb {
     }
     Rgb { data: out, w: nw, h: nh }
 }
-

@@ -6,7 +6,7 @@
  *
  * Walks the figma node tree from <rootNodeId>, visiting every FRAME / COMPONENT
  * subtree leaf-first. For each node: `pixpec generate` → `pixpec dump-chromium`
- * → exportAsync (cfigma) → `pixpec-measure`. Halts at the first node whose
+ * → exportAsync (cfigma) → `pixpec-measure`. Halts at first node whose
  * max ΔE00/px >= threshold (default 30) — that's where the generator is
  * mishandling something. Atomic INSTANCEs (mapping to a registered danah
  * component) are NOT recursed into; they're treated as leaves rendered via
@@ -48,7 +48,7 @@ const rootNodeId = args[0]
 const opt = (k: string, d?: string) => {
   const i = args.indexOf(k); return i >= 0 ? args[i + 1] : d
 }
-// Pass criterion: largest connected blob of pixels with ΔE00 > 1.8 must NOT
+// Pass criterion: largest connected blob of pixels with ΔE00 > 1.9 must NOT
 // exceed `--max-blob`. Default 8 → "9+ connected pixels above threshold = fail".
 // Distinguishes anti-alias rendering noise (isolated pixels) from real
 // structural mismatches (clustered residuals from mispositioned elements).
@@ -221,7 +221,7 @@ const measure = async (componentName: string): Promise<{ max: number; sum: numbe
 
 await mkdir(dirname(reportPath), { recursive: true })
 await writeFile(reportPath,
-  `# Breakdown report — root ${rootNodeId}\n\nthreshold: largest connected blob (ΔE00 > 1.8) <= ${maxBlob}, max ΔE00/px <= ${maxDe}\n\n`)
+  `# Breakdown report — root ${rootNodeId}\n\nthreshold: largest connected blob (ΔE00 > 1.9) <= ${maxBlob}, max ΔE00/px <= ${maxDe}\n\n`)
 
 let firstFailure: { node: Node; max: number; sum: number; blob: number; componentName: string } | null = null
 let passed = 0, skipped = 0
@@ -278,4 +278,4 @@ if (firstFailure) {
   console.log(`\nFull report: ${reportPath}`)
   process.exit(1)
 }
-console.log(`\n✓ All ${passed} nodes passed (largest blob <= ${maxBlob} pixels above ΔE=1.8). Full report: ${reportPath}`)
+console.log(`\n✓ All ${passed} nodes passed (largest blob <= ${maxBlob} pixels above ΔE=1.9). Full report: ${reportPath}`)

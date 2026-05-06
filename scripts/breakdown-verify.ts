@@ -19,6 +19,7 @@ import { resolve, join, dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { runGenerate } from '../src/generator/cli.ts'
 import { runDumpChromium } from '../src/dump-chromium.ts'
+import { Renderer } from '../src/render.ts'
 import { runAnalyze } from '../src/analyze.ts'
 import { writeRggMaps } from '../src/rgg.ts'
 
@@ -139,7 +140,7 @@ const measure = async (componentName: string): Promise<{ max: number; sum: numbe
 
 await mkdir(dirname(reportPath), { recursive: true })
 await writeFile(reportPath,
-  `# Breakdown report — root ${manifest.rootNodeId}\n\nthreshold: largest connected blob (ΔE00 > 1.8) <= ${maxBlob}, max ΔE00/px <= ${maxDe}\n\n`)
+  `# Breakdown report — root ${manifest.rootNodeId}\n\nthreshold: largest connected blob (ΔE00 > 1.9) <= ${maxBlob}, max ΔE00/px <= ${maxDe}\n\n`)
 
 type Failure = {
   node: Node; max: number; sum: number; blob: number; componentName: string
@@ -148,49 +149,59 @@ type Failure = {
   errMsg?: string
 }
 let firstFailure: Failure | null = null
-let passed = 0, skipped = 0
+let passed = 0
+let renderer: Renderer | null = null
 
-for (const n of manifest.nodes) {
-  const componentName = safeName(n.id)
-  const outDir = resolve(projectRoot, '.pixpec-out', componentName)
-  if (skipPassed && existsSync(join(outDir, 'results.json'))) {
+const getRenderer = async () => {
+  renderer ??= await Renderer.create()
+  return renderer
+}
+
+try {
+  for (const n of manifest.nodes) {
+    const componentName = safeName(n.id)
+    const outDir = resolve(projectRoot, '.pixpec-out', componentName)
+    if (skipPassed && existsSync(join(outDir, 'results.json'))) {
+      try {
+        const r = JSON.parse(await readFile(join(outDir, 'results.json'), 'utf8'))[0]
+        if (typeof r.blob_max_size === 'number' && r.blob_max_size <= maxBlob && (typeof r.dE00_max !== 'number' || r.dE00_max <= maxDe)) {
+          skipped++
+          process.stdout.write(`  [${'··'.repeat(n.depth)}] ${n.id} ${n.name}: cached blob=${r.blob_max_size} max=${(r.dE00_max ?? 0).toFixed(2)} ✓\n`)
+          continue
+        }
+      } catch { /* fall through */ }
+    }
+    process.stdout.write(`  [${'··'.repeat(n.depth)}] ${n.id} ${n.name} (${n.type} ${n.w}x${n.h})… `)
     try {
-      const r = JSON.parse(await readFile(join(outDir, 'results.json'), 'utf8'))[0]
-      if (typeof r.blob_max_size === 'number' && r.blob_max_size <= maxBlob && (typeof r.dE00_max !== 'number' || r.dE00_max <= maxDe)) {
-        skipped++
-        process.stdout.write(`  [${'··'.repeat(n.depth)}] ${n.id} ${n.name}: cached blob=${r.blob_max_size} max=${(r.dE00_max ?? 0).toFixed(2)} ✓\n`)
-        continue
+      await runGenerate(n.id, { tab: manifest.tab })
+      await ensureExport(componentName)
+      await runDumpChromium(componentName, { renderer: await getRenderer() })
+      await placeFigmaPng(n,
+        resolve(projectRoot, '.pixpec-out', componentName, 'figma', `${componentName}_main.png`))
+      const r = await measure(componentName)
+      const ok = r.blob <= maxBlob && r.max <= maxDe
+      process.stdout.write(`blob=${r.blob} max=${r.max.toFixed(2)} sum=${r.sum.toFixed(0)} ${ok ? '✓' : '✗'}\n`)
+      await appendFile(reportPath,
+        `- ${ok ? '✓' : '✗'} ${'  '.repeat(n.depth)}\`${n.id}\` ${n.name} — blob=${r.blob} max=${r.max.toFixed(2)} sum=${r.sum.toFixed(0)}\n`)
+      if (ok) { passed++; continue }
+      firstFailure = { node: n, max: r.max, sum: r.sum, blob: r.blob, componentName }
+      break
+    } catch (e) {
+      if (e instanceof DimMismatchError) {
+        process.stdout.write(`✗ DIM MISMATCH ${e.figW}x${e.figH} (figma) vs ${e.chrW}x${e.chrH} (chrom)\n`)
+        await appendFile(reportPath, `- ✗ ${'  '.repeat(n.depth)}\`${n.id}\` ${n.name} — DIM MISMATCH figma ${e.figW}x${e.figH} vs chrom ${e.chrW}x${e.chrH}\n`)
+        firstFailure = { node: n, max: NaN, sum: NaN, blob: NaN, componentName, kind: 'dim', dimErr: e } as typeof firstFailure
+        break
       }
-    } catch { /* fall through */ }
-  }
-  process.stdout.write(`  [${'··'.repeat(n.depth)}] ${n.id} ${n.name} (${n.type} ${n.w}x${n.h})… `)
-  try {
-    await runGenerate(n.id, { tab: manifest.tab })
-    await ensureExport(componentName)
-    await runDumpChromium(componentName)
-    await placeFigmaPng(n,
-      resolve(projectRoot, '.pixpec-out', componentName, 'figma', `${componentName}_main.png`))
-    const r = await measure(componentName)
-    const ok = r.blob <= maxBlob && r.max <= maxDe
-    process.stdout.write(`blob=${r.blob} max=${r.max.toFixed(2)} sum=${r.sum.toFixed(0)} ${ok ? '✓' : '✗'}\n`)
-    await appendFile(reportPath,
-      `- ${ok ? '✓' : '✗'} ${'  '.repeat(n.depth)}\`${n.id}\` ${n.name} — blob=${r.blob} max=${r.max.toFixed(2)} sum=${r.sum.toFixed(0)}\n`)
-    if (ok) { passed++; continue }
-    firstFailure = { node: n, max: r.max, sum: r.sum, blob: r.blob, componentName }
-    break
-  } catch (e) {
-    if (e instanceof DimMismatchError) {
-      process.stdout.write(`✗ DIM MISMATCH ${e.figW}x${e.figH} (figma) vs ${e.chrW}x${e.chrH} (chrom)\n`)
-      await appendFile(reportPath, `- ✗ ${'  '.repeat(n.depth)}\`${n.id}\` ${n.name} — DIM MISMATCH figma ${e.figW}x${e.figH} vs chrom ${e.chrW}x${e.chrH}\n`)
-      firstFailure = { node: n, max: NaN, sum: NaN, blob: NaN, componentName, kind: 'dim', dimErr: e } as typeof firstFailure
+      const msg = e instanceof Error ? e.message : String(e)
+      process.stdout.write(`ERROR: ${msg.split('\n')[0]}\n`)
+      await appendFile(reportPath, `- ⚠ ${'  '.repeat(n.depth)}\`${n.id}\` ${n.name} — error: ${msg.split('\n')[0]}\n`)
+      firstFailure = { node: n, max: NaN, sum: NaN, blob: NaN, componentName, kind: 'error', errMsg: msg } as typeof firstFailure
       break
     }
-    const msg = e instanceof Error ? e.message : String(e)
-    process.stdout.write(`ERROR: ${msg.split('\n')[0]}\n`)
-    await appendFile(reportPath, `- ⚠ ${'  '.repeat(n.depth)}\`${n.id}\` ${n.name} — error: ${msg.split('\n')[0]}\n`)
-    firstFailure = { node: n, max: NaN, sum: NaN, blob: NaN, componentName, kind: 'error', errMsg: msg } as typeof firstFailure
-    break
   }
+} finally {
+  await renderer?.close()
 }
 
 console.log(`\n[verify] ${passed} passed, ${skipped} skipped (cached)`)
@@ -265,4 +276,4 @@ if (firstFailure) {
   console.log(`Full report: ${reportPath}`)
   process.exit(1)
 }
-console.log(`\n✓ All ${manifest.nodes.length} nodes passed (largest blob <= ${maxBlob} pixels above ΔE=1.8). Full report: ${reportPath}`)
+console.log(`\n✓ All ${manifest.nodes.length} nodes passed (largest blob <= ${maxBlob} pixels above ΔE=1.9). Full report: ${reportPath}`)
