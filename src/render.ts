@@ -11,6 +11,21 @@ import { chromium } from '@playwright/test'
 
 const LOCKED_FLAGS = ['--disable-lcd-text', '--font-render-hinting=none']
 
+/** Layout-side device pixel ratio for verify capture. Fixed at 2.
+ *
+ * Chrom's Skia computes glyph advance with dpr-dependent sub-pixel positioning
+ * binning even when font-render-hinting is disabled. Empirically (Wanted Sans
+ * "~" 14px Medium):
+ *   dpr=8 → advance 7.574 (binning artifact, 1.36c smaller than figma's view)
+ *   dpr=2 → advance 8.935 (matches figma's text engine output)
+ *
+ * For high target output scale (e.g. figma export scale=8), we keep layout at
+ * dpr=2 (correct advance) but drive output density via CDP screenshot scale +
+ * a runtime html font-size scale-up (rem-base supersampling). 8 device px per
+ * figma unit = 2 dpr × 4 rem-multiplier — same density as native dpr=8 but
+ * with text advance computed in dpr=2's precision regime. */
+const VERIFY_DPR = 2
+
 export interface RenderUrlOptions {
   /** URL to navigate to (e.g. pixpec harness route on DS's Vite). */
   url: string
@@ -18,8 +33,14 @@ export interface RenderUrlOptions {
   outPath: string
   /** Viewport dimensions. */
   viewport: { width: number; height: number }
-  /** Device scale factor. Pair with cfigma --scale for pixel parity. */
-  deviceScaleFactor?: number
+  /** Output device-px per CSS-px density. Pair with cfigma --scale for pixel
+   * parity. Layout always runs at VERIFY_DPR (=2) for stable Skia advance;
+   * `outputScale > VERIFY_DPR` upsamples via runtime html font-size scaling. */
+  outputScale: number
+  /** Design system rem base in CSS px (pixpec.toml `remBase`, default 16).
+   * Verify mode sets `html { font-size: remBase × outputScale / VERIFY_DPR }px`
+   * so all rem-based emitted values supersample by `outputScale / VERIFY_DPR`. */
+  remBase: number
   /** CSS selector to clip the screenshot to. Also used as the mount probe. */
   clipSelector?: string
   /** Wait for `document.fonts.ready`. Default true. */
@@ -55,12 +76,25 @@ export class Renderer {
   }
 
   async renderUrl(opts: RenderUrlOptions): Promise<void> {
+    const remPx = opts.remBase * opts.outputScale / VERIFY_DPR
     const ctx: BrowserContext = await this.browser.newContext({
       viewport: opts.viewport,
-      deviceScaleFactor: opts.deviceScaleFactor ?? 2,
+      deviceScaleFactor: VERIFY_DPR,
     })
     try {
       const page = await ctx.newPage()
+      // Set html font-size BEFORE any page script runs. Codegen emits all
+      // figma-px values as rem; this scales the rem base so layout is
+      // (outputScale / VERIFY_DPR)× supersampled while Skia advance stays
+      // in dpr=2's precision regime. String-form (not function) so tsx's
+      // esbuild transpile doesn't inject __name wrappers that fail in chrom.
+      await page.addInitScript({
+        content: `(function(){
+  var apply = function(){ if (document.documentElement) document.documentElement.style.fontSize = "${remPx}px"; };
+  apply();
+  document.addEventListener("readystatechange", apply);
+})();`,
+      })
       page.on('console', (m) => {
         if (m.type() === 'error' || process.env.PIXPEC_DEBUG) {
           console.error(`[browser:${m.type()}] ${m.text()}`)
@@ -73,7 +107,17 @@ export class Renderer {
       if (opts.waitForFonts !== false) {
         await page.evaluate(() => (document as Document).fonts.ready)
       }
+      // Harness may expose `window.__pixpecReady: Promise<void>` for post-mount
+      // work (e.g. SVG sub-pixel snap). Await if present.
+      await page.evaluate(
+        () =>
+          (window as unknown as { __pixpecReady?: Promise<void> }).__pixpecReady ??
+          Promise.resolve(),
+      )
       if (opts.settleMs) await page.waitForTimeout(opts.settleMs)
+      // Output is dpr × CSS. With html font-size scaled by outputScale/VERIFY_DPR,
+      // CSS dim is (outputScale/VERIFY_DPR)× design-unit; capture at dpr=VERIFY_DPR
+      // gives device px = outputScale × design-unit, matching figma export scale.
       await page.locator(targetSel).screenshot({ path: opts.outPath })
     } finally {
       await ctx.close()
@@ -89,13 +133,24 @@ export class Renderer {
   async openBatch(opts: {
     url: string
     viewport: { width: number; height: number }
-    deviceScaleFactor?: number
+    /** Output device-px per CSS-px density. See RenderUrlOptions.outputScale. */
+    outputScale: number
+    /** Design system rem base. See RenderUrlOptions.remBase. */
+    remBase: number
   }): Promise<BatchSession> {
+    const remPx = opts.remBase * opts.outputScale / VERIFY_DPR
     const ctx: BrowserContext = await this.browser.newContext({
       viewport: opts.viewport,
-      deviceScaleFactor: opts.deviceScaleFactor ?? 2,
+      deviceScaleFactor: VERIFY_DPR,
     })
     const page = await ctx.newPage()
+    await page.addInitScript({
+      content: `(function(){
+  var apply = function(){ if (document.documentElement) document.documentElement.style.fontSize = "${remPx}px"; };
+  apply();
+  document.addEventListener("readystatechange", apply);
+})();`,
+    })
     page.on('console', (m) => {
       if (m.type() === 'error' || process.env.PIXPEC_DEBUG) {
         console.error(`[browser:${m.type()}] ${m.text()}`)
@@ -104,7 +159,10 @@ export class Renderer {
     page.on('pageerror', (e) => console.error(`[browser:exception] ${e.message}`))
     await page.goto(opts.url, { waitUntil: 'load', timeout: 120_000 })
     const cdp = await ctx.newCDPSession(page)
-    const dpr = opts.deviceScaleFactor ?? 2
+    // Capture density = VERIFY_DPR. CSS is already (outputScale/VERIFY_DPR)×
+    // supersampled via html font-size, so dpr-density-only capture lands at
+    // outputScale × design-unit (matches figma export at scale=outputScale).
+    const dpr = VERIFY_DPR
     return {
       async waitMounted(expectedCount: number) {
         await page.waitForFunction(
@@ -113,6 +171,11 @@ export class Renderer {
           { timeout: 60_000 },
         )
         await page.evaluate(() => (document as Document).fonts.ready)
+        await page.evaluate(
+          () =>
+            (window as unknown as { __pixpecReady?: Promise<void> }).__pixpecReady ??
+            Promise.resolve(),
+        )
       },
       async screenshot(selector: string, outPath: string) {
         await page.locator(selector).first().screenshot({ path: outPath })

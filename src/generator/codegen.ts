@@ -101,7 +101,7 @@ function deepEq(a: unknown, b: unknown): boolean {
   return false
 }
 
-function emitComponent(n: IRComponent, _parent: ParentCtx = { dir: 'none', mainSizing: 'fixed' }): ts.JsxChild {
+function emitComponent(n: IRComponent, ctx: CodegenCtx, _parent: ParentCtx = { dir: 'none', mainSizing: 'fixed' }): ts.JsxChild {
   // Elide props that match the component-set's default — figma's
   // `componentPropertyDefinitions[name].defaultValue` semantically equals
   // "what you'd get if you didn't override it." Cuts visual noise on
@@ -159,10 +159,10 @@ function emitComponent(n: IRComponent, _parent: ParentCtx = { dir: 'none', mainS
       // rotation box to the parent's content-top, matching figma's render.
       verticalAlign: 'top',
       transformOrigin: '0 0',
-      transform: `translate(${tx.toFixed(4)}px, ${(-minY).toFixed(4)}px) rotate(${-n.rotation}deg)`,
+      transform: `translate(${px2rem(tx, ctx.remBase)}, ${px2rem(-minY, ctx.remBase)}) rotate(${-n.rotation}deg)`,
     }
-    if (typeof n.width === 'number') rotateStyle.width = `${n.width}px`
-    if (typeof n.height === 'number') rotateStyle.height = `${n.height}px`
+    if (typeof n.width === 'number') rotateStyle.width = px2rem(n.width, ctx.remBase)
+    if (typeof n.height === 'number') rotateStyle.height = px2rem(n.height, ctx.remBase)
     const open = f.createJsxOpeningElement(
       f.createIdentifier('div'), undefined,
       f.createJsxAttributes([
@@ -209,10 +209,30 @@ function emitFrame(n: IRFrame, ctx: CodegenCtx, parent: ParentCtx = { dir: 'none
     // children that would otherwise be intrinsic-sized. Same risk for justify
     // is smaller (default `start` matches figma's MIN), but emit for symmetry.
     styles.align = n.layout.alignItems
-    styles.justify = n.layout.justifyContent
+    // figma SPACE_BETWEEN with a single child renders as "center" (figma
+    // distributes equal space on both sides). CSS flex `space-between` with
+    // a single child collapses to `start`, so it would shift the child
+    // left by (frameW - childW)/2 vs figma. Substitute when only 1 child.
+    const visibleChildren = n.children.filter((c) => !c.absolute)
+    styles.justify =
+      n.layout.justifyContent === 'space-between' && visibleChildren.length === 1
+        ? 'center'
+        : n.layout.justifyContent
     // Always emit gap (even when 0) — Stack pattern in panda has default
     // gap='8px' which would silently apply when figma says 0.
     styles.gap = resolveValue(n.layout.gap, tids.gap, ctx.tokenMap)
+    // figma layoutWrap=WRAP → flex-wrap:wrap. counterAxisSpacing maps to
+    // rowGap (horizontal flow) or columnGap (vertical flow). The single
+    // `gap` property emitted above sets BOTH axes; override the wrap-axis
+    // gap when figma specifies a different counter-gap.
+    if (n.layout.wrap) {
+      styles.flexWrap = 'wrap'
+      const cg = n.layout.counterGap
+      if (typeof cg === 'number' && cg !== n.layout.gap) {
+        if (n.layout.direction === 'row') styles.rowGap = cg
+        else if (n.layout.direction === 'column') styles.columnGap = cg
+      }
+    }
   }
   if (n.layout.paddingTop) styles.paddingTop = resolveValue(n.layout.paddingTop, tids.paddingTop, ctx.tokenMap)
   if (n.layout.paddingRight) styles.paddingRight = resolveValue(n.layout.paddingRight, tids.paddingRight, ctx.tokenMap)
@@ -294,7 +314,7 @@ function emitFrame(n: IRFrame, ctx: CodegenCtx, parent: ParentCtx = { dir: 'none
         f.createJsxClosingElement(f.createIdentifier('svg')),
       )
     } else {
-      styles.boxShadow = `inset 0 0 0 ${n.strokeWeight}px ${n.strokeColor}`
+      styles.boxShadow = `inset 0 0 0 ${px2rem(n.strokeWeight, ctx.remBase)} ${n.strokeColor}`
     }
   }
   if (n.clipsContent) styles.overflow = 'hidden'
@@ -308,7 +328,7 @@ function emitFrame(n: IRFrame, ctx: CodegenCtx, parent: ParentCtx = { dir: 'none
     'Box'
   ctx.usedJsxPatterns.add(tag)
   const attrs = Object.keys(styles).length
-    ? attrsFromObject(pandaize(styles))
+    ? attrsFromObject(pandaize(styles, ctx.remBase))
     : []
   const open = f.createJsxOpeningElement(
     f.createIdentifier(tag), undefined, f.createJsxAttributes(attrs),
@@ -368,7 +388,7 @@ function emitText(n: IRText, ctx: CodegenCtx, parent: ParentCtx = { dir: 'none',
     // (color, bg, etc.) pass through `splitCssProps` and merge into className
     // via css(). Prefer the bound token path (resolves to var(--colors-...))
     // — falls back to raw hex/rgba when no figma variable is bound.
-    const colorTokenPath = n.colorTokenId ? ctx.tokenMap[n.colorTokenId] : undefined
+    const colorTokenPath = n.tokenIds?.color ? ctx.tokenMap[n.tokenIds.color] : undefined
     if (colorTokenPath) {
       attrs.push(f.createJsxAttribute(f.createIdentifier('color'),
         f.createStringLiteral(colorTokenPath)))
@@ -409,10 +429,10 @@ function emitText(n: IRText, ctx: CodegenCtx, parent: ParentCtx = { dir: 'none',
   }
   // Fallback: styled span (when textStyleId missing or unknown).
   const styles: Record<string, unknown> = {
-    fontSize: n.fontSize,
-    lineHeight: `${n.lineHeight}px`,
+    fontSize: resolveValue(n.fontSize, n.tokenIds?.fontSize, ctx.tokenMap),
+    lineHeight: resolveValue(n.lineHeight, n.tokenIds?.lineHeight, ctx.tokenMap),
     fontWeight: n.fontWeight,
-    color: resolveValue(n.color, n.colorTokenId, ctx.tokenMap),
+    color: resolveValue(n.color, n.tokenIds?.color, ctx.tokenMap),
   }
   if (n.textAlign) styles.textAlign = n.textAlign
   if (fixedWidth !== undefined) styles.width = fixedWidth
@@ -424,12 +444,12 @@ function emitText(n: IRText, ctx: CodegenCtx, parent: ParentCtx = { dir: 'none',
     f.createJsxAttributes([cssAttr(styles, ctx)]),
   )
   const close = f.createJsxClosingElement(f.createIdentifier('span'))
-  return f.createJsxElement(open, paragraphChildren(n.content, n.paragraphSpacing), close)
+  return f.createJsxElement(open, paragraphChildren(n.content, n.paragraphSpacing, ctx.remBase), close)
 }
 
 /** Multi-paragraph block split with `marginBottom: paragraphSpacing` between
  * paragraphs (no spacing on last). Single-paragraph content returns plain text. */
-function paragraphChildren(content: string, paragraphSpacing: number): ts.JsxChild[] {
+function paragraphChildren(content: string, paragraphSpacing: number, remBase: number): ts.JsxChild[] {
   const paragraphs = content.split('\n')
   if (paragraphs.length <= 1 || paragraphSpacing <= 0) return textChildren(content)
   return paragraphs.map((p, i) => {
@@ -437,7 +457,7 @@ function paragraphChildren(content: string, paragraphSpacing: number): ts.JsxChi
     const styles: Record<string, unknown> = {
       display: 'block',
       whiteSpace: 'inherit',
-      ...(isLast ? {} : { marginBottom: `${paragraphSpacing}px` }),
+      ...(isLast ? {} : { marginBottom: px2rem(paragraphSpacing, remBase) }),
     }
     const open = f.createJsxOpeningElement(
       f.createIdentifier('span'), undefined,
@@ -618,6 +638,9 @@ interface CodegenCtx {
   usedJsxPatterns: Set<string>
   /** figma variable id → panda token path (e.g. "background.standard.primary"). */
   tokenMap: Record<string, string>
+  /** REM base in CSS px. From pixpec.toml `remBase` (default 16). All emitted
+   * numeric figma-px values become `(value/remBase)rem`. */
+  remBase: number
   /** DS-specific codegen extensions (Icon currentColor, etc.). Each plugin's
    * `emitWrap` runs after the default JSX is built per node. */
   plugins: import('../types.ts').CodegenPlugin[]
@@ -643,10 +666,22 @@ function resolveValue(rawValue: number | string | undefined, tokenId: string | u
   return rawValue
 }
 
+/** figma px → rem string. base from pixpec.toml `remBase` (default 16,
+ * matches CSS default html font-size). Emitting rem (not px) lets verify-mode
+ * harness scale the html font-size to supersample text layout — chrom's Skia
+ * glyph advance is dpr-dependent at small font sizes (14px @ dpr=8 measures
+ * ~1.36c smaller than dpr=2), so capturing at dpr=2 with 4× rem-base produces
+ * a 56px effective render that downsamples cleanly to figma scale=8 and
+ * preserves dpr=2 advance precision. Production at default html font-size:
+ * 1rem = 16px, unaffected.
+ */
+const px2rem = (v: number, base: number): string =>
+  `${+(v / base).toFixed(6)}rem`
+
 /**
- * Numeric → '<n>px' string for properties that panda interprets as token
+ * Numeric → 'rem' string for properties that panda interprets as token
  * references when given a bare number (spacing/sizing/radius/border). Other
- * properties (flex, opacity, fontWeight, lineHeight when string) pass through.
+ * properties (flex, opacity, fontWeight) pass through.
  */
 const PX_PROPS = new Set([
   'gap', 'rowGap', 'columnGap',
@@ -656,12 +691,12 @@ const PX_PROPS = new Set([
   'top', 'right', 'bottom', 'left', 'inset',
   'borderRadius', 'borderTopLeftRadius', 'borderTopRightRadius', 'borderBottomLeftRadius', 'borderBottomRightRadius',
   'borderWidth', 'borderTopWidth', 'borderRightWidth', 'borderBottomWidth', 'borderLeftWidth',
-  'fontSize',
+  'fontSize', 'lineHeight',
 ])
-function pandaize(styles: Record<string, unknown>): Record<string, unknown> {
+function pandaize(styles: Record<string, unknown>, remBase: number): Record<string, unknown> {
   const out: Record<string, unknown> = {}
   for (const [k, v] of Object.entries(styles)) {
-    out[k] = typeof v === 'number' && PX_PROPS.has(k) ? `${v}px` : v
+    out[k] = typeof v === 'number' && PX_PROPS.has(k) ? px2rem(v, remBase) : v
   }
   return out
 }
@@ -669,7 +704,7 @@ function pandaize(styles: Record<string, unknown>): Record<string, unknown> {
 /** Build `className={css({...})}` JSX attribute (panda CSS). */
 function cssAttr(styles: Record<string, unknown>, ctx: CodegenCtx): ts.JsxAttribute {
   ctx.usesCss = true
-  const obj = pandaize(styles)
+  const obj = pandaize(styles, ctx.remBase)
   const call = f.createCallExpression(
     f.createIdentifier('css'), undefined,
     [valueToExpr(obj)],
@@ -698,7 +733,7 @@ interface ParentCtx {
 function emitNode(n: IRNode, ctx: CodegenCtx, parent: ParentCtx = { dir: 'none', mainSizing: 'fixed' }): ts.JsxChild {
   let jsx: ts.JsxChild
   switch (n.kind) {
-    case 'component': jsx = emitComponent(n, parent); break
+    case 'component': jsx = emitComponent(n, ctx, parent); break
     case 'frame': jsx = emitFrame(n, ctx, parent); break
     case 'text': jsx = emitText(n, ctx, parent); break
     case 'vector': jsx = emitVector(n); break
@@ -750,8 +785,8 @@ function emitNode(n: IRNode, ctx: CodegenCtx, parent: ParentCtx = { dir: 'none',
       rotW = snap(rotW)
       rotH = snap(rotH)
     }
-    if (n.sizingH === 'fixed' && typeof rotW === 'number') ws.width = rotW
-    if (n.sizingV === 'fixed' && typeof rotH === 'number') ws.height = rotH
+    if (n.sizingH === 'fixed' && typeof rotW === 'number') ws.width = px2rem(rotW, ctx.remBase)
+    if (n.sizingV === 'fixed' && typeof rotH === 'number') ws.height = px2rem(rotH, ctx.remBase)
     if (Object.keys(ws).length) {
       // inline-block (not inline-flex) so an inner element with its own
       // explicit width/height (e.g. a rotation wrap) isn't shrunk by a
@@ -774,6 +809,7 @@ export function generate(
   typographyMap: Record<string, string> = {},
   tokenMap: Record<string, string> = {},
   plugins: import('../types.ts').CodegenPlugin[] = [],
+  remBase: number = 16,
 ): string {
   hydrate(root, components)
   const usedComponents = new Set<string>()
@@ -782,6 +818,7 @@ export function generate(
     typographyMap, usedTypography: new Set(),
     usesCss: false, usedJsxPatterns: new Set(),
     tokenMap,
+    remBase,
     plugins,
   }
 

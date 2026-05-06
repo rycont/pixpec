@@ -79,6 +79,10 @@ export interface IRFrame extends IRBase {
     /** figma layoutSizingHorizontal: FIXED|HUG|FILL → width treatment */
     sizingH: 'fixed' | 'hug' | 'fill'
     sizingV: 'fixed' | 'hug' | 'fill'
+    /** figma layoutWrap=WRAP — children wrap onto multiple rows/cols. */
+    wrap?: boolean
+    /** figma counterAxisSpacing — gap between wrapped lines (when wrap). */
+    counterGap?: number
   }
   width?: number
   height?: number
@@ -100,6 +104,7 @@ export interface IRFrame extends IRBase {
     paddingTop?: string; paddingRight?: string; paddingBottom?: string; paddingLeft?: string
     width?: string; height?: string
     borderRadius?: string
+    strokeWeight?: string
   }
   /** figma clipsContent → overflow:hidden; off-bounds children get clipped (e.g., 126x0 separator). */
   clipsContent?: boolean
@@ -119,9 +124,14 @@ export interface IRText extends IRBase {
   paragraphSpacing: number
   /** Resolved CSS color (hex or rgba). Codegen maps to panda token. */
   color: string
-  /** figma variable id for the fill color, when bound. Codegen prefers this
-   * over the raw `color` for emission as a panda token reference. */
-  colorTokenId?: string
+  /** figma boundVariables — variable id per styled property. Codegen uses
+   * `figma-tokens.json` to resolve id → panda token path. */
+  tokenIds?: {
+    color?: string
+    lineHeight?: string
+    paragraphSpacing?: string
+    fontSize?: string
+  }
   textAlign?: 'left' | 'center' | 'right' | 'justify'
   /** Figma textStyle binding (S:hash,index format). If matches a registered
    * typography wrapper, codegen emits <Wrapper>content</Wrapper> instead of

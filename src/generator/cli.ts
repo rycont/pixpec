@@ -30,13 +30,30 @@ import type { IRNode } from './ir.ts'
 const isComponent = (v: unknown): v is Component<unknown> =>
   !!v && typeof v === 'object' && 'name' in v && 'cases' in v && 'noise' in v
 
+export interface FigmaPayload {
+  ir: IRNode
+  fileKey: string
+  wrapper: { width?: number; height?: number; padding: number; bg: string }
+}
+
+/** Cache path used by `breakdown-prepare` to stash a per-node {ir, fileKey,
+ * wrapper} so `runGenerate` can run later without any cfigma calls. */
+export function breakdownCachePath(root: string, nodeId: string): string {
+  const safe = nodeId.replace(/[^A-Za-z0-9]/g, '_')
+  return resolve(root, '.pixpec-out/_breakdown-cache/ir', `${safe}.json`)
+}
+
 export async function runGenerate(
   nodeId: string,
-  opts: { tab?: string; name?: string } = {},
+  opts: { tab?: string; name?: string; payload?: FigmaPayload } = {},
 ): Promise<{ jsx: string; ir: IRNode; componentDir: string; componentName: string }> {
   const { cfg, root } = await loadConfig()
-  if (!cfg.cfigmaBin) throw new Error('pixpec.toml: cfigmaBin required')
-  const componentName = opts.name ?? `Gen_${nodeId.replace(':', '_')}`
+  // cfigmaBin only required when we actually have to talk to figma — a
+  // cached payload (or one passed in) lets us skip that branch entirely.
+  // Sanitize: figma INSTANCE ids carry `;` and leading `I` (e.g.
+  // `I14252:90810;3686:12769`). Strip to alphanumerics for a valid JS
+  // identifier and a directory-safe name.
+  const componentName = opts.name ?? `Gen_${nodeId.replace(/[^A-Za-z0-9]/g, '_')}`
   const componentsDir = cfg.componentsDir ?? 'src/components'
   const componentDir = resolve(root, componentsDir, componentName)
 
@@ -61,14 +78,36 @@ export async function runGenerate(
   const walkExtend = plugins.map(p => p.walkExtend ?? '').filter(Boolean).join('\n')
 
   const tab = opts.tab ?? cfg.tabPattern
-  const ir = await walk({ cfigmaBin: cfg.cfigmaBin, tab, nodeId, registry, walkExtend })
+  // Resolve the (ir, fileKey, wrapper) bundle. Priority:
+  //   1. opts.payload — caller already has it (in-memory pass).
+  //   2. .pixpec-out/_breakdown-cache/ir/<safeId>.json — pre-warmed by
+  //      `breakdown-prepare`; avoids any cfigma call here.
+  //   3. live figma — fall back to walking + bridge SVG export + getFileKey.
+  const cachedPath = breakdownCachePath(root, nodeId)
+  const cacheExists = (await import('node:fs')).existsSync(cachedPath)
+  let payload: FigmaPayload
+  if (opts.payload) {
+    payload = opts.payload
+  } else if (cacheExists) {
+    payload = JSON.parse(await (await import('node:fs/promises')).readFile(cachedPath, 'utf8'))
+    console.log(`[generate] using cached IR (.pixpec-out/_breakdown-cache/ir/${nodeId.replace(/[^A-Za-z0-9]/g, '_')}.json)`)
+  } else {
+    if (!cfg.cfigmaBin) throw new Error('pixpec.toml: cfigmaBin required (no cached IR for this nodeId)')
+    const ir = await walk({ cfigmaBin: cfg.cfigmaBin, tab, nodeId, registry, walkExtend })
+    if (ir.kind === 'text') {
+      throw new Error(`Cannot generate from a bare TEXT node. figma exportAsync trims to ink bbox (render bounds), making dim-parity with chromium's line-box impossible. Wrap the text in a frame first, then generate from the frame's nodeId.`)
+    }
+    await resolveImages(ir, tab)
+    const fileKey = await getFileKey(cfg.cfigmaBin, tab)
+    const wrapper = await getNodeDim(cfg.cfigmaBin, tab, nodeId)
+    payload = { ir, fileKey, wrapper }
+  }
+  const { ir } = payload
+  const wrapper = payload.wrapper
+  const fileKey = payload.fileKey
   if (ir.kind === 'text') {
     throw new Error(`Cannot generate from a bare TEXT node. figma exportAsync trims to ink bbox (render bounds), making dim-parity with chromium's line-box impossible. Wrap the text in a frame first, then generate from the frame's nodeId.`)
   }
-
-  // Get the wrapper dim from the source frame so the generated component
-  // can be rendered into a fixed-size box for dim parity.
-  const wrapper = await getNodeDim(cfg.cfigmaBin, tab, nodeId)
   // Optional typography binding: textStyleId → wrapper component name.
   let typographyMap: Record<string, string> = {}
   try {
@@ -94,12 +133,7 @@ export async function runGenerate(
     }
     console.log(`[generate] loaded ${Object.keys(tokenMap).length} design-token bindings`)
   } catch { /* optional */ }
-  // Resolve IRImage.dataUrl: collect figma ids of all 'image' kind nodes,
-  // batch-export PNG via cfigma bridge, mutate IR in place. Inline base64 so
-  // the generated component is self-contained (no external asset dir).
-  await resolveImages(ir, tab)
-  const jsx = generate(ir, components, typographyMap, tokenMap, plugins)
-  const fileKey = await getFileKey(cfg.cfigmaBin, tab)
+  const jsx = generate(ir, components, typographyMap, tokenMap, plugins, cfg.remBase)
 
   await mkdir(componentDir, { recursive: true })
   // Format generator output with Prettier so the source is human-reviewable.
@@ -168,6 +202,59 @@ export const ${componentName} = defineComponent<GeneratedProps>({
 
 /** Query node dim + sizing mode via cfigma exec. Wrapper omits dim on HUG axes
  * so the rendered root expresses its intrinsic size (CSS-equivalent of HUG). */
+/** Walk + resolveImages + getFileKey for a root node, returning data needed
+ * by `breakdown-prepare` to slice per-subtree caches. Single bridge round
+ * for the whole tree (vs N per-node walks). */
+export async function buildRootPayload(
+  rootNodeId: string,
+  tab: string,
+): Promise<{ ir: IRNode; fileKey: string }> {
+  const { cfg, root } = await loadConfig()
+  if (!cfg.cfigmaBin) throw new Error('pixpec.toml: cfigmaBin required')
+  const registryMod = (await import(resolve(root, 'src/index.ts'))) as Record<string, unknown>
+  const components = Object.values(registryMod).filter(isComponent)
+  const registry = buildRegistry(components)
+  type Plugin = import('../types.ts').CodegenPlugin
+  let plugins: Plugin[] = []
+  const pluginConfigPath = resolve(root, 'pixpec.config.ts')
+  if ((await import('node:fs')).existsSync(pluginConfigPath)) {
+    const mod = (await import(pluginConfigPath)) as { default?: { plugins?: Plugin[] }; plugins?: Plugin[] }
+    plugins = mod.default?.plugins ?? mod.plugins ?? []
+  }
+  const walkExtend = plugins.map(p => p.walkExtend ?? '').filter(Boolean).join('\n')
+  const ir = await walk({ cfigmaBin: cfg.cfigmaBin, tab, nodeId: rootNodeId, registry, walkExtend })
+  await resolveImages(ir, tab)
+  const fileKey = await getFileKey(cfg.cfigmaBin, tab)
+  return { ir, fileKey }
+}
+
+/** Compute the chromium wrapper dim from IR alone — no cfigma call. Mirrors
+ * `getNodeDim`'s rule (omit dim on HUG axes so the rendered root expresses
+ * its intrinsic size). */
+export function wrapperFromIr(ir: IRNode): FigmaPayload['wrapper'] {
+  const sH = (ir as { layout?: { sizingH?: string } }).layout?.sizingH
+    ?? (ir as { sizingH?: string }).sizingH
+  const sV = (ir as { layout?: { sizingV?: string } }).layout?.sizingV
+    ?? (ir as { sizingV?: string }).sizingV
+  const w = (ir as { width?: number }).width
+  const h = (ir as { height?: number }).height
+  return {
+    width: sH === 'hug' ? undefined : w,
+    height: sV === 'hug' ? undefined : h,
+    padding: 0, bg: '#ffffff',
+  }
+}
+
+/** DFS the IR, yielding (node, subtreeIr) for every node id encountered.
+ * `breakdown-prepare` uses this to write a per-subtree cache file from a
+ * single root walk. */
+export function* walkIrSubtrees(ir: IRNode): Iterable<{ id: string; ir: IRNode }> {
+  yield { id: ir.figmaId, ir }
+  if (ir.kind === 'frame') {
+    for (const c of ir.children) yield* walkIrSubtrees(c)
+  }
+}
+
 async function getNodeDim(cfigmaBin: string, tab: string, nodeId: string): Promise<{
   width?: number; height?: number; padding: number; bg: string;
   sH: 'FIXED' | 'HUG' | 'FILL'; sV: 'FIXED' | 'HUG' | 'FILL';

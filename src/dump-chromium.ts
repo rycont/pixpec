@@ -26,11 +26,13 @@ export interface DumpChromiumOptions {
   /** Base URL of an externally-launched Vite dev server. Required. */
   devUrl: string
   scale?: number
+  /** Design system rem base in CSS px. Default 16. */
+  remBase?: number
   verbose?: boolean
 }
 
 export async function dumpChromium(opts: DumpChromiumOptions): Promise<void> {
-  const { component: comp, outDir, devUrl, scale, verbose } = opts
+  const { component: comp, outDir, devUrl, scale, remBase, verbose } = opts
   await mkdir(outDir, { recursive: true })
 
   // Probe the dev server up-front so the failure mode is a clear message
@@ -65,7 +67,8 @@ export async function dumpChromium(opts: DumpChromiumOptions): Promise<void> {
       const session = await renderer.openBatch({
         url,
         viewport: comp.viewport ?? { width: 4000, height: 8000 },
-        deviceScaleFactor: scale ?? 2,
+        outputScale: scale ?? 2,
+        remBase: remBase ?? 16,
       })
       const tNav = Date.now()
       await session.waitMounted(e - s)
@@ -134,6 +137,7 @@ export async function runDumpChromium(componentName: string): Promise<void> {
     outDir,
     devUrl,
     scale: cfg.scale,
+    remBase: cfg.remBase,
     verbose: true,
   })
   console.log(`[dump-chromium] done in ${Date.now() - t0}ms`)

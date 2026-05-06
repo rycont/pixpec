@@ -55,41 +55,27 @@ async function __pixpecIr(node) {
     }
     // Detach detection: when an instance carries structural divergence from
     // its master that the registered component cannot reproduce via props,
-    // walk it as a raw frame so we get the actual figma node tree.
-    // Triggers:
-    //   1) visible-field override on a descendant whose visibility is NOT
-    //      bound to a BOOLEAN componentProperty (designer hid/showed a
-    //      master-defined element directly).
-    //   2) TEXT descendant whose fontName.style differs from its master
-    //      counterpart (designer overrode font weight without using a
-    //      provided variant). figma instance.overrides does NOT report
-    //      fontName overrides reliably, so we must diff master vs instance
-    //      manually.
-    const visOverrides = (node.overrides || []).filter(o =>
-      o.overriddenFields?.includes('visible'));
+    // walk it as a raw frame so we get the actual figma node tree. Single
+    // pass over node.overrides -- figma reports overridden fields per
+    // descendant, no need to fetch the master and diff manually.
+    //
+    // Triggers (any one detaches):
+    //   - visible on a descendant NOT bound to a BOOLEAN componentProperty
+    //     (designer hid/showed a master-defined element directly)
+    //   - fontName / fontSize on a TEXT descendant
+    //   - fills on a TEXT descendant (token rebind, e.g.
+    //     content.standard.primary -> secondary)
     const structural = await (async () => {
-      // (1) visible override
-      for (const ov of visOverrides) {
+      for (const ov of (node.overrides || [])) {
+        const fields = ov.overriddenFields || [];
         const target = await figma.getNodeByIdAsync(ov.id);
-        if (target && !target.componentPropertyReferences?.visible) return true;
-      }
-      // (2) text fontName diff. Instance descendant text id format is
-      // "I<instanceId>;<masterDescendantId>". Strip prefix to find the
-      // master text and compare fontName.style.
-      const instTexts = [];
-      const collectTexts = (n) => {
-        if (n.type === 'TEXT') instTexts.push(n);
-        for (const c of n.children ?? []) collectTexts(c);
-      };
-      collectTexts(node);
-      for (const t of instTexts) {
-        // Master-id stripping. "I<instId>;<masterId>" → "<masterId>"
-        const masterId = t.id.startsWith('I') ? t.id.split(';').slice(1).join(';') : null;
-        if (!masterId) continue;
-        const masterText = await figma.getNodeByIdAsync(masterId);
-        if (!masterText || masterText.type !== 'TEXT') continue;
-        if (t.fontName?.style !== masterText.fontName?.style) return true;
-        if (t.fontSize !== masterText.fontSize) return true;
+        if (!target) continue;
+        if (fields.includes('visible') && !target.componentPropertyReferences?.visible) return true;
+        if (target.type === 'TEXT' && (
+          fields.includes('fontName') ||
+          fields.includes('fontSize') ||
+          fields.includes('fills')
+        )) return true;
       }
       return false;
     })();
@@ -162,6 +148,7 @@ async function __pixpecIr(node) {
       paddingBottom: bv.paddingBottom?.id, paddingLeft: bv.paddingLeft?.id,
       width: bv.width?.id, height: bv.height?.id,
       borderRadius: bv.topLeftRadius?.id,
+      strokeWeight: bv.strokeWeight?.id,
     };
     const children = [];
     for (const c of node.children || []) {
@@ -185,6 +172,8 @@ async function __pixpecIr(node) {
         justifyContent: mapAlign(node.primaryAxisAlignItems),
         sizingH: mapSizing(node.layoutSizingHorizontal),
         sizingV: mapSizing(node.layoutSizingVertical),
+        wrap: node.layoutWrap === 'WRAP',
+        counterGap: node.counterAxisSpacing || 0,
       },
       width: node.width, height: node.height,
       background: bg, borderRadius: node.cornerRadius,
@@ -197,7 +186,13 @@ async function __pixpecIr(node) {
   }
   if (node.type === 'TEXT') {
     const fill = (Array.isArray(node.fills) && node.fills[0]?.type === 'SOLID') ? node.fills[0] : null;
-    const colorTokenId = fill?.boundVariables?.color?.id;
+    const tbv = node.boundVariables || {};
+    const tokenIds = {
+      color: fill?.boundVariables?.color?.id,
+      lineHeight: tbv.lineHeight?.id,
+      paragraphSpacing: tbv.paragraphSpacing?.id,
+      fontSize: tbv.fontSize?.id,
+    };
     return {
       ...base, kind: 'text',
       content: node.characters,
@@ -205,7 +200,7 @@ async function __pixpecIr(node) {
       lineHeight: typeof node.lineHeight === 'object' && node.lineHeight.unit === 'PIXELS' ? node.lineHeight.value : node.fontSize,
       paragraphSpacing: typeof node.paragraphSpacing === 'number' ? node.paragraphSpacing : 0,
       color: fill ? rgbaHex(fill.color, fill.opacity ?? 1) : '#000000',
-      colorTokenId,
+      tokenIds,
       textAlign: node.textAlignHorizontal?.toLowerCase(),
       textStyleId: typeof node.textStyleId === 'string' ? node.textStyleId : undefined,
       autoResize: mapAutoResize(node.textAutoResize),

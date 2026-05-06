@@ -35,8 +35,12 @@ export interface BoxWrapperOptions {
   color?: string
 }
 export function boxWrapper(o: BoxWrapperOptions): ComponentType<{ children: ReactNode }> {
+  // Emit dimensional values as rem so verify-mode html font-size scaling
+  // (codegen Phase 2) supersamples the wrapper alongside the codegen'd JSX.
+  // 16 is CSS default html font-size; production renders identically.
+  const px2rem = (v: number) => `${+(v / 16).toFixed(6)}rem`
   const style: Record<string, unknown> = {
-    padding: o.padding ?? 0,
+    padding: typeof o.padding === 'number' ? px2rem(o.padding) : '0rem',
     background: o.bg ?? 'white',
     ...(o.color ? { color: o.color } : {}),
     boxSizing: 'border-box',
@@ -44,7 +48,7 @@ export function boxWrapper(o: BoxWrapperOptions): ComponentType<{ children: Reac
     alignItems: 'center',
     justifyContent: 'center',
   }
-  if (o.width !== undefined) style.width = o.width
-  if (o.height !== undefined) style.height = o.height
+  if (o.width !== undefined) style.width = px2rem(o.width)
+  if (o.height !== undefined) style.height = px2rem(o.height)
   return ({ children }) => createElement('div', { style }, children)
 }
