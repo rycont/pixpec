@@ -302,15 +302,22 @@ function deepEq(a: unknown, b: unknown): boolean {
 
 function componentLayoutStyles(n: IRComponent, parent: ParentCtx, ctx: CodegenCtx): Record<string, unknown> {
   if (parent.dir === 'none') {
-    // Root case: still emit explicit width/height when designer resized the
+    // Root case: emit explicit width/height when designer resized the
     // instance off its master dim (e.g. IconButton Small=28 stretched to 32
-    // inside Input). Skip when no resize — recipe handles default.
+    // inside Input), AND emit 100% for fill-axis since the boxWrapper is
+    // an inline-flex container — the registered component otherwise renders
+    // at intrinsic content width (e.g. a horizontal Divider with
+    // sizingH=fill collapses to 0 cross-width).
     const ws: Record<string, unknown> = {}
     if (n.sizingH === 'fixed' && typeof n.width === 'number' && typeof n.mainWidth === 'number' && n.width !== n.mainWidth) {
       ws.width = px2remPanda(n.width, ctx.remBase)
+    } else if (n.sizingH === 'fill') {
+      ws.width = '100%'
     }
     if (n.sizingV === 'fixed' && typeof n.height === 'number' && typeof n.mainHeight === 'number' && n.height !== n.mainHeight) {
       ws.height = px2remPanda(n.height, ctx.remBase)
+    } else if (n.sizingV === 'fill') {
+      ws.height = '100%'
     }
     return ws
   }
