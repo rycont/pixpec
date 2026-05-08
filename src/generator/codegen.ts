@@ -518,6 +518,11 @@ function emitFrame(n: IRFrame, ctx: CodegenCtx, parent: ParentCtx = { dir: 'none
     // gap when figma specifies a different counter-gap.
     if (n.layout.wrap) {
       styles.flexWrap = 'wrap'
+      // CSS default for align-content with flex-wrap is `normal` → stretch
+      // (rows expand to fill cross-axis when container has definite size).
+      // Figma autolayout packs wrapped rows from the start of the cross axis,
+      // leaving any leftover space below — match with flex-start.
+      styles.alignContent = 'flex-start'
       const cg = n.layout.counterGap
       if (typeof cg === 'number' && cg !== n.layout.gap) {
         if (n.layout.direction === 'row') styles.rowGap = cg
