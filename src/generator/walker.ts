@@ -584,7 +584,9 @@ function assertAllInstancesRegistered(n: unknown, registry: Record<string, strin
 export function buildRegistry(components: Array<Component<unknown>>): Record<string, string> {
   const reg: Record<string, string> = {}
   for (const c of components) {
-    if (c.figma) reg[c.figma.componentSetKey] = c.name
+    if (!c.figma) continue
+    const keys = Array.isArray(c.figma.componentSetKey) ? c.figma.componentSetKey : [c.figma.componentSetKey]
+    for (const k of keys) reg[k] = c.name
   }
   return reg
 }

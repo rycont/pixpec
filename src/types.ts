@@ -169,8 +169,11 @@ export interface FigmaInstanceRaw {
 }
 
 export interface FigmaBinding<P> {
-  /** Master ComponentSetNode.key (NOT individual variant key). */
-  componentSetKey: string
+  /** Master ComponentSetNode.key (NOT individual variant key). Pass an array
+   * when the same React component should match multiple figma component sets
+   * (e.g. when a remote library was republished under a new key but the old
+   * instances still exist in the file). */
+  componentSetKey: string | string[]
   /** Pure function: serialized instance → React props. */
   propsFromFigma: (raw: FigmaInstanceRaw) => P
 }
