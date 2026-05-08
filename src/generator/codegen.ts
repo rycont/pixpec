@@ -905,10 +905,12 @@ function emitText(n: IRText, ctx: CodegenCtx, parent: ParentCtx = { dir: 'none',
     // paragraph splitting itself per design-system metadata. Use a template
     // literal so non-ASCII characters (Korean, emoji, etc.) survive the TS
     // printer's default \uXXXX escape behavior.
-    const child: ast.JsxChild = n.content.includes('\n')
-      ? f.createJsxExpression(undefined, f.createNoSubstitutionTemplateLiteral(n.content, noTokenFlags))
-      : f.createJsxText(n.content)
-    return f.createJsxElement(open, [child], close)
+    const children: ast.JsxChild[] = n.runs?.length
+      ? emitRunSpans(n.runs, ctx)
+      : [n.content.includes('\n')
+          ? f.createJsxExpression(undefined, f.createNoSubstitutionTemplateLiteral(n.content, noTokenFlags))
+          : f.createJsxText(n.content)]
+    return f.createJsxElement(open, children, close)
   }
   // Fallback: styled span (when textStyleId missing or unknown).
   const styles: Record<string, unknown> = {
@@ -934,7 +936,49 @@ function emitText(n: IRText, ctx: CodegenCtx, parent: ParentCtx = { dir: 'none',
     f.createJsxAttributes([cssAttr(styles, ctx)]),
   )
   const close = f.createJsxClosingElement(f.createIdentifier('span'))
-  return f.createJsxElement(open, paragraphChildren(n.content, n.paragraphSpacing, ctx.remBase), close)
+  const children = n.runs?.length
+    ? emitRunSpans(n.runs, ctx)
+    : paragraphChildren(n.content, n.paragraphSpacing, ctx.remBase)
+  return f.createJsxElement(open, children, close)
+}
+
+/** Emit nested spans for a per-character styled TEXT (figma's
+ * getStyledTextSegments). Each run becomes a `<span style={...}>{text}</span>`
+ * with only the fields that override the surrounding text styling. */
+function emitRunSpans(runs: import('./ir.ts').TextRun[], ctx: CodegenCtx): ast.JsxChild[] {
+  return runs.map((r) => {
+    const inlineStyles: Record<string, unknown> = {}
+    if (r.color) {
+      const tokenPath = r.colorTokenId ? requireTokenPath(r.colorTokenId, ctx.tokenMap, 'run.color') : undefined
+      inlineStyles.color = tokenPath ? colorTokenVar(tokenPath) : r.color
+    }
+    if (r.fontFamily) inlineStyles.fontFamily = `"${r.fontFamily}", system-ui, sans-serif`
+    if (r.fontStyle) inlineStyles.fontWeight = /^\d+$/.test(r.fontStyle) ? Number(r.fontStyle) : r.fontStyle
+    if (typeof r.fontSize === 'number') inlineStyles.fontSize = px2rem(r.fontSize, ctx.remBase)
+    if (typeof r.lineHeight === 'number') inlineStyles.lineHeight = px2rem(r.lineHeight, ctx.remBase)
+    if (r.textDecoration) inlineStyles.textDecoration =
+      r.textDecoration === 'UNDERLINE' ? 'underline'
+      : r.textDecoration === 'STRIKETHROUGH' ? 'line-through'
+      : r.textDecoration.toLowerCase()
+    const attrs: ast.JsxAttribute[] = []
+    if (Object.keys(inlineStyles).length) {
+      attrs.push(f.createJsxAttribute(f.createIdentifier('style'),
+        f.createJsxExpression(undefined, valueToExpr(inlineStyles))))
+    }
+    const open = f.createJsxOpeningElement(f.createIdentifier('span'), undefined,
+      f.createJsxAttributes(attrs))
+    const close = f.createJsxClosingElement(f.createIdentifier('span'))
+    // JSX text strips leading/trailing whitespace at compile time, so a
+    // run starting with " " (e.g. " 보여주기" between two color segments)
+    // would lose its leading space. Use a template literal expression
+    // (preserved verbatim) for any run that starts/ends with whitespace
+    // OR contains a newline.
+    const needsExpr = r.text.includes('\n') || /^\s|\s$/.test(r.text)
+    const child: ast.JsxChild = needsExpr
+      ? f.createJsxExpression(undefined, f.createNoSubstitutionTemplateLiteral(r.text, noTokenFlags))
+      : f.createJsxText(r.text)
+    return f.createJsxElement(open, [child], close)
+  })
 }
 
 /** Multi-paragraph block split with `marginBottom: paragraphSpacing` between

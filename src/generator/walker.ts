@@ -348,6 +348,33 @@ async function __pixpecIr(node) {
       pixpecText = pixpecText.replace(/^( +)/, (m) => NBSP.repeat(m.length));
       pixpecText = pixpecText.replace(/( +)$/, (m) => NBSP.repeat(m.length));
     }
+    // figma per-character styling: getStyledTextSegments returns {start,end,
+    // characters,fills,fontName,fontSize,...} for each run of identical
+    // styling. When > 1 segment, the text has mixed colors/fonts/sizes per
+    // range — codegen needs to emit nested spans per run instead of a
+    // single styled span. Single segment case bypasses this and uses the
+    // node-level fields below.
+    const segments = (typeof node.getStyledTextSegments === 'function')
+      ? node.getStyledTextSegments(['fills', 'fontName', 'fontSize', 'fontWeight', 'lineHeight', 'textDecoration'])
+      : [];
+    const runs = segments.length > 1 ? segments.map((seg) => {
+      const segFill = Array.isArray(seg.fills) && seg.fills[0]?.type === 'SOLID' ? seg.fills[0] : null;
+      let segText = seg.characters;
+      if (typeof segText === 'string') {
+        const NBSP = '\\u00A0';
+        segText = segText.replace(/ {2,}/g, (m) => NBSP.repeat(m.length - 1) + ' ');
+      }
+      return {
+        text: segText,
+        color: segFill ? rgbaHex(segFill.color, segFill.opacity ?? 1) : undefined,
+        colorTokenId: segFill?.boundVariables?.color?.id,
+        fontFamily: typeof seg.fontName?.family === 'string' ? seg.fontName.family : undefined,
+        fontStyle: typeof seg.fontName?.style === 'string' ? seg.fontName.style : undefined,
+        fontSize: typeof seg.fontSize === 'number' ? seg.fontSize : undefined,
+        lineHeight: typeof seg.lineHeight === 'object' && seg.lineHeight.unit === 'PIXELS' ? seg.lineHeight.value : undefined,
+        textDecoration: typeof seg.textDecoration === 'string' && seg.textDecoration !== 'NONE' ? seg.textDecoration : undefined,
+      };
+    }) : undefined;
     const fill = (Array.isArray(node.fills) && node.fills[0]?.type === 'SOLID') ? node.fills[0] : null;
     const tbv = node.boundVariables || {};
     const tokenIds = {
@@ -407,6 +434,9 @@ async function __pixpecIr(node) {
       // figma textDecoration: 'NONE' | 'UNDERLINE' | 'STRIKETHROUGH'.
       // Codegen maps to CSS text-decoration values.
       textDecoration: typeof node.textDecoration === 'string' && node.textDecoration !== 'NONE' ? node.textDecoration : undefined,
+      // Per-character styled runs when figma TEXT has mixed fills/fonts/etc
+      // across ranges. Codegen emits nested spans per run when present.
+      runs,
       tokenIds,
       textAlign: node.textAlignHorizontal?.toLowerCase(),
       textStyleId: typeof node.textStyleId === 'string' ? node.textStyleId : undefined,

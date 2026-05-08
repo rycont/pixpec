@@ -154,6 +154,20 @@ export interface IRFrame extends IRBase {
   children: IRNode[]
 }
 
+/** A styled segment within a TEXT node. Set on `IRText.runs` when figma's
+ * `getStyledTextSegments` returns multiple ranges. Each field is undef
+ * when the segment matches the node-level value (no override). */
+export interface TextRun {
+  text: string
+  color?: string
+  colorTokenId?: string
+  fontFamily?: string
+  fontStyle?: string
+  fontSize?: number
+  lineHeight?: number
+  textDecoration?: string
+}
+
 export interface IRText extends IRBase {
   kind: 'text'
   content: string
@@ -176,6 +190,10 @@ export interface IRText extends IRBase {
   /** figma textDecoration ('UNDERLINE' | 'STRIKETHROUGH'). Codegen maps
    * to CSS text-decoration. Undefined when figma reports 'NONE'. */
   textDecoration?: string
+  /** Per-character styled runs from figma `getStyledTextSegments`. Set only
+   * when text has mixed fills/fonts/sizes across ranges (otherwise the
+   * node-level fontFamily/color/etc apply uniformly and `runs` is undef). */
+  runs?: TextRun[]
   /** figma boundVariables — variable id per styled property. Codegen uses
    * `figma-tokens.json` to resolve id → panda token path. */
   tokenIds?: {
