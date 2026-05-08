@@ -428,6 +428,19 @@ async function __pixpecIr(node) {
   // preserves sub-pixel position (verified empirically — see SnapGridProbe).
   const shapeMap = { 'RECTANGLE':'rect', 'ELLIPSE':'ellipse', 'POLYGON':'polygon', 'STAR':'star', 'LINE':'line' };
   if (shapeMap[node.type]) {
+    // RECTANGLE with IMAGE fill — figma renders raster image. Treat as
+    // image kind so resolveImages exports the bitmap and codegen emits an
+    // <img>. SOLID-only fill check below would ignore IMAGE and produce
+    // an empty rect.
+    if (Array.isArray(node.fills) && node.fills.some(f => f.type === 'IMAGE' && f.visible !== false)) {
+      return {
+        ...base, kind: 'image',
+        width: node.width, height: node.height,
+        sizingH: mapSizing(node.layoutSizingHorizontal),
+        sizingV: mapSizing(node.layoutSizingVertical),
+        opacity: typeof node.opacity === 'number' && node.opacity < 0.999 ? Math.round(node.opacity * 100) / 100 : undefined,
+      };
+    }
     const fill = (Array.isArray(node.fills) && node.fills[0]?.type === 'SOLID' && node.fills[0]?.visible !== false) ? node.fills[0] : null;
     const stroke = (Array.isArray(node.strokes) && node.strokes[0]?.type === 'SOLID' && node.strokes[0]?.visible !== false) ? node.strokes[0] : null;
     // Skip only zero-area degenerate shapes (e.g. designer left a 0-height
