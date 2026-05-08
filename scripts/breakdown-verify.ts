@@ -155,8 +155,14 @@ const placeFigmaPng = async (n: Node, outPath: string): Promise<{ padW: number; 
 
   const cropped = await pipeline.toBuffer()
   const meta = await sharp(cropped).metadata()
-  const padW = padToMul(meta.width!)
-  const padH = padToMul(meta.height!)
+  // Figma exportAsync uses absoluteRenderBounds — when ink area < layout
+  // bbox (e.g. transparent frame with tiny text), the export is smaller
+  // than the layout dim. Chromium screenshot uses layout dim. Pad figma
+  // up to layout dim before adding the multiple-of-8 padding.
+  const layoutW = n.bbox ? Math.round(n.bbox.width * SCALE) : meta.width!
+  const layoutH = n.bbox ? Math.round(n.bbox.height * SCALE) : meta.height!
+  const padW = padToMul(Math.max(meta.width!, layoutW))
+  const padH = padToMul(Math.max(meta.height!, layoutH))
   const padded = await padWhite(cropped, padW, padH)
   await writeFile(outPath, padded)
   return { padW, padH }

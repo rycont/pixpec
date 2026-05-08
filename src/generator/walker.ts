@@ -100,12 +100,16 @@ async function __pixpecIr(node) {
           fields.includes('fontSize') ||
           fields.includes('fills')
         )) return true;
-        // Descendant FIXED-sized dim override — designer scaled an inner
+        // DESCENDANT FIXED-sized dim override — designer scaled an inner
         // node off its master dim (figma "drag corner" on a child). The
         // registered component API has no prop for arbitrary descendant
         // dim, so render the actual override tree (e.g. Input's IconButton
-        // 28→32 with inner Icon 20→22.857).
-        if ((fields.includes('width') || fields.includes('height'))
+        // 28→32 with inner Icon 20→22.857). Skip the instance ITSELF —
+        // top-level dim resize is the standard pattern (Icon master 24
+        // commonly used at 16/20) and the registered component receives
+        // it via componentLayoutStyles or its own size prop.
+        if (ov.id !== node.id
+            && (fields.includes('width') || fields.includes('height'))
             && (target.layoutSizingHorizontal === 'FIXED' || target.layoutSizingVertical === 'FIXED')) return true;
       }
       // Fallback: figma's overrides API misses textStyle drift (instance text
@@ -315,6 +319,13 @@ async function __pixpecIr(node) {
       // doesn't match panda's atomic class name op_0.3; the runtime value
       // would generate a class with no rule. Designers use 1-decimal values.
       opacity: typeof node.opacity === 'number' && node.opacity < 0.999 ? Math.round(node.opacity * 100) / 100 : undefined,
+      // Min/max constraints — figma frames often set minHeight (or
+      // minWidth) larger than HUG content so the box stays at a designed
+      // dim even when text shrinks. CSS HUG without these renders smaller.
+      minWidth: typeof node.minWidth === 'number' ? node.minWidth : undefined,
+      maxWidth: typeof node.maxWidth === 'number' ? node.maxWidth : undefined,
+      minHeight: typeof node.minHeight === 'number' ? node.minHeight : undefined,
+      maxHeight: typeof node.maxHeight === 'number' ? node.maxHeight : undefined,
       children,
     };
   }
@@ -387,6 +398,9 @@ async function __pixpecIr(node) {
       lineHeight: typeof node.lineHeight === 'object' && node.lineHeight.unit === 'PIXELS' ? node.lineHeight.value : node.fontSize,
       paragraphSpacing: typeof node.paragraphSpacing === 'number' ? node.paragraphSpacing : 0,
       color: fill ? rgbaHex(fill.color, fill.opacity ?? 1) : '#000000',
+      // figma textDecoration: 'NONE' | 'UNDERLINE' | 'STRIKETHROUGH'.
+      // Codegen maps to CSS text-decoration values.
+      textDecoration: typeof node.textDecoration === 'string' && node.textDecoration !== 'NONE' ? node.textDecoration : undefined,
       tokenIds,
       textAlign: node.textAlignHorizontal?.toLowerCase(),
       textStyleId: typeof node.textStyleId === 'string' ? node.textStyleId : undefined,

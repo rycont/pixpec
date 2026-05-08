@@ -352,6 +352,9 @@ async function resolveImages(ir: IRNode, tab: string): Promise<void> {
   const bridge = getBridge()
   const ids = targets.map((t) => t.node.figmaId)
   console.log(`[generate] exporting ${ids.length} image node(s) as SVG via figma.exportAsync…`)
+  // SVG export sometimes fails for INSTANCE nodes whose mainComponent is in
+  // a remote library (figma reports "no visible layers" even when ink is
+  // present). Fall back to PNG (DPR=8) so the layout at least gets a raster.
   const code = `
     const ids = ${JSON.stringify(ids)};
     const dec = new TextDecoder('utf-8');
@@ -362,7 +365,14 @@ async function resolveImages(ir: IRNode, tab: string): Promise<void> {
       try {
         const bytes = await n.exportAsync({ format: 'SVG' });
         out.push({ id, svg: dec.decode(bytes) });
-      } catch (e) { out.push({ id, error: String(e?.message ?? e) }); }
+      } catch (e) {
+        try {
+          const png = await n.exportAsync({ format: 'PNG', constraint: { type: 'SCALE', value: 8 }, useAbsoluteBounds: true });
+          out.push({ id, png: figma.base64Encode(png) });
+        } catch (e2) {
+          out.push({ id, error: String(e2?.message ?? e2) });
+        }
+      }
     }
     return out;
   `

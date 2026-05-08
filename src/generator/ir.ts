@@ -94,6 +94,14 @@ export interface IRFrame extends IRBase {
   }
   width?: number
   height?: number
+  /** Min/max constraints set on the figma frame. Captured even when the
+   * frame is HUG-sized so CSS layout matches figma's actual rendered dim
+   * (e.g. a HUG row with minHeight=48 stays 48 tall even when text is
+   * shorter — without this CSS HUG would shrink to text dim). */
+  minWidth?: number
+  maxWidth?: number
+  minHeight?: number
+  maxHeight?: number
   background?: string  // hex or rgba; codegen maps to panda token if matches
   /** First SOLID stroke color (hex/rgba) — figma frames often have 1px
    * border for visual separation. Codegen emits as inset boxShadow to keep
@@ -159,6 +167,9 @@ export interface IRText extends IRBase {
   paragraphSpacing: number
   /** Resolved CSS color (hex or rgba). Codegen maps to panda token. */
   color: string
+  /** figma textDecoration ('UNDERLINE' | 'STRIKETHROUGH'). Codegen maps
+   * to CSS text-decoration. Undefined when figma reports 'NONE'. */
+  textDecoration?: string
   /** figma boundVariables — variable id per styled property. Codegen uses
    * `figma-tokens.json` to resolve id → panda token path. */
   tokenIds?: {

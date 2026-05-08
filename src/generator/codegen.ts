@@ -571,6 +571,12 @@ function emitFrame(n: IRFrame, ctx: CodegenCtx, parent: ParentCtx = { dir: 'none
   if (parentDir === 'column' && n.layout.sizingV === 'fixed') styles.flexShrink = 0
   if (n.background) styles.background = resolveValue(n.background, tids.background, ctx.tokenMap, `${n.figmaId}.background`, ctx.tokenValueMap)
   if (n.opacity !== undefined) styles.opacity = n.opacity
+  // Min/max constraints from figma. Emitted even with HUG sizing so a
+  // HUG row with minHeight=48 stays 48px tall when content is shorter.
+  if (n.minWidth !== undefined) styles.minWidth = n.minWidth
+  if (n.maxWidth !== undefined) styles.maxWidth = n.maxWidth
+  if (n.minHeight !== undefined) styles.minHeight = n.minHeight
+  if (n.maxHeight !== undefined) styles.maxHeight = n.maxHeight
   // figma cornerSmoothing > 0 → render the rounded shape via clip-path with
   // figma-squircle's path. CSS `border-radius` is a circular arc; figma uses
   // a G2-continuous (smoothed) corner that fades into the side gradually.
@@ -874,6 +880,10 @@ function emitText(n: IRText, ctx: CodegenCtx, parent: ParentCtx = { dir: 'none',
     if (n.textAlign && n.textAlign !== 'left' && n.textAlign !== 'justify') {
       wrapperProps.textAlign = n.textAlign
     }
+    if (n.textDecoration) wrapperProps.textDecoration =
+      n.textDecoration === 'UNDERLINE' ? 'underline'
+      : n.textDecoration === 'STRIKETHROUGH' ? 'line-through'
+      : n.textDecoration.toLowerCase()
     attrs.push(...attrsFromObject(pandaize(wrapperProps, ctx.remBase)))
     if (Object.keys(inlineStyles).length) {
       attrs.push(f.createJsxAttribute(f.createIdentifier('style'),
@@ -900,6 +910,12 @@ function emitText(n: IRText, ctx: CodegenCtx, parent: ParentCtx = { dir: 'none',
     color: resolveValue(n.color, n.tokenIds?.color, ctx.tokenMap, `${n.figmaId}.color`, ctx.tokenValueMap),
   }
   if (n.textAlign) styles.textAlign = n.textAlign
+  // figma → CSS text-decoration: UNDERLINE → underline, STRIKETHROUGH →
+  // line-through. Fallthrough on unknown values keeps the figma string.
+  if (n.textDecoration) styles.textDecoration =
+    n.textDecoration === 'UNDERLINE' ? 'underline'
+    : n.textDecoration === 'STRIKETHROUGH' ? 'line-through'
+    : n.textDecoration.toLowerCase()
   if (fixedWidth !== undefined) styles.width = fixedWidth
   if (fillMain) { styles.flex = 1; styles.minWidth = 0 }
   if (fillCross) styles.alignSelf = 'stretch'
@@ -1113,11 +1129,23 @@ function emitImage(n: IRImage, ctx: CodegenCtx): ast.JsxSelfClosingElement {
     height: px2rem(n.height, ctx.remBase),
   }
   if (n.opacity !== undefined) styles.opacity = n.opacity
+  // No SVG dataUrl (figma export failed — typically empty/invisible Icon
+  // instance). Emit a div placeholder so layout slot is preserved without
+  // triggering the React "empty src" warning + duplicate page download.
+  if (!n.dataUrl) {
+    return f.createJsxSelfClosingElement(
+      f.createIdentifier('div'), undefined,
+      f.createJsxAttributes([
+        f.createJsxAttribute(f.createIdentifier('style'),
+          f.createJsxExpression(undefined, valueToExpr(styles))),
+      ]),
+    )
+  }
   return f.createJsxSelfClosingElement(
     f.createIdentifier('img'), undefined,
     f.createJsxAttributes([
       f.createJsxAttribute(f.createIdentifier('src'),
-        stringLiteral(n.dataUrl ?? '')),
+        stringLiteral(n.dataUrl)),
       f.createJsxAttribute(f.createIdentifier('alt'), stringLiteral('')),
       f.createJsxAttribute(f.createIdentifier('style'),
         f.createJsxExpression(undefined, valueToExpr(styles))),

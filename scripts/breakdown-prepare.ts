@@ -185,7 +185,12 @@ for (const id of ids) {
   const n = await figma.getNodeByIdAsync(id);
   if (!n) { out.push({ id, error: 'not found' }); continue; }
   try {
-    const bytes = await n.exportAsync({ format: 'PNG', constraint: { type: 'SCALE', value: 8 } });
+    // useAbsoluteBounds: true → export is layout bbox dim (absoluteBoundingBox)
+    // instead of the default absoluteRenderBounds (ink-only). Matches chromium
+    // screenshot dim which uses layout bbox. Without this, frames with tiny
+    // ink area (e.g. 600×48 frame with single-line low-alpha bg) export as
+    // 600×1 and the verify dim mismatch can't be padded meaningfully.
+    const bytes = await n.exportAsync({ format: 'PNG', constraint: { type: 'SCALE', value: 8 }, useAbsoluteBounds: true });
     out.push({ id, b64: figma.base64Encode(bytes) });
   } catch (e) { out.push({ id, error: String(e?.message ?? e) }); }
 }
