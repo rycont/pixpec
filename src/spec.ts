@@ -50,6 +50,11 @@ export function boxWrapper(o: BoxWrapperOptions): ComponentType<{ children: Reac
     // Positioning context for absolutely-positioned root children (e.g. the
     // rotation-wrap codegen emits for rotated FRAME/COMPONENT roots).
     position: 'relative',
+    // Clip overflow so an authored thin frame (e.g. 600×1 with content
+    // overflowing 30px) gives the screenshot the wrapper's bbox dim,
+    // not the overflowing children's. Matches figma exportAsync's bbox
+    // (useAbsoluteBounds) behavior.
+    overflow: 'hidden',
   }
   if (o.width !== undefined) style.width = px2rem(o.width)
   if (o.height !== undefined) style.height = px2rem(o.height)

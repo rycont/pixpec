@@ -496,7 +496,13 @@ function emitFrame(n: IRFrame, ctx: CodegenCtx, parent: ParentCtx = { dir: 'none
     if (justify !== 'start') styles.justify = justify
     // Stack pattern may carry a default gap, so preserve column gap=0. Flex
     // row has no default gap, so omit zero for terser generated JSX.
-    if (n.layout.gap !== 0 || n.layout.direction === 'column') {
+    // For SPACE_BETWEEN: figma's `itemSpacing` is documented but only used
+    // when items would otherwise overlap; the actual rendered gap = remaining
+    // space distributed evenly. CSS `gap` is a HARD MIN — emitting it forces
+    // items to keep that gap, overriding space-between's distribution. Skip
+    // the gap emit so the browser's space-between distributes freely.
+    if ((n.layout.gap !== 0 || n.layout.direction === 'column')
+        && n.layout.justifyContent !== 'space-between') {
       styles.gap = resolveValue(n.layout.gap, tids.gap, ctx.tokenMap, `${n.figmaId}.gap`, ctx.tokenValueMap)
     }
     // figma layoutWrap=WRAP → flex-wrap:wrap. counterAxisSpacing maps to

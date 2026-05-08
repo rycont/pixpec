@@ -376,16 +376,18 @@ async function resolveImages(ir: IRNode, tab: string): Promise<void> {
     }
     return out;
   `
-  const res = await bridge.exec<Array<{ id: string; svg?: string; error?: string }>>(tab, code)
+  const res = await bridge.exec<Array<{ id: string; svg?: string; png?: string; error?: string }>>(tab, code)
   const byId = new Map(res.map((r) => [r.id, r]))
   for (const { node } of targets) {
     const r = byId.get(node.figmaId)
-    if (!r || !r.svg) {
+    if (r?.svg) {
+      const b64 = Buffer.from(r.svg, 'utf-8').toString('base64')
+      node.dataUrl = `data:image/svg+xml;base64,${b64}`
+    } else if (r?.png) {
+      node.dataUrl = `data:image/png;base64,${r.png}`
+    } else {
       console.warn(`[generate] image export failed for ${node.figmaId}: ${r?.error ?? 'no result'}`)
-      continue
     }
-    const b64 = Buffer.from(r.svg, 'utf-8').toString('base64')
-    node.dataUrl = `data:image/svg+xml;base64,${b64}`
   }
 }
 

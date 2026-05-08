@@ -267,11 +267,25 @@ try {
     process.stdout.write(`  [${'··'.repeat(n.depth)}] ${n.id} ${n.name} (${n.type} ${n.w}x${n.h})… `)
     try {
       await runDumpChromium(componentName, { renderer: await getRenderer() })
-      const { padW, padH } = await placeFigmaPng(n,
+      // Compute the unified pad dim from BOTH figma and chromium output —
+      // padding has to extend each, so the target must be ≥ max of both.
+      // Otherwise sharp.extend errors with negative values when chromium
+      // is taller/wider than figma's bbox (e.g. CSS HUG content overflows
+      // figma's authored 1px-tall divider frame).
+      const figmaSrc = resolve(projectRoot, '.pixpec-out/_breakdown-cache/figma-png', n.id.replace(/[^A-Za-z0-9]/g, '_') + '.png')
+      const chrPath = resolve(projectRoot, '.pixpec-out', componentName, 'chromium', `${componentName}_main.png`)
+      const figMeta = await sharp(figmaSrc).metadata()
+      const chrMeta = await sharp(chrPath).metadata()
+      const layoutW = n.bbox ? Math.round(n.bbox.width * 8) : 0
+      const layoutH = n.bbox ? Math.round(n.bbox.height * 8) : 0
+      const targetW = Math.ceil(Math.max(figMeta.width!, chrMeta.width!, layoutW) / 8) * 8
+      const targetH = Math.ceil(Math.max(figMeta.height!, chrMeta.height!, layoutH) / 8) * 8
+      await placeFigmaPng(n,
         resolve(projectRoot, '.pixpec-out', componentName, 'figma', `${componentName}_main.png`))
-      await padChromiumPng(
-        resolve(projectRoot, '.pixpec-out', componentName, 'chromium', `${componentName}_main.png`),
-        padW, padH)
+      const figOutPath = resolve(projectRoot, '.pixpec-out', componentName, 'figma', `${componentName}_main.png`)
+      const figBuf = await readFile(figOutPath)
+      await writeFile(figOutPath, await padWhite(figBuf, targetW, targetH))
+      await padChromiumPng(chrPath, targetW, targetH)
       const r = await measure(componentName)
       // Drop a clean per-variant generated tree into the parent component's
       // generated/ dir if init has scaffolded one (looked up by figma id in
