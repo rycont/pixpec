@@ -158,7 +158,13 @@ export interface IRText extends IRBase {
   kind: 'text'
   content: string
   fontSize: number
-  fontWeight: number
+  /** figma `fontName.family` — designer-authored string (e.g.
+   * "Wanted Sans Variable", "goorm Sans Code"). Emitted verbatim. */
+  fontFamily?: string
+  /** figma `fontName.style` — designer-authored string. NOT a numeric
+   * weight: figma stores it as text the designer typed ("Bold", "400",
+   * "Regular Italic"). DS layer maps to CSS font-weight/font-style. */
+  fontStyle?: string
   lineHeight: number
   /** figma `paragraphSpacing` (PIXELS). Inserted between paragraphs (split by
    * `\n` in `content`). Soft-wrapped lines do NOT receive this gap; only hard

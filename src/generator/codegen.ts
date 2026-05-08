@@ -871,13 +871,15 @@ function emitText(n: IRText, ctx: CodegenCtx, parent: ParentCtx = { dir: 'none',
     } else if (n.color) {
       inlineStyles.color = n.color
     }
-    // figma can override fontName.style on a TEXT instance independently of
-    // its bound textStyle (designer applies Bold on top of Body/Regular). The
-    // wrapper enforces the textStyle's weight, so we override inline when the
-    // IR's fontWeight diverges. Wrapper name suffix encodes its expected
-    // weight (Strong=700, Regular=500). Mismatch → inline override.
-    const expectedWeight = /Strong$/.test(wrapperName) ? 700 : 500
-    if (n.fontWeight !== expectedWeight) wrapperProps.fontWeight = n.fontWeight
+    // figma fontName — emit verbatim (family + style). family is e.g.
+    // "Wanted Sans Variable" or "goorm Sans Code"; style is the
+    // designer-authored string (any text — "Bold", "400", "Regular").
+    // The DS layer (typography wrapper / Text impl) maps style to CSS
+    // font-weight/font-style if needed; pixpec stays format-agnostic.
+    if (n.fontFamily) {
+      inlineStyles.fontFamily = `"${n.fontFamily}", system-ui, sans-serif`
+    }
+    if (n.fontStyle) wrapperProps.fontStyle = n.fontStyle
     // figma's HUG width = ceil(advance) creates 0..1 css slack. textAlignHorizontal
     // distributes that slack: LEFT→right, CENTER→half each side, RIGHT→left. Chromium
     // default text-align: start (= LEFT) leaves slack on the right, mismatching figma's
@@ -912,9 +914,10 @@ function emitText(n: IRText, ctx: CodegenCtx, parent: ParentCtx = { dir: 'none',
   const styles: Record<string, unknown> = {
     fontSize: resolveValue(n.fontSize, n.tokenIds?.fontSize, ctx.tokenMap, `${n.figmaId}.fontSize`, ctx.tokenValueMap),
     lineHeight: resolveValue(n.lineHeight, n.tokenIds?.lineHeight, ctx.tokenMap, `${n.figmaId}.lineHeight`, ctx.tokenValueMap),
-    fontWeight: n.fontWeight,
     color: resolveValue(n.color, n.tokenIds?.color, ctx.tokenMap, `${n.figmaId}.color`, ctx.tokenValueMap),
   }
+  if (n.fontFamily) styles.fontFamily = `"${n.fontFamily}", system-ui, sans-serif`
+  if (n.fontStyle) styles.fontStyle = n.fontStyle
   if (n.textAlign) styles.textAlign = n.textAlign
   // figma → CSS text-decoration: UNDERLINE → underline, STRIKETHROUGH →
   // line-through. Fallthrough on unknown values keeps the figma string.

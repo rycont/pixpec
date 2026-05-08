@@ -394,7 +394,13 @@ async function __pixpecIr(node) {
     return {
       ...base, kind: 'text',
       content: pixpecText,
-      fontSize: node.fontSize, fontWeight: node.fontName?.style === 'Bold' ? 700 : 500,
+      fontSize: node.fontSize,
+      // Capture figma fontName verbatim — family + style are designer-
+      // authored strings (style is NOT a numeric weight: it can be any
+      // text the designer typed, e.g. "Bold", "400", "Regular Italic").
+      // The DS layer maps style → CSS font-weight if needed.
+      fontFamily: typeof node.fontName?.family === 'string' ? node.fontName.family : undefined,
+      fontStyle: typeof node.fontName?.style === 'string' ? node.fontName.style : undefined,
       lineHeight: typeof node.lineHeight === 'object' && node.lineHeight.unit === 'PIXELS' ? node.lineHeight.value : node.fontSize,
       paragraphSpacing: typeof node.paragraphSpacing === 'number' ? node.paragraphSpacing : 0,
       color: fill ? rgbaHex(fill.color, fill.opacity ?? 1) : '#000000',
