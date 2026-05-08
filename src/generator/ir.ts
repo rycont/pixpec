@@ -37,6 +37,8 @@ export interface IRBase {
   absolute?: boolean
   absX?: number
   absY?: number
+  /** Node-level "Layer opacity" (figma slider). Captured only when < 1. */
+  opacity?: number
 }
 
 /** Recognized as a registered component (defineComponent.figma binding). */
@@ -44,9 +46,9 @@ export interface IRComponent extends IRBase {
   kind: 'component'
   /** Matches a Component.name from defineComponent. */
   componentName: string
-  /** Props produced by Component.figma.fromInstance(raw). */
+  /** Props produced by Component.figma.propsFromFigma(raw). */
   props: Record<string, unknown>
-  /** Default-equivalent props (also via fromInstance) — for codegen to elide
+  /** Default-equivalent props (also via propsFromFigma) — for codegen to elide
    * redundant prop emission. Source: figma COMPONENT_SET.componentPropertyDefinitions. */
   defaultProps?: Record<string, unknown>
   /** figma `rotation` in degrees (counterclockwise). codegen emits CSS transform. */
@@ -98,7 +100,21 @@ export interface IRFrame extends IRBase {
    * the border inside the frame's dim (CSS `border` adds to layout). */
   strokeColor?: string
   strokeWeight?: number
+  /** Per-side stroke weights when figma's `strokeWeight === figma.mixed`
+   * (individualStrokeWeights set). Codegen emits borderTop/Right/Bottom/Left
+   * instead of a 4-side insetBorder. Undefined when stroke is uniform. */
+  strokeTopWeight?: number
+  strokeRightWeight?: number
+  strokeBottomWeight?: number
+  strokeLeftWeight?: number
+  /** Uniform corner radius. Mutually exclusive with the per-corner fields:
+   * the walker emits ONE form depending on whether figma reports a single
+   * number or `figma.mixed` for cornerRadius. */
   borderRadius?: number
+  borderRadiusTopLeft?: number
+  borderRadiusTopRight?: number
+  borderRadiusBottomRight?: number
+  borderRadiusBottomLeft?: number
   /** figma cornerSmoothing (0..1). >0 means squircle (G2-continuous corner) — codegen
    * must emit clip-path with figma-squircle path instead of CSS border-radius. */
   cornerSmoothing?: number
@@ -163,6 +179,20 @@ export interface IRText extends IRBase {
    * typography wrapper, codegen emits <Wrapper>content</Wrapper> instead of
    * a styled span. */
   textStyleId?: string
+  /** Fields where the node's effective value diverges from textStyleId's
+   * definition (figma plugin API has no explicit "is-overridden" flag, so
+   * walker resolves the textStyle and diffs each field). Codegen MUST emit
+   * the explicit value for any present field — typography wrapper alone
+   * would render the textStyle's value, missing the override. */
+  textStyleOverrides?: {
+    fontName?: { family: string; style: string }
+    fontSize?: number
+    lineHeight?: { unit: string; value?: number }
+    paragraphSpacing?: number
+    textCase?: string
+    textDecoration?: string
+    letterSpacing?: { unit: string; value: number }
+  }
   /** figma textAutoResize: WIDTH_AND_HEIGHT(HUG)|HEIGHT(FIXED-w wrap)|NONE(FIXED-wxh) */
   autoResize: 'hug' | 'fixed-width' | 'fixed-both' | 'truncate'
   /** Figma resolved width — only used when autoResize forces wrap (fixed-width/-both/truncate) */
@@ -197,6 +227,10 @@ export interface IRShape extends IRBase {
   strokeColor?: string
   strokeWeight?: number
   borderRadius?: number
+  borderRadiusTopLeft?: number
+  borderRadiusTopRight?: number
+  borderRadiusBottomRight?: number
+  borderRadiusBottomLeft?: number
   /** figma rotation in degrees CCW. */
   rotation?: number
   /** Sibling sizing inside parent flex. */

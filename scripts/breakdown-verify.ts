@@ -4,12 +4,12 @@
  * cache produced by `breakdown-prepare`. ZERO cfigma calls; runs offline
  * against `<projectRoot>/.pixpec-out/_breakdown-cache/`.
  *
- *   tsx breakdown-verify.ts [--max-blob 8] [--max-de Inf] [--skip-passed]
+ *   tsx breakdown-verify.ts [--max-blob 8] [--max-de Inf]
  *                           [--root DIR]
  *
  * Per node: runGenerate (uses cached IR) → ensureExport → runDumpChromium
  *   → place pre-exported figma PNG → pixpec-measure. Halts at first failure
- *   so you can fix the codegen and re-run with `--skip-passed`.
+ *   so you can fix the codegen and re-run.
  */
 import { execFile } from 'node:child_process'
 import { promisify } from 'node:util'
@@ -17,6 +17,7 @@ import { mkdir, readFile, writeFile, appendFile } from 'node:fs/promises'
 import { existsSync } from 'node:fs'
 import { resolve, join, dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import sharp from 'sharp'
 import { runGenerate } from '../src/generator/cli.ts'
 import { runDumpChromium } from '../src/dump-chromium.ts'
 import { Renderer } from '../src/render.ts'
@@ -33,10 +34,23 @@ const opt = (k: string, d?: string) => {
 }
 const maxBlob = parseInt(opt('--max-blob', '16')!, 10)
 const maxDe = parseFloat(opt('--max-de', 'Infinity')!)
-const skipPassed = args.includes('--skip-passed')
+const onlyNode = opt('--only')
 const projectRoot = resolve(opt('--root', process.cwd())!)
 const cacheDir = resolve(projectRoot, '.pixpec-out/_breakdown-cache')
 const reportPath = resolve(projectRoot, '.pixpec-out/_breakdown-report.md')
+const componentsPath = resolve(projectRoot, 'src/components')
+
+// ───────── Step 0: cleanup existing BD_ components ─────────
+import { readdir, rm } from 'node:fs/promises'
+const existing = await readdir(componentsPath, { withFileTypes: true })
+let cleanCount = 0
+for (const ent of existing) {
+  if (ent.isDirectory() && ent.name.startsWith('BD_')) {
+    await rm(resolve(componentsPath, ent.name), { recursive: true, force: true })
+    cleanCount++
+  }
+}
+if (cleanCount > 0) console.log(`[verify] cleaned up ${cleanCount} BD_ components`)
 
 if (!existsSync(resolve(cacheDir, 'manifest.json'))) {
   console.error(`no cache at ${cacheDir} — run breakdown-prepare first`)
@@ -47,19 +61,13 @@ type Bbox = { x: number; y: number; width: number; height: number }
 type Node = {
   id: string; name: string; depth: number; type: string
   w?: number; h?: number; bbox?: Bbox; render?: Bbox
+  componentName?: string // Populated if it's a registered instance
+  masterVariantId?: string | null // Populated for instances → master COMPONENT id
 }
 const manifest = JSON.parse(await readFile(resolve(cacheDir, 'manifest.json'), 'utf8')) as
   { rootNodeId: string; tab: string; fileKey: string; nodes: Node[] }
 
-const safeName = (id: string) => `Gen_${id.replace(/[^A-Za-z0-9]/g, '_')}`
-const indexEntry = (name: string) =>
-  `export { ${name} } from './components/${name}/index.ts'`
-const ensureExport = async (name: string) => {
-  const idxPath = resolve(projectRoot, 'src/index.ts')
-  const txt = await readFile(idxPath, 'utf8')
-  if (txt.includes(`from './components/${name}/`)) return
-  await writeFile(idxPath, txt.trimEnd() + '\n' + indexEntry(name) + '\n')
-}
+const safeName = (id: string) => `BD_${id.replace(/[^A-Za-z0-9]/g, '_')}`
 
 /** Measure error subtypes — surfaced verbatim to the user instead of just
  * "Command failed". DimMismatch carries the parsed sizes. */
@@ -103,30 +111,91 @@ const runRggSafe = async (componentName: string) => {
   }
 }
 
-const placeFigmaPng = async (n: Node, outPath: string) => {
+const SCALE = 8
+/** Round UP to next multiple of SCALE so measure-rs's downsample-by-8 always
+ * fits. Padding is applied identically on both sides (figma + chromium) with
+ * the wrapper bg color, so the padded region contributes zero diff. */
+const padToMul = (v: number) => Math.ceil(v / SCALE) * SCALE
+
+/** Add right/bottom white padding to make `srcBuf` exactly `padW × padH`. */
+const padWhite = async (srcBuf: Buffer, padW: number, padH: number): Promise<Buffer> => {
+  const meta = await sharp(srcBuf).metadata()
+  const w = meta.width!, h = meta.height!
+  if (w === padW && h === padH) return srcBuf
+  return sharp(srcBuf)
+    .extend({
+      top: 0, left: 0,
+      right: padW - w, bottom: padH - h,
+      background: { r: 255, g: 255, b: 255, alpha: 1 },
+    })
+    .toBuffer()
+}
+
+const placeFigmaPng = async (n: Node, outPath: string): Promise<{ padW: number; padH: number }> => {
   const safe = n.id.replace(/[^A-Za-z0-9]/g, '_')
   const srcPath = resolve(cacheDir, 'figma-png', `${safe}.png`)
   await mkdir(dirname(outPath), { recursive: true })
-  const buf = await readFile(srcPath)
-  if (!n.bbox || !n.render) { await writeFile(outPath, buf); return }
-  const bbox = n.bbox, render = n.render
-  const overflowTop = bbox.y - render.y
-  const overflowLeft = bbox.x - render.x
-  const overflowRight = (render.x + render.width) - (bbox.x + bbox.width)
-  const overflowBottom = (render.y + render.height) - (bbox.y + bbox.height)
-  if (overflowTop > 0 || overflowLeft > 0 || overflowRight > 0 || overflowBottom > 0) {
-    const sharp = (await import('sharp')).default
-    const SCALE = 8
-    const cropTop = Math.round(overflowTop * SCALE)
-    const cropLeft = Math.round(overflowLeft * SCALE)
-    const cropW = Math.round(bbox.width * SCALE)
-    const cropH = Math.round(bbox.height * SCALE)
-    const cropped = await sharp(buf)
-      .extract({ left: cropLeft, top: cropTop, width: cropW, height: cropH })
-      .toBuffer()
-    await writeFile(outPath, cropped)
-  } else {
-    await writeFile(outPath, buf)
+
+  let pipeline = sharp(srcPath)
+
+  // Crop overflow ink (figma exportAsync uses absoluteRenderBounds which can
+  // extend outside absoluteBoundingBox). Bring back to layout bbox before pad.
+  if (n.bbox && n.render) {
+    const overflowTop = n.bbox.y - n.render.y
+    const overflowLeft = n.bbox.x - n.render.x
+    if (overflowTop > 0 || overflowLeft > 0) {
+      pipeline = pipeline.extract({
+        left: Math.max(0, Math.round(overflowLeft * SCALE)),
+        top: Math.max(0, Math.round(overflowTop * SCALE)),
+        width: Math.round(n.bbox.width * SCALE),
+        height: Math.round(n.bbox.height * SCALE),
+      })
+    }
+  }
+
+  const cropped = await pipeline.toBuffer()
+  const meta = await sharp(cropped).metadata()
+  const padW = padToMul(meta.width!)
+  const padH = padToMul(meta.height!)
+  const padded = await padWhite(cropped, padW, padH)
+  await writeFile(outPath, padded)
+  return { padW, padH }
+}
+
+/** Pad the chromium screenshot to the same dim so measure-rs sees identical
+ * canvas sizes. Padding is white (matches boxWrapper bg), zero diff in pad. */
+const padChromiumPng = async (chrPath: string, padW: number, padH: number) => {
+  const buf = await readFile(chrPath)
+  const padded = await padWhite(buf, padW, padH)
+  await writeFile(chrPath, padded)
+}
+
+/** Walk components dir, find a cases.ts referencing this nodeId, copy the
+ * BD_<safeId>/impl.tsx into <componentDir>/generated/<safeId>.tsx. The
+ * compose step uses these per-variant trees as the literal source of
+ * truth for synthesizing impl.tsx. */
+const maybeMirrorGenerated = async (nodeId: string, bdComponentName: string) => {
+  const bdImpl = resolve(projectRoot, 'src/components', bdComponentName, 'impl.tsx')
+  if (!existsSync(bdImpl)) return
+  const ents = await readdir(componentsPath, { withFileTypes: true })
+  for (const ent of ents) {
+    if (!ent.isDirectory()) continue
+    if (ent.name.startsWith('BD_')) continue
+    const casesPath = resolve(componentsPath, ent.name, 'cases.ts')
+    if (!existsSync(casesPath)) continue
+    const casesSrc = await readFile(casesPath, 'utf8')
+    if (!casesSrc.includes(JSON.stringify(nodeId))) continue
+    const genDir = resolve(componentsPath, ent.name, 'generated')
+    await mkdir(genDir, { recursive: true })
+    const safe = nodeId.replace(/[^A-Za-z0-9]/g, '_')
+    const dst = resolve(genDir, `${safe}.tsx`)
+    const src = await readFile(bdImpl, 'utf8')
+    // BD_<id>/ sits at src/components/BD_*/, imports relative paths.
+    // Copying to src/components/<Owner>/generated/ adds one extra dir level
+    // → every `../...` relative import needs an extra leading `../`.
+    const fixed = src.replace(/from\s+(['"])(\.\.\/[^'"]+)\1/g, "from $1../$2$1")
+    await writeFile(dst, fixed)
+    return
   }
 }
 
@@ -141,6 +210,35 @@ const measure = async (componentName: string): Promise<{ max: number; sum: numbe
 await mkdir(dirname(reportPath), { recursive: true })
 await writeFile(reportPath,
   `# Breakdown report — root ${manifest.rootNodeId}\n\nthreshold: largest connected blob (ΔE00 > 1.9) <= ${maxBlob}, max ΔE00/px <= ${maxDe}\n\n`)
+
+// ───────── Step 1: Generate all components ─────────
+process.stdout.write(`[verify] generating ${manifest.nodes.length} components… `)
+const originalLog = console.log
+console.log = () => {} // Suppress runGenerate logs
+
+const { loadConfig } = await import('../src/init.ts')
+// We need to import the functions directly since commonjs/esm interop might be tricky with re-exports.
+// Actually, runGenerate is exported from cli.ts, and discoverComponents is also there.
+const { discoverComponents } = await import('../src/generator/cli.ts')
+const { cfg, root: projectRootPath } = await loadConfig()
+const componentsDir = cfg.componentsDir ?? 'src/components'
+const components = await discoverComponents(projectRootPath, componentsDir)
+
+try {
+  const CONCURRENCY = 32
+  const pool = [...manifest.nodes]
+  const workers = Array.from({ length: CONCURRENCY }, async () => {
+    while (pool.length > 0) {
+      const n = pool.shift()!
+      const componentName = safeName(n.id)
+      await runGenerate(n.id, { tab: manifest.tab, name: componentName, components })
+    }
+  })
+  await Promise.all(workers)
+} finally {
+  console.log = originalLog
+}
+process.stdout.write(`done\n`)
 
 type Failure = {
   node: Node; max: number; sum: number; blob: number; componentName: string
@@ -160,25 +258,19 @@ const getRenderer = async () => {
 try {
   for (const n of manifest.nodes) {
     const componentName = safeName(n.id)
-    const outDir = resolve(projectRoot, '.pixpec-out', componentName)
-    if (skipPassed && existsSync(join(outDir, 'results.json'))) {
-      try {
-        const r = JSON.parse(await readFile(join(outDir, 'results.json'), 'utf8'))[0]
-        if (typeof r.blob_max_size === 'number' && r.blob_max_size <= maxBlob && (typeof r.dE00_max !== 'number' || r.dE00_max <= maxDe)) {
-          skipped++
-          process.stdout.write(`  [${'··'.repeat(n.depth)}] ${n.id} ${n.name}: cached blob=${r.blob_max_size} max=${(r.dE00_max ?? 0).toFixed(2)} ✓\n`)
-          continue
-        }
-      } catch { /* fall through */ }
-    }
     process.stdout.write(`  [${'··'.repeat(n.depth)}] ${n.id} ${n.name} (${n.type} ${n.w}x${n.h})… `)
     try {
-      await runGenerate(n.id, { tab: manifest.tab })
-      await ensureExport(componentName)
       await runDumpChromium(componentName, { renderer: await getRenderer() })
-      await placeFigmaPng(n,
+      const { padW, padH } = await placeFigmaPng(n,
         resolve(projectRoot, '.pixpec-out', componentName, 'figma', `${componentName}_main.png`))
+      await padChromiumPng(
+        resolve(projectRoot, '.pixpec-out', componentName, 'chromium', `${componentName}_main.png`),
+        padW, padH)
       const r = await measure(componentName)
+      // Drop a clean per-variant generated tree into the parent component's
+      // generated/ dir if init has scaffolded one (looked up by figma id in
+      // cases.ts). The compose step (AI / hand) reads from there.
+      await maybeMirrorGenerated(n.id, componentName)
       const ok = r.blob <= maxBlob && r.max <= maxDe
       process.stdout.write(`blob=${r.blob} max=${r.max.toFixed(2)} sum=${r.sum.toFixed(0)} ${ok ? '✓' : '✗'}\n`)
       await appendFile(reportPath,
@@ -204,11 +296,23 @@ try {
   await renderer?.close()
 }
 
-console.log(`\n[verify] ${passed} passed, ${skipped} skipped (cached)`)
+console.log(`\n[verify] ${passed} passed`)
 if (firstFailure) {
   const { node: n, componentName } = firstFailure
   const outDir = resolve(projectRoot, '.pixpec-out', componentName)
   const caseName = `${componentName}_main`
+
+  if (n.componentName) {
+    console.log(`\n💡 TIP: This is an INSTANCE of the registered component "${n.componentName}".`)
+    console.log(`   The instance failed standalone-render parity — verify the master`)
+    console.log(`   definition next to localize the bug to the component itself:`)
+    if (n.masterVariantId) {
+      console.log(`\n   pnpm exec tsx ${resolve(HERE, 'breakdown-prepare.ts')} ${n.masterVariantId}`)
+      console.log(`   pnpm exec tsx ${resolve(HERE, 'breakdown-verify.ts')}`)
+    } else {
+      console.log(`   (master variant id not captured — re-run breakdown-prepare to refresh manifest)`)
+    }
+  }
 
   // Headline: classify the failure so the user knows immediately what
   // class of fix is needed (regenerate? layout? color? raster engine gap?).
@@ -234,6 +338,7 @@ if (firstFailure) {
     const { max, sum, blob } = firstFailure
     console.log(`\n✗ FAILED at ${n.id} (${n.name}) — DIFF THRESHOLD`)
     console.log(`  blob=${blob} (limit ${maxBlob})  max ΔE/px=${max.toFixed(2)}  sum ΔE=${sum.toFixed(0)}`)
+
     // Auto-run analyze + rgg so the user gets the full diagnostic without
     // a second command. analyze is best-effort; rgg always written.
     console.log(`\n  generating diagnostics…`)
@@ -272,8 +377,8 @@ if (firstFailure) {
     console.log(`  pnpm pixpec analyze ${componentName} ${caseName}`)
     console.log(`  pnpm pixpec-rgg ${componentName}`)
   }
-  console.log(`\nFix, then rerun with --skip-passed.`)
+  console.log(`\nFix, then rerun.`)
   console.log(`Full report: ${reportPath}`)
   process.exit(1)
 }
-console.log(`\n✓ All ${manifest.nodes.length} nodes passed (largest blob <= ${maxBlob} pixels above ΔE=1.9). Full report: ${reportPath}`)
+console.log(`\n✓ All ${manifest.nodes.length} nodes passed (largest blob <= ${maxBlob} pixels above ΔE=2.0). Full report: ${reportPath}`)

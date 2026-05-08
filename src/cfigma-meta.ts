@@ -14,6 +14,19 @@ import { promisify } from 'node:util'
 
 const execFileAsync = promisify(execFile)
 
+function cleanControlValue<T>(value: T): T {
+  if (typeof value === 'string') {
+    return value.replace(/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g, '') as T
+  }
+  if (Array.isArray(value)) return value.map(cleanControlValue) as T
+  if (value && typeof value === 'object') {
+    return Object.fromEntries(
+      Object.entries(value as Record<string, unknown>).map(([k, v]) => [k, cleanControlValue(v)]),
+    ) as T
+  }
+  return value
+}
+
 export type FigmaPropType = 'VARIANT' | 'TEXT' | 'BOOLEAN' | 'INSTANCE_SWAP'
 
 export interface FigmaPropertyDefinition {
@@ -34,20 +47,33 @@ export type FigmaPropValue =
   | FigmaInstanceSwapValue
   | null
 
+/** Per-variant schema for an exposed nested instance slot — used by init
+ * to emit a properly-typed sub-interface instead of `Record<string, unknown>`. */
+export interface FigmaExposedInstanceSchema {
+  /** componentSet key (preferred) or component key for figma binding. */
+  mainKey: string | null
+  /** componentSet name (e.g. "Icon", "Button"). */
+  mainName: string | null
+  /** Property definitions of the slot's componentSet — same shape as the
+   * top-level componentPropertyDefinitions. Drives TS type emission. */
+  propertyDefinitions: Record<string, FigmaPropertyDefinition>
+}
+
 export interface FigmaVariantMeta {
   id: string
   name: string
   /**
    * Prop name → resolved value for this variant. Combines:
    *   - VARIANT / TEXT / BOOLEAN / INSTANCE_SWAP props from the variant itself
-   *   - Nested instance overrides at the variant-master level: each outer
-   *     INSTANCE child shows up as a key (using the layer name; duplicates
-   *     get `_2`, `_3` suffixes), with its own resolved componentProperties.
-   *
-   * pixpec init writes these into cases.ts as boilerplate; the impl picks
-   * which to expose as part of the component's React prop API.
+   *   - Nested-instance slots that the designer marked as `exposedInstances`
+   *     in figma — keyed by the layer name (duplicate names get `_2`, `_3`
+   *     suffixes), values are the slot's own resolved componentProperties.
    */
   propValues: Record<string, FigmaPropValue>
+  /** Schema for each exposed nested-instance slot (same keys as propValues
+   * for slots that came from exposedInstances). init aggregates these
+   * across variants and emits a typed sub-interface per slot. */
+  exposedSchemas?: Record<string, FigmaExposedInstanceSchema>
 }
 
 export interface FigmaComponentMeta {
@@ -55,13 +81,18 @@ export interface FigmaComponentMeta {
   kind: 'set' | 'single'
   id: string
   name: string
+  /** Stable component-set key for figma binding (used by registered DS
+   * components to declare which figma master they implement). */
+  key?: string
   propertyDefinitions: Record<string, FigmaPropertyDefinition>
   variants: FigmaVariantMeta[]
 }
 
 const PLUGIN_TEMPLATE = (componentId: string) => `
 const targetId = ${JSON.stringify(componentId)};
-const node = figma.root.findOne((n) => n.id === targetId);
+// getNodeByIdAsync hits the page index without requiring all pages to be
+// loaded — works regardless of which page is currently active.
+const node = await figma.getNodeByIdAsync(targetId);
 if (!node) throw new Error('component not found: ' + targetId);
 
 function stripHashKey(k) { return String(k).replace(/#[^#]*$/, ''); }
@@ -70,6 +101,11 @@ function extractVariant(v) {
   const propValues = Object.assign({}, v.variantProperties || {});
 
   // Step 1: Figma component-property bindings (TEXT / BOOLEAN / INSTANCE_SWAP).
+  // componentPropertyReferences names point into the OWNING component's
+  // propertyDefinitions; descending into nested INSTANCEs would leak THEIR
+  // ref names (e.g. an inner TextButton's leftIcon prop) onto the variant
+  // root. Stop recursion at INSTANCE boundaries — those are handled by
+  // Step 2 (exposedInstances) instead.
   const visit = (n) => {
     const refs = n.componentPropertyReferences;
     if (refs) {
@@ -88,23 +124,20 @@ function extractVariant(v) {
         };
       }
     }
+    if (n.type === 'INSTANCE') return;
     if (n.children) for (const c of n.children) visit(c);
   };
-  visit(v);
+  if (v.children) for (const c of v.children) visit(c);
 
-  // Step 2: walk outer-level INSTANCE descendants (don't descend into found
-  // instances). Each carries its resolved componentProperties — including
-  // overrides set at the variant-master level. We surface them as keyed
-  // entries on propValues so the impl can choose what to expose as React props.
-  const outer = [];
-  const collectOuter = (n) => {
-    if (n.type === 'INSTANCE') { outer.push(n); return; }
-    if (n.children) for (const c of n.children) collectOuter(c);
-  };
-  if (v.children) for (const c of v.children) collectOuter(c);
-
+  // Step 2: only nested INSTANCEs that the designer explicitly marked
+  // "Expose properties" in figma get surfaced as public props. The rest
+  // are baked into the variant's render and the codegen reads their
+  // resolved values from the IR walk, not from cases.ts. This mirrors
+  // figma's own API surface.
+  const exposed = v.exposedInstances || [];
   const taken = new Set(Object.keys(propValues));
-  for (const inst of outer) {
+  const exposedSchemas = {};
+  for (const inst of exposed) {
     let key = inst.name;
     let i = 2;
     while (taken.has(key)) { key = inst.name + '_' + i; i++; }
@@ -116,9 +149,22 @@ function extractVariant(v) {
       innerProps[stripHashKey(k)] = cp[k] && 'value' in cp[k] ? cp[k].value : cp[k];
     }
     propValues[key] = innerProps;
+
+    // Capture the slot's componentSet schema so init can emit a proper TS
+    // type for its props. Walk up to COMPONENT_SET (so all variants of the
+    // referenced component share one definition).
+    let main = inst.mainComponent;
+    let set = main;
+    while (set && set.type !== 'COMPONENT_SET') set = set.parent;
+    const root = set || main;
+    exposedSchemas[key] = {
+      mainKey: root ? root.key : null,
+      mainName: root ? root.name : null,
+      propertyDefinitions: stripHash(root ? root.componentPropertyDefinitions : {}),
+    };
   }
 
-  return { id: v.id, name: v.name, propValues };
+  return { id: v.id, name: v.name, propValues, exposedSchemas };
 }
 
 function stripHash(defs) {
@@ -135,6 +181,7 @@ if (node.type === 'COMPONENT_SET') {
     kind: 'set',
     id: node.id,
     name: node.name,
+    key: node.key,
     propertyDefinitions: stripHash(node.componentPropertyDefinitions),
     variants: node.children
       .filter((c) => c.type === 'COMPONENT')
@@ -142,10 +189,13 @@ if (node.type === 'COMPONENT_SET') {
   };
 }
 if (node.type === 'COMPONENT') {
+  // Standalone COMPONENT (no variants) — use its own key. When the user
+  // later wraps it in a COMPONENT_SET, init can be re-run.
   return {
     kind: 'single',
     id: node.id,
     name: node.name,
+    key: node.key,
     propertyDefinitions: stripHash(node.componentPropertyDefinitions),
     variants: [extractVariant(node)],
   };
@@ -165,7 +215,7 @@ export async function fetchComponentMeta(opts: {
     ['--tab', opts.tabPattern, 'exec', code],
     { encoding: 'utf8', maxBuffer: 16 * 1024 * 1024 },
   )
-  return JSON.parse(stdout) as FigmaComponentMeta
+  return cleanControlValue(JSON.parse(stdout)) as FigmaComponentMeta
 }
 
 /**

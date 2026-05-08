@@ -43,9 +43,11 @@ export interface RenderUrlOptions {
 }
 
 export interface BatchSession {
+  reload(): Promise<void>
   waitMounted(expectedCount: number): Promise<void>
   screenshot(selector: string, outPath: string): Promise<void>
   screenshotMany(items: { selector: string; outPath: string }[]): Promise<void>
+  navigateTo(url: string): Promise<void>
   close(): Promise<void>
 }
 
@@ -109,30 +111,57 @@ export class Renderer {
     })
     const page = await ctx.newPage()
     await page.addInitScript({ content: buildInitScript(remPx) })
+    let lastError: Error | null = null
     page.on('console', (m) => {
       if (m.type() === 'error' || process.env.PIXPEC_DEBUG) {
         console.error(`[browser:${m.type()}] ${m.text()}`)
       }
     })
-    page.on('pageerror', (e) => console.error(`[browser:exception] ${e.message}`))
+    page.on('pageerror', (e) => {
+      console.error(`[browser:exception] ${e.message}`)
+      lastError = e
+    })
     await page.goto(opts.url, { waitUntil: 'load', timeout: 120_000 })
     const cdp = await ctx.newCDPSession(page)
     const dpr = VERIFY_DPR
     return {
+      async reload() {
+        lastError = null
+        await page.reload({ waitUntil: 'load' })
+      },
+      async navigateTo(url: string) {
+        if (lastError) throw lastError
+        const attempt = async (retryCount = 0) => {
+          try {
+            await page.evaluate((u) => {
+              window.history.pushState({}, '', u)
+              return (window as any).__pixpecRender()
+            }, url)
+          } catch (e) {
+            if (retryCount < 3 && String(e).includes('context was destroyed')) {
+              // Wait a bit for the reload to finish, then try again.
+              await page.waitForTimeout(500)
+              return attempt(retryCount + 1)
+            }
+            throw e
+          }
+        }
+        await attempt()
+        if (lastError) throw lastError
+      },
       async waitMounted(expectedCount: number) {
+        if (lastError) throw lastError
         await page.waitForFunction(
-          (n) => document.querySelectorAll('[data-case]').length >= n,
+          (n) => {
+            if ((window as any).__pixpecError) throw new Error((window as any).__pixpecError);
+            return document.querySelectorAll('[data-case]').length >= n;
+          },
           expectedCount,
-          { timeout: 60_000 },
+          { timeout: 10_000 },
         )
-        // @font-face load grace period.
-        await page.waitForTimeout(FONT_SETTLE_MS)
         // Harness post-mount.
-        await page.evaluate(
-          () =>
-            (window as unknown as { __pixpecReady?: Promise<void> }).__pixpecReady ??
-            Promise.resolve(),
-        )
+        await page.evaluate(() => (window as any).__pixpecSettle())
+        if (lastError) throw lastError
       },
       async screenshot(selector: string, outPath: string) {
         await page.locator(selector).first().screenshot({ path: outPath })
@@ -171,7 +200,7 @@ export class Renderer {
         })) as { data: string }
         const fullBuf = Buffer.from(data, 'base64')
         const sharp = (await import('sharp')).default
-        const meta = await sharp(fullBuf).metadata()
+        const meta = await sharp(fullBuf, { limitInputPixels: false }).metadata()
         const fullW = meta.width ?? Math.round(unionW * dpr)
         const fullH = meta.height ?? Math.round(unionH * dpr)
         await Promise.all(
@@ -189,11 +218,11 @@ export class Renderer {
             const padded = haveW < wantW || haveH < wantH
             if (padded) {
               process.stderr.write(`\n[!!! WARNING !!!] screenshotMany: extract clipped for ${selectors[i]}\n  bound=(${b.x},${b.y},${b.w},${b.h}) want=${wantW}×${wantH} have=${haveW}×${haveH}\n  Padding right/bottom with RED #ff0000.\n\n`)
-              const cropped = await sharp(fullBuf).extract({ left, top, width: haveW, height: haveH }).toBuffer()
+              const cropped = await sharp(fullBuf, { limitInputPixels: false }).extract({ left, top, width: haveW, height: haveH }).toBuffer()
               await sharp({ create: { width: wantW, height: wantH, channels: 4, background: { r: 255, g: 0, b: 0, alpha: 1 } } })
                 .composite([{ input: cropped, top: 0, left: 0 }]).png().toFile(item.outPath)
             } else {
-              await sharp(fullBuf).extract({ left, top, width: wantW, height: wantH }).png().toFile(item.outPath)
+              await sharp(fullBuf, { limitInputPixels: false }).extract({ left, top, width: wantW, height: wantH }).png().toFile(item.outPath)
             }
           }),
         )

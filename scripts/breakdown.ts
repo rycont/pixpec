@@ -6,7 +6,7 @@
  *
  * Walks the figma node tree from <rootNodeId>, visiting every FRAME / COMPONENT
  * subtree leaf-first. For each node: `pixpec generate` → `pixpec dump-chromium`
- * → exportAsync (cfigma) → `pixpec-measure`. Halts at first node whose
+ * → exportAsync (cfigma) → `pixpec-measure`. Halts at the first node whose
  * max ΔE00/px >= threshold (default 30) — that's where the generator is
  * mishandling something. Atomic INSTANCEs (mapping to a registered danah
  * component) are NOT recursed into; they're treated as leaves rendered via
@@ -18,7 +18,6 @@
  * has already been certified.
  *
  *   --threshold N   max-per-pixel ΔE00 limit per node (default 30)
- *   --skip-passed   skip nodes whose existing results.json already passes
  *   --tab PATTERN   cfigma tab pattern (default from pixpec.toml)
  *   --root DIR      danah project root (default cwd)
  *
@@ -41,7 +40,7 @@ const MEASURE_BIN = resolve(HERE, '../measure-rs/target/release/pixpec-measure')
 
 const args = process.argv.slice(2)
 if (!args[0] || args[0].startsWith('-')) {
-  console.error('usage: tsx breakdown.ts <rootNodeId> [--max-blob 8] [--max-de Inf] [--skip-passed] [--tab PATTERN] [--root DIR]')
+  console.error('usage: tsx breakdown.ts <rootNodeId> [--max-blob 8] [--max-de Inf] [--tab PATTERN] [--root DIR]')
   process.exit(2)
 }
 const rootNodeId = args[0]
@@ -54,7 +53,6 @@ const opt = (k: string, d?: string) => {
 // structural mismatches (clustered residuals from mispositioned elements).
 const maxBlob = parseInt(opt('--max-blob', '16')!, 10)
 const maxDe = parseFloat(opt('--max-de', 'Infinity')!)
-const skipPassed = args.includes('--skip-passed')
 const projectRoot = resolve(opt('--root', process.cwd())!)
 const reportPath = resolve(projectRoot, '.pixpec-out/_breakdown-report.md')
 
@@ -64,37 +62,61 @@ const tomlGet = (k: string) => tomlText.match(new RegExp(`^${k}\\s*=\\s*"([^"]+)
 const cfigmaBin = tomlGet('cfigmaBin')!
 const defaultTab = opt('--tab', tomlGet('tabPattern')!)
 const componentsDir = tomlGet('componentsDir') ?? 'src/components'
+const componentsPath = resolve(projectRoot, componentsDir)
+
+// ───────── Step 0: cleanup existing BD_ components ─────────
+import { readdir, rm } from 'node:fs/promises'
+const existing = await readdir(componentsPath, { withFileTypes: true })
+for (const ent of existing) {
+  if (ent.isDirectory() && ent.name.startsWith('BD_')) {
+    console.log(`[breakdown] cleanup ${ent.name}`)
+    await rm(resolve(componentsPath, ent.name), { recursive: true, force: true })
+  }
+}
 
 // ───────── Step 1: walk figma tree, collect node ids in DFS post-order ─────────
-// "Atomic" = INSTANCE backed by a registered defineComponent. Walker emits these
-// as <Component .../> JSX so we don't recurse into them — their internal residual
-// is the responsibility of the component impl, not the generator.
+// "Atomic" = INSTANCE backed by a registered defineComponent.
 console.log(`[breakdown] walking ${rootNodeId} for FRAME/COMPONENT subtree…`)
-const indexMod = await import(resolve(projectRoot, 'src/index.ts')) as Record<string, unknown>
+
 const isComp = (v: unknown): v is { name: string; figma?: { componentSetKey: string } } =>
   !!v && typeof v === 'object' && 'name' in v && 'figma' in v
-const registeredKeys = new Set(Object.values(indexMod)
-  .filter(isComp).map((c) => c.figma!.componentSetKey).filter(Boolean))
+
+const registeredKeys = new Set<string>()
+const ents = await readdir(componentsPath, { withFileTypes: true })
+for (const ent of ents) {
+  if (!ent.isDirectory()) continue
+  try {
+    const modPath = resolve(componentsPath, ent.name, 'index.ts')
+    const mod = await import(modPath) as Record<string, unknown>
+    const c = (mod.default || mod[ent.name] || Object.values(mod).find(isComp)) as any
+    if (c?.figma?.componentSetKey) registeredKeys.add(c.figma.componentSetKey)
+  } catch { /* skip */ }
+}
 const bridge = getBridge()
 
 const REGISTRY_JSON = JSON.stringify(Array.from(registeredKeys))
 const walkCode = `
 const REGISTRY = new Set(${REGISTRY_JSON});
-const isAtomicInstance = (n) => {
+const isRegistered = (n) => {
   if (n.type !== 'INSTANCE') return false;
   let p = n.mainComponent; while (p && p.type !== 'COMPONENT_SET') p = p.parent;
   const key = p?.key ?? n.mainComponent?.key;
   return key && REGISTRY.has(key);
 };
 const out = [];
-const walk = (n, depth) => {
+const walk = async (n, depth) => {
   if (!n.visible) return;
-  // Skip TEXT (cli rejects bare text generation) — they're handled inside their parent frame.
   if (n.type === 'TEXT') return;
-  // Atomic registered instance: leaf, but don't generate it (component already verified).
-  if (isAtomicInstance(n)) { out.push({ id: n.id, name: n.name, depth, atomic: true, type: n.type }); return; }
-  // Recurse first (post-order)
-  for (const c of n.children ?? []) walk(c, depth + 1);
+
+  const registered = isRegistered(n);
+  
+  // If not a registered component, recurse into children first (post-order).
+  // If it IS registered, we treat it as a leaf for this breakdown (don't recurse
+  // into its internal implementation details).
+  if (!registered) {
+    for (const c of n.children ?? []) await walk(c, depth + 1);
+  }
+
   if (n.type === 'FRAME' || n.type === 'COMPONENT' || n.type === 'INSTANCE') {
     out.push({
       id: n.id, name: n.name, depth, atomic: false, type: n.type,
@@ -106,7 +128,7 @@ const walk = (n, depth) => {
 };
 const root = await figma.getNodeByIdAsync(${JSON.stringify(rootNodeId)});
 if (!root) throw new Error('node not found');
-walk(root, 0);
+await walk(root, 0);
 return out;
 `
 type Bbox = { x: number; y: number; width: number; height: number }
@@ -161,15 +183,7 @@ for (const r of exportRes) {
 }
 
 // ───────── Step 2: for each node, run the round-trip ─────────
-const safeName = (id: string) => `Gen_${id.replace(/[^A-Za-z0-9]/g, '_')}`
-const indexEntry = (name: string) =>
-  `export { ${name} } from './components/${name}/index.ts'`
-const ensureExport = async (name: string) => {
-  const idxPath = resolve(projectRoot, 'src/index.ts')
-  const txt = await readFile(idxPath, 'utf8')
-  if (txt.includes(`from './components/${name}/`)) return
-  await writeFile(idxPath, txt.trimEnd() + '\n' + indexEntry(name) + '\n')
-}
+const safeName = (id: string) => `BD_${id.replace(/[^A-Za-z0-9]/g, '_')}`
 
 const runMeasure = async (dir: string) => {
   await execFileAsync(MEASURE_BIN, [dir],
@@ -224,27 +238,15 @@ await writeFile(reportPath,
   `# Breakdown report — root ${rootNodeId}\n\nthreshold: largest connected blob (ΔE00 > 1.9) <= ${maxBlob}, max ΔE00/px <= ${maxDe}\n\n`)
 
 let firstFailure: { node: Node; max: number; sum: number; blob: number; componentName: string } | null = null
-let passed = 0, skipped = 0
+let passed = 0
 for (const n of targets) {
   const componentName = safeName(n.id)
-  const outDir = resolve(projectRoot, '.pixpec-out', componentName)
-  if (skipPassed && existsSync(join(outDir, 'results.json'))) {
-    try {
-      const r = JSON.parse(await readFile(join(outDir, 'results.json'), 'utf8'))[0]
-      if (typeof r.blob_max_size === 'number' && r.blob_max_size <= maxBlob && (typeof r.dE00_max !== 'number' || r.dE00_max <= maxDe)) {
-        skipped++
-        process.stdout.write(`  [${'··'.repeat(n.depth)}] ${n.id} ${n.name}: cached blob=${r.blob_max_size} max=${(r.dE00_max ?? 0).toFixed(2)} ✓\n`)
-        continue
-      }
-    } catch { /* fall through and re-run */ }
-  }
   process.stdout.write(`  [${'··'.repeat(n.depth)}] ${n.id} ${n.name} (${n.type} ${n.w}x${n.h})… `)
   try {
     // Direct function calls (vs spawning `pnpm exec tsx pixpec ...` subprocess)
     // — eliminates ~2.5s tsx-loader cold start per step. For a 15-node tree
     // with 2 steps each, that's ~75s saved.
-    await runGenerate(n.id, { tab: defaultTab })
-    await ensureExport(componentName)
+    await runGenerate(n.id, { tab: defaultTab, name: componentName })
     await runDumpChromium(componentName)
     await placeFigmaPng(n,
       resolve(projectRoot, '.pixpec-out', componentName, 'figma', `${componentName}_main.png`))
@@ -265,7 +267,7 @@ for (const n of targets) {
   }
 }
 
-console.log(`\n[breakdown] ${passed} passed, ${skipped} skipped (cached)`)
+console.log(`\n[breakdown] ${passed} passed`)
 if (firstFailure) {
   const { node, max, sum, blob, componentName } = firstFailure
   console.log(`\n✗ FAILED at ${node.id} (${node.name}): blob=${blob} max=${max.toFixed(2)} sum=${sum.toFixed(0)}`)
@@ -274,7 +276,7 @@ if (firstFailure) {
   console.log(`  pnpm pixpec-rgg ${componentName}`)
   console.log(`  open .pixpec-out/${componentName}/{chromium,figma}/${componentName}_main.png`)
   console.log(`  open .pixpec-out/${componentName}/rgg/${componentName}_main/rgg-{h,s,v}.png`)
-  console.log(`\nFix the generator (pixpec/src/generator/*) for this pattern, then rerun with --skip-passed to resume.`)
+  console.log(`\nFix the generator (pixpec/src/generator/*) for this pattern, then rerun to resume.`)
   console.log(`\nFull report: ${reportPath}`)
   process.exit(1)
 }

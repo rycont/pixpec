@@ -1,8 +1,8 @@
 /**
- * IR → React + PandaCSS JSX codegen using TypeScript factory + printer.
+ * IR → React + PandaCSS JSX codegen using TypeScript native-preview AST.
  *
- *   - Type-safe AST construction (ts.factory.*)
- *   - Printer handles escaping, indentation, JSX text/expression boundaries
+ *   - Type-safe AST construction (@typescript/native-preview/ast/factory)
+ *   - Native emitter handles escaping, indentation, JSX text/expression boundaries
  *   - No string concatenation
  *
  * Phase 0 mappings:
@@ -11,21 +11,32 @@
  *   IRText      → <span style={{...}}>content</span>
  *   IRVector / IRUnknown → placeholder div
  *
- * fromInstance() runs in hydrate() pass before codegen.
+ * propsFromFigma() runs in hydrate() pass before codegen.
  */
-import * as ts from 'typescript'
+import * as ast from '@typescript/native-preview/ast'
+import * as f from '@typescript/native-preview/ast/factory'
+import { isJsxSelfClosingElement } from '@typescript/native-preview/ast/is'
 import { getSvgPath } from 'figma-squircle'
 import type { Component } from '../types.ts'
 import type { IRNode, IRComponent, IRFrame, IRText, IRVector, IRShape, IRImage, IRUnknown } from './ir.ts'
-
-const f = ts.factory
 
 interface IRComponentRaw extends IRComponent {
   raw: unknown
 }
 
-/** Apply each registered component's fromInstance to fill .props. Mutates.
- * fromInstance is allowed to return `undefined` for missing-in-figma fields;
+function cleanControlValue(value: unknown): unknown {
+  if (typeof value === 'string') return value.replace(/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g, '')
+  if (Array.isArray(value)) return value.map(cleanControlValue)
+  if (value && typeof value === 'object') {
+    return Object.fromEntries(
+      Object.entries(value as Record<string, unknown>).map(([k, v]) => [k, cleanControlValue(v)]),
+    )
+  }
+  return value
+}
+
+/** Apply each registered component's propsFromFigma to fill .props. Mutates.
+ * propsFromFigma is allowed to return `undefined` for missing-in-figma fields;
  * we drop those keys here so the rendering component naturally falls back to
  * its declared `defaults` at runtime.
  * If the component declares `defaults`, copy it to IR — codegen will elide
@@ -36,10 +47,14 @@ export function hydrate(node: IRNode, components: Component<unknown>[]): IRNode 
     const c = node as IRComponentRaw
     const comp = components.find((x) => x.name === c.componentName)
     if (comp?.figma) {
-      const raw = comp.figma.fromInstance(c.raw as never) as Record<string, unknown>
-      c.props = Object.fromEntries(Object.entries(raw).filter(([, v]) => v !== undefined))
+      const raw = comp.figma.propsFromFigma(c.raw as never) as Record<string, unknown>
+      c.props = Object.fromEntries(
+        Object.entries(raw)
+          .filter(([, v]) => v !== undefined)
+          .map(([k, v]) => [k, cleanControlValue(v)]),
+      )
     }
-    if (comp?.defaults) c.defaultProps = comp.defaults as Record<string, unknown>
+    if (comp?.defaults) c.defaultProps = cleanControlValue(comp.defaults) as Record<string, unknown>
     delete (c as Partial<IRComponentRaw>).raw
   }
   if (node.kind === 'frame') for (const ch of node.children) hydrate(ch, components)
@@ -47,35 +62,219 @@ export function hydrate(node: IRNode, components: Component<unknown>[]): IRNode 
 }
 
 const IDENT_RE = /^[A-Za-z_$][A-Za-z0-9_$]*$/
+const noTokenFlags = 0 as ast.TokenFlags
+const noNodeFlags = 0 as ast.NodeFlags
+const nodeFlagsConst = 2 as ast.NodeFlags
+const noType = undefined as unknown as ast.TypeNode
+
+const stringLiteral = (text: string): ast.StringLiteral => f.createStringLiteral(text, noTokenFlags)
+const numericLiteral = (value: number): ast.NumericLiteral =>
+  f.createNumericLiteral(String(value), noTokenFlags)
+const keywordExpression = <T extends ast.KeywordExpressionSyntaxKind>(
+  kind: T,
+): ast.KeywordExpression<T> => f.createKeywordExpression(kind)
+const exportModifier = (): ast.ModifierLike =>
+  f.createToken(ast.SyntaxKind.ExportKeyword) as ast.ModifierLike
+const propertyAssignment = (
+  name: ast.PropertyName,
+  initializer: ast.Expression,
+): ast.PropertyAssignment => f.createPropertyAssignment(undefined, name, undefined, noType, initializer)
+const callExpression = (expression: ast.Expression, args: readonly ast.Expression[]): ast.CallExpression =>
+  f.createCallExpression(expression, undefined, undefined, args, noNodeFlags)
+
+function printStringLiteral(text: string): string {
+  return JSON.stringify(text)
+}
+
+function printTemplateLiteral(text: string): string {
+  return `\`${text.replace(/\\/g, '\\\\').replace(/`/g, '\\`').replace(/\$\{/g, '\\${')}\``
+}
+
+function printIdentifier(node: ast.Identifier): string {
+  return node.text
+}
+
+function printPropertyName(node: ast.PropertyName): string {
+  return node.kind === ast.SyntaxKind.Identifier
+    ? printIdentifier(node as ast.Identifier)
+    : printStringLiteral((node as ast.StringLiteral).text)
+}
+
+function printExpr(node: ast.Expression): string {
+  switch (node.kind) {
+    case ast.SyntaxKind.Identifier:
+      return printIdentifier(node as ast.Identifier)
+    case ast.SyntaxKind.StringLiteral:
+      return printStringLiteral((node as ast.StringLiteral).text)
+    case ast.SyntaxKind.NumericLiteral:
+      return (node as ast.NumericLiteral).text
+    case ast.SyntaxKind.TrueKeyword:
+      return 'true'
+    case ast.SyntaxKind.FalseKeyword:
+      return 'false'
+    case ast.SyntaxKind.NullKeyword:
+      return 'null'
+    case ast.SyntaxKind.ArrayLiteralExpression:
+      return `[${[...(node as ast.ArrayLiteralExpression).elements].map(printExpr).join(', ')}]`
+    case ast.SyntaxKind.ObjectLiteralExpression:
+      return `{ ${[...(node as ast.ObjectLiteralExpression).properties].map((p) => {
+        if (p.kind !== ast.SyntaxKind.PropertyAssignment) {
+          throw new Error(`[pixpec generate] unsupported object property kind: ${p.kind}`)
+        }
+        const prop = p as ast.PropertyAssignment
+        return `${printPropertyName(prop.name)}: ${printExpr(prop.initializer)}`
+      }).join(', ')} }`
+    case ast.SyntaxKind.CallExpression: {
+      const call = node as ast.CallExpression
+      return `${printExpr(call.expression)}(${[...call.arguments].map(printExpr).join(', ')})`
+    }
+    case ast.SyntaxKind.ParenthesizedExpression:
+      return `(${printExpr((node as ast.ParenthesizedExpression).expression)})`
+    case ast.SyntaxKind.ArrowFunction:
+      return printArrowFunction(node as ast.ArrowFunction)
+    case ast.SyntaxKind.NoSubstitutionTemplateLiteral:
+      return printTemplateLiteral((node as ast.NoSubstitutionTemplateLiteral).text)
+    case ast.SyntaxKind.JsxSelfClosingElement:
+    case ast.SyntaxKind.JsxElement:
+      return printJsx(node as ast.JsxChild)
+    case ast.SyntaxKind.PropertyAccessExpression: {
+      // ts-go stores child nodes in node._data (factory.generated.js:1757);
+      // typed `.expression`/`.name` getters from ast.d.ts aren't materialized
+      // on factory-created nodes.
+      const data = (node as unknown as { _data: { expression: ast.Expression; name: ast.Identifier } })._data
+      return `${printExpr(data.expression)}.${printIdentifier(data.name)}`
+    }
+    default:
+      throw new Error(`[pixpec generate] unsupported expression kind: ${node.kind}`)
+  }
+}
+
+function printJsxTagName(node: ast.JsxTagNameExpression): string {
+  return node.kind === ast.SyntaxKind.Identifier
+    ? printIdentifier(node as ast.Identifier)
+    : printExpr(node as ast.Expression)
+}
+
+function printJsxAttr(attr: ast.JsxAttributeLike): string {
+  if (attr.kind === ast.SyntaxKind.JsxSpreadAttribute) {
+    return `{...${printExpr((attr as ast.JsxSpreadAttribute).expression)}}`
+  }
+  const a = attr as ast.JsxAttribute
+  const name = a.name.kind === ast.SyntaxKind.Identifier
+    ? printIdentifier(a.name as ast.Identifier)
+    : `${printIdentifier((a.name as ast.JsxNamespacedName).namespace)}:${printIdentifier((a.name as ast.JsxNamespacedName).name)}`
+  if (!a.initializer) return name
+  if (a.initializer.kind === ast.SyntaxKind.StringLiteral) {
+    return `${name}=${printStringLiteral((a.initializer as ast.StringLiteral).text)}`
+  }
+  return `${name}={${printExpr((a.initializer as ast.JsxExpression).expression!)}}`
+}
+
+function printJsxAttrs(attrs: ast.JsxAttributes): string {
+  const printed = [...attrs.properties].map(printJsxAttr)
+  return printed.length ? ` ${printed.join(' ')}` : ''
+}
+
+function printJsxText(text: string): string {
+  return text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/{/g, '&#123;')
+}
+
+function printJsx(node: ast.JsxChild): string {
+  switch (node.kind) {
+    case ast.SyntaxKind.JsxText:
+      return printJsxText((node as ast.JsxText).text)
+    case ast.SyntaxKind.JsxExpression: {
+      const expr = (node as ast.JsxExpression).expression
+      return `{${expr ? printExpr(expr) : ''}}`
+    }
+    case ast.SyntaxKind.JsxSelfClosingElement: {
+      const el = node as ast.JsxSelfClosingElement
+      return `<${printJsxTagName(el.tagName)}${printJsxAttrs(el.attributes)} />`
+    }
+    case ast.SyntaxKind.JsxElement: {
+      const el = node as ast.JsxElement
+      const tag = printJsxTagName(el.openingElement.tagName)
+      const attrs = printJsxAttrs(el.openingElement.attributes)
+      return `<${tag}${attrs}>${[...el.children].map(printJsx).join('')}</${tag}>`
+    }
+    default:
+      throw new Error(`[pixpec generate] unsupported JSX kind: ${node.kind}`)
+  }
+}
+
+function printImportDeclaration(node: ast.ImportDeclaration): string {
+  const clause = node.importClause
+  const moduleSpecifier = printExpr(node.moduleSpecifier as ast.Expression)
+  if (!clause?.namedBindings || clause.namedBindings.kind !== ast.SyntaxKind.NamedImports) {
+    return `import ${moduleSpecifier};`
+  }
+  const typePrefix = clause.phaseModifier === ast.SyntaxKind.TypeKeyword ? ' type' : ''
+  const imports = [...(clause.namedBindings as ast.NamedImports).elements]
+    .map((s) => s.propertyName ? `${printIdentifier(s.propertyName as ast.Identifier)} as ${printIdentifier(s.name)}` : printIdentifier(s.name))
+    .join(', ')
+  return `import${typePrefix} { ${imports} } from ${moduleSpecifier};`
+}
+
+function printVariableStatement(node: ast.VariableStatement): string {
+  const exported = node.modifiers?.some((m) => m.kind === ast.SyntaxKind.ExportKeyword) ? 'export ' : ''
+  const declarations = [...node.declarationList.declarations].map((d) => {
+    const type = d.type ? `: ${printTypeNode(d.type)}` : ''
+    const init = d.initializer ? ` = ${printExpr(d.initializer)}` : ''
+    return `${printIdentifier(d.name as ast.Identifier)}${type}${init}`
+  })
+  return `${exported}const ${declarations.join(', ')};`
+}
+
+function printTypeNode(node: ast.TypeNode): string {
+  if (node.kind === ast.SyntaxKind.TypeReference) {
+    const typeRef = node as ast.TypeReferenceNode
+    return printPropertyName(typeRef.typeName as ast.PropertyName)
+  }
+  throw new Error(`[pixpec generate] unsupported type node kind: ${node.kind}`)
+}
+
+function printArrowFunction(node: ast.ArrowFunction): string {
+  return `() => ${printExpr(node.body as ast.Expression)}`
+}
+
+function printStatement(node: ast.Statement): string {
+  if (node.kind === ast.SyntaxKind.ImportDeclaration) return printImportDeclaration(node as ast.ImportDeclaration)
+  if (node.kind === ast.SyntaxKind.VariableStatement) return printVariableStatement(node as ast.VariableStatement)
+  throw new Error(`[pixpec generate] unsupported statement kind: ${node.kind}`)
+}
+
+function printSourceFile(sourceFile: ast.SourceFile): string {
+  return [...sourceFile.statements].map(printStatement).join('\n') + '\n'
+}
 
 /** JS value → ts AST expression. Handles primitives, arrays, plain objects. */
-function valueToExpr(v: unknown): ts.Expression {
-  if (v === null) return f.createNull()
+function valueToExpr(v: unknown): ast.Expression {
+  if (v === null) return keywordExpression(ast.SyntaxKind.NullKeyword)
   if (v === undefined) return f.createIdentifier('undefined')
-  if (typeof v === 'boolean') return v ? f.createTrue() : f.createFalse()
-  if (typeof v === 'number') return f.createNumericLiteral(v)
-  if (typeof v === 'string') return f.createStringLiteral(v)
+  if (typeof v === 'boolean') return keywordExpression(v ? ast.SyntaxKind.TrueKeyword : ast.SyntaxKind.FalseKeyword)
+  if (typeof v === 'number') return numericLiteral(v)
+  if (typeof v === 'string') return stringLiteral(v)
   if (Array.isArray(v)) return f.createArrayLiteralExpression(v.map(valueToExpr))
   if (typeof v === 'object') {
     const props = Object.entries(v as Record<string, unknown>).map(([k, val]) => {
-      const name = IDENT_RE.test(k) ? f.createIdentifier(k) : f.createStringLiteral(k)
-      return f.createPropertyAssignment(name, valueToExpr(val))
+      const name = IDENT_RE.test(k) ? f.createIdentifier(k) : stringLiteral(k)
+      return propertyAssignment(name, valueToExpr(val))
     })
     return f.createObjectLiteralExpression(props, false)
   }
-  return f.createStringLiteral(String(v))
+  return stringLiteral(String(v))
 }
 
 /** Build JSX attributes; identifier-safe keys go inline, rest go via spread.
  * String values render as `prop="value"` (no curly braces) — matches the
  * idiomatic JSX style. Other types (number, boolean, object) use `{...}`. */
-function attrsFromObject(obj: Record<string, unknown>): ts.JsxAttributeLike[] {
-  const inline: ts.JsxAttribute[] = []
+function attrsFromObject(obj: Record<string, unknown>): ast.JsxAttributeLike[] {
+  const inline: ast.JsxAttributeLike[] = []
   const rest: Record<string, unknown> = {}
   for (const [k, v] of Object.entries(obj)) {
     if (IDENT_RE.test(k)) {
-      const initializer: ts.JsxAttributeValue = typeof v === 'string'
-        ? f.createStringLiteral(v)
+      const initializer: ast.JsxAttributeValue = typeof v === 'string'
+        ? stringLiteral(v)
         : f.createJsxExpression(undefined, valueToExpr(v))
       inline.push(f.createJsxAttribute(f.createIdentifier(k), initializer))
     } else {
@@ -83,7 +282,7 @@ function attrsFromObject(obj: Record<string, unknown>): ts.JsxAttributeLike[] {
     }
   }
   if (Object.keys(rest).length) {
-    inline.push(f.createJsxSpreadAttribute(valueToExpr(rest)) as ts.JsxAttributeLike as ts.JsxAttribute)
+    inline.push(f.createJsxSpreadAttribute(valueToExpr(rest)))
   }
   return inline
 }
@@ -142,10 +341,19 @@ function componentLayoutStyles(n: IRComponent, parent: ParentCtx, ctx: CodegenCt
       }
     }
   }
+  // FIXED main-axis child of FILL/FIXED parent: prevent flex-shrink from
+  // collapsing the child below its explicit dim. HUG parent never shrinks
+  // its children, so wrap is unnecessary there. Emitted as a Panda style
+  // prop directly on the component (DS components must forward style/
+  // className to their root — AGENTS.md: 1 figma node = 1 JSX element).
+  if (parent.mainSizing !== 'hug') {
+    if (parent.dir === 'row' && n.sizingH === 'fixed') ws.flexShrink = 0
+    if (parent.dir === 'column' && n.sizingV === 'fixed') ws.flexShrink = 0
+  }
   return ws
 }
 
-function emitComponent(n: IRComponent, ctx: CodegenCtx, parent: ParentCtx = { dir: 'none', mainSizing: 'fixed' }): ts.JsxChild {
+function emitComponent(n: IRComponent, ctx: CodegenCtx, parent: ParentCtx = { dir: 'none', mainSizing: 'fixed' }): ast.JsxChild {
   // Elide props that match the component-set's default — figma's
   // `componentPropertyDefinitions[name].defaultValue` semantically equals
   // "what you'd get if you didn't override it." Cuts visual noise on
@@ -163,13 +371,14 @@ function emitComponent(n: IRComponent, ctx: CodegenCtx, parent: ParentCtx = { di
   for (const k of Object.keys(n.props)) delete layoutStyles[k]
   if ('width' in n.props) delete layoutStyles.minWidth
   if ('height' in n.props) delete layoutStyles.minHeight
+  if (n.opacity !== undefined) layoutStyles.opacity = n.opacity
   if (Object.keys(layoutStyles).length) attrs.push(...attrsFromObject(pandaize(layoutStyles, ctx.remBase)))
   const inner = f.createJsxSelfClosingElement(
     f.createIdentifier(n.componentName),
     undefined,
     f.createJsxAttributes(attrs),
   )
-  let wrapped: ts.JsxChild = inner
+  let wrapped: ast.JsxChild = inner
   // figma rotation (counterclockwise degrees) → CSS rotate (clockwise positive).
   // Wrap with inline-flex div so rotate doesn't affect parent layout.
   if (n.rotation !== undefined) {
@@ -199,38 +408,45 @@ function emitComponent(n: IRComponent, ctx: CodegenCtx, parent: ParentCtx = { di
     // divider). Geometric: translate(1, 0) → snap to css 63. Adjusted:
     // translate(0.5, 0) → ink at css 62.5 = match figma. The trick works only
     // for thin shapes; thicker rotated shapes don't snap.
-    const rotPostW = Math.abs(w0 * Math.cos(css)) + Math.abs(h0 * Math.sin(css))
-    const isThin = rotPostW <= 1.01
-    const tx = isThin ? -minX - 0.5 : -minX
-    const rotateStyle: Record<string, unknown> = {
-      display: 'inline-flex',
-      alignSelf: 'flex-start',
-      // inline-flex sits on baseline by default → ~18 css px Y offset inside an
-      // inline-block layout-wrap parent. `vertical-align: top` aligns the
-      // rotation box to the parent's content-top, matching figma's render.
-      verticalAlign: 'top',
-      transformOrigin: '0 0',
-      transform: `translate(${px2rem(tx, ctx.remBase)}, ${px2rem(-minY, ctx.remBase)}) rotate(${-n.rotation}deg)`,
-    }
-    if (typeof n.width === 'number') rotateStyle.width = px2rem(n.width, ctx.remBase)
-    if (typeof n.height === 'number') rotateStyle.height = px2rem(n.height, ctx.remBase)
-    const open = f.createJsxOpeningElement(
-      f.createIdentifier('div'), undefined,
+    const atRoot = parent.dir === 'none'
+    const tx = -minX
+    // Use CSS individual transform properties (translate, rotate) which
+    // Panda exposes as utilities — `transform` is multi-token and trips
+    // Panda's atomic class generator. Composition order per CSS spec for
+    // individual properties: rotate first, then translate (matches the
+    // legacy `transform: translate(...) rotate(...)` right-to-left order).
+    const pandaProps: Record<string, unknown> = atRoot
+      // boxWrapper centers content; absolute pin defeats centering so
+      // transform-origin:0,0 lines up with screenshot clip's top-left.
+      ? { position: 'absolute', top: 0, left: 0 }
+      : { display: 'inline-flex', alignSelf: 'flex-start', flexShrink: 0, verticalAlign: 'top' }
+    pandaProps.transformOrigin = '0 0'
+    pandaProps.translate = `${px2rem(tx, ctx.remBase)} ${px2rem(-minY, ctx.remBase)}`
+    pandaProps.rotate = `${-n.rotation}deg`
+    if (typeof n.width === 'number') pandaProps.width = px2rem(n.width, ctx.remBase)
+    if (typeof n.height === 'number') pandaProps.height = px2rem(n.height, ctx.remBase)
+    const extraAttrs = attrsFromObject(pandaize(pandaProps, ctx.remBase))
+    return f.updateJsxSelfClosingElement(
+      inner as ast.JsxSelfClosingElement,
+      (inner as ast.JsxSelfClosingElement).tagName,
+      (inner as ast.JsxSelfClosingElement).typeArguments,
       f.createJsxAttributes([
-        f.createJsxAttribute(f.createIdentifier('style'),
-          f.createJsxExpression(undefined, valueToExpr(rotateStyle))),
+        ...(inner as ast.JsxSelfClosingElement).attributes.properties,
+        ...extraAttrs,
       ]),
     )
-    const close = f.createJsxClosingElement(f.createIdentifier('div'))
-    return f.createJsxElement(open, [wrapped], close)
   }
   return wrapped
 }
 
-function emitFrame(n: IRFrame, ctx: CodegenCtx, parent: ParentCtx = { dir: 'none', mainSizing: 'fixed' }): ts.JsxElement {
+function emitFrame(n: IRFrame, ctx: CodegenCtx, parent: ParentCtx = { dir: 'none', mainSizing: 'fixed' }): ast.JsxElement {
   const parentDir = parent.dir
   const flexDir = n.layout.direction === 'none' ? null : n.layout.direction
   const styles: Record<string, unknown> = {}
+  // CSS values that bypass Panda atomic extraction (e.g. mixed-stroke
+  // boxShadow with var() refs — Panda extract drops the class). Emitted as
+  // a separate `style={{...}}` JSX attribute alongside the Panda atomic props.
+  const inlineStyle: Record<string, unknown> = {}
   // FILL semantics depend on parent main-axis: same axis → flex:1; cross axis → alignSelf:stretch.
   // BUT if parent's main-axis is HUG, "fill" along that axis is meaningless in figma
   // (HUG sizes to content), so collapse to HUG behaviour (no flex:1) — matches figma render.
@@ -316,9 +532,12 @@ function emitFrame(n: IRFrame, ctx: CodegenCtx, parent: ParentCtx = { dir: 'none
   } else if (n.layout.sizingH === 'fixed' && n.width !== undefined) {
     styles.width = resolveValue(n.width, tids.width, ctx.tokenMap, `${n.figmaId}.width`)
     // figma's FIXED sizing means "this dim is the truth" even if padding +
-    // children would normally push the flex container larger. Override CSS
-    // flex auto-min-size so the explicit dim wins.
-    styles.minWidth = 0
+    // children would normally push the flex container larger. CSS flex
+    // items get `min-width: auto` by default (= intrinsic min-content) which
+    // can override an explicit width — but only when this element IS a flex
+    // item (i.e., the parent is a flex container). Skip the override at the
+    // root (no parent) or in non-flex parents.
+    if (parentDir !== 'none') styles.minWidth = 0
   }
   if (n.layout.sizingV === 'fill') {
     if (parentDir === 'none') {
@@ -330,9 +549,16 @@ function emitFrame(n: IRFrame, ctx: CodegenCtx, parent: ParentCtx = { dir: 'none
     }
   } else if (n.layout.sizingV === 'fixed' && n.height !== undefined) {
     styles.height = resolveValue(n.height, tids.height, ctx.tokenMap, `${n.figmaId}.height`)
-    styles.minHeight = 0
+    if (parentDir !== 'none') styles.minHeight = 0
   }
+  // figma's FIXED-on-main-axis means "do not shrink to fit container," but
+  // CSS flex items default to flex-shrink:1 and can shrink below their
+  // explicit dim when the container's content area is smaller. Force
+  // flex-shrink:0 on FIXED main-axis frame children so they overflow like figma.
+  if (parentDir === 'row' && n.layout.sizingH === 'fixed') styles.flexShrink = 0
+  if (parentDir === 'column' && n.layout.sizingV === 'fixed') styles.flexShrink = 0
   if (n.background) styles.background = resolveValue(n.background, tids.background, ctx.tokenMap, `${n.figmaId}.background`)
+  if (n.opacity !== undefined) styles.opacity = n.opacity
   // figma cornerSmoothing > 0 → render the rounded shape via clip-path with
   // figma-squircle's path. CSS `border-radius` is a circular arc; figma uses
   // a G2-continuous (smoothed) corner that fades into the side gradually.
@@ -356,6 +582,17 @@ function emitFrame(n: IRFrame, ctx: CodegenCtx, parent: ParentCtx = { dir: 'none
     styles.clipPath = `url(#${squircleClipId})`
   } else if (n.borderRadius) {
     styles.borderRadius = resolveValue(n.borderRadius, tids.borderRadius, ctx.tokenMap, `${n.figmaId}.borderRadius`)
+  } else if (
+    (n.borderRadiusTopLeft || n.borderRadiusTopRight ||
+     n.borderRadiusBottomRight || n.borderRadiusBottomLeft)
+  ) {
+    // Per-corner radii (figma's mixed cornerRadius). Squircle smoothing on
+    // mixed corners isn't supported here — figma-squircle's path needs a
+    // single radius. Falls back to plain CSS per-corner border-radius.
+    if (n.borderRadiusTopLeft) styles.borderTopLeftRadius = n.borderRadiusTopLeft
+    if (n.borderRadiusTopRight) styles.borderTopRightRadius = n.borderRadiusTopRight
+    if (n.borderRadiusBottomRight) styles.borderBottomRightRadius = n.borderRadiusBottomRight
+    if (n.borderRadiusBottomLeft) styles.borderBottomLeftRadius = n.borderRadiusBottomLeft
   }
   // Stroke. Two cases:
   //   - non-squircle: use `inset boxShadow` (matches figma INSIDE alignment,
@@ -364,7 +601,7 @@ function emitFrame(n: IRFrame, ctx: CodegenCtx, parent: ParentCtx = { dir: 'none
   //     corners lose their stroke pixels. Render an absolute SVG overlay
   //     with the same path stroked at 2× weight; clip-path clips the outer
   //     half, leaving exactly `strokeWeight` px of stroke inside the squircle.
-  let strokeOverlay: ts.JsxChild | undefined
+  let strokeOverlay: ast.JsxChild | undefined
   if (n.strokeColor && n.strokeWeight) {
     requireTokenPath(tids.strokeWeight, ctx.tokenMap, `${n.figmaId}.strokeWeight`)
     const strokeTokenPath = requireTokenPath(tids.strokeColor, ctx.tokenMap, `${n.figmaId}.strokeColor`)
@@ -372,33 +609,59 @@ function emitFrame(n: IRFrame, ctx: CodegenCtx, parent: ParentCtx = { dir: 'none
     const strokeAttrColor = strokeTokenPath ? colorTokenVar(strokeTokenPath) : n.strokeColor
     if (squirclePath) {
       styles.position = 'relative'
-      const overlayStyle = {
-        position: 'absolute', inset: 0,
-        width: '100%', height: '100%',
-        pointerEvents: 'none' as const,
-      }
+      ctx.usedJsxPatterns.add('styled')
+      const tag = () => f.createPropertyAccessExpression(
+        f.createIdentifier('styled'), undefined, f.createIdentifier('svg'),
+      )
       strokeOverlay = f.createJsxElement(
-        f.createJsxOpeningElement(f.createIdentifier('svg'), undefined,
+        f.createJsxOpeningElement(tag(), undefined,
           f.createJsxAttributes([
             f.createJsxAttribute(f.createIdentifier('viewBox'),
-              f.createStringLiteral(`0 0 ${n.width} ${n.height}`)),
+              stringLiteral(`0 0 ${n.width} ${n.height}`)),
             f.createJsxAttribute(f.createIdentifier('preserveAspectRatio'),
-              f.createStringLiteral('none')),
-            f.createJsxAttribute(f.createIdentifier('style'),
-              f.createJsxExpression(undefined, valueToExpr(overlayStyle))),
+              stringLiteral('none')),
+            f.createJsxAttribute(f.createIdentifier('position'), stringLiteral('absolute')),
+            f.createJsxAttribute(f.createIdentifier('inset'), f.createJsxExpression(undefined, valueToExpr(0))),
+            f.createJsxAttribute(f.createIdentifier('width'), stringLiteral('100%')),
+            f.createJsxAttribute(f.createIdentifier('height'), stringLiteral('100%')),
+            f.createJsxAttribute(f.createIdentifier('pointerEvents'), stringLiteral('none')),
           ])),
         [f.createJsxSelfClosingElement(f.createIdentifier('path'), undefined,
           f.createJsxAttributes([
-            f.createJsxAttribute(f.createIdentifier('d'), f.createStringLiteral(squirclePath)),
-            f.createJsxAttribute(f.createIdentifier('fill'), f.createStringLiteral('none')),
-            f.createJsxAttribute(f.createIdentifier('stroke'), f.createStringLiteral(strokeAttrColor)),
+            f.createJsxAttribute(f.createIdentifier('d'), stringLiteral(squirclePath)),
+            f.createJsxAttribute(f.createIdentifier('fill'), stringLiteral('none')),
+            f.createJsxAttribute(f.createIdentifier('stroke'), stringLiteral(strokeAttrColor)),
             f.createJsxAttribute(f.createIdentifier('strokeWidth'),
               f.createJsxExpression(undefined, valueToExpr(n.strokeWeight * 2))),
           ]))],
-        f.createJsxClosingElement(f.createIdentifier('svg')),
+        f.createJsxClosingElement(tag()),
       )
     } else {
-      styles.insetBorder = `${n.strokeWeight} ${strokeTokenPath ?? n.strokeColor}`
+      // Per-side weights (figma individualStrokeWeights → strokeWeight=mixed).
+      // Emit borderTop/Right/Bottom/Left individually instead of insetBorder
+      // (which is uniform 4-side). CSS border adds outside the box; figma
+      // strokeAlign INSIDE adds inside. To keep layout dim stable, use
+      // boxShadow inset chained per side.
+      const hasMixed = n.strokeTopWeight !== undefined
+      if (hasMixed) {
+        // Panda's atomic generator doesn't reliably extract boxShadow values
+        // with multiple commas+parens (each variant per-side combo creates a
+        // unique class — too dynamic to pre-extract). CSS var() reference is
+        // native, so an inline style entry is the most robust path.
+        // Use rem (not px) so verify-mode supersample (htmlFs=128 → 8× rem
+        // scale) renders the stroke at the figma design dim. Raw px would
+        // render 1 device px = 0.125 design px → invisible hairline.
+        const colorRef = strokeTokenPath ? colorTokenVar(strokeTokenPath) : n.strokeColor
+        const w2r = (w: number) => px2rem(w, ctx.remBase)
+        const shadows: string[] = []
+        if (n.strokeTopWeight) shadows.push(`inset 0 ${w2r(n.strokeTopWeight)} 0 0 ${colorRef}`)
+        if (n.strokeBottomWeight) shadows.push(`inset 0 -${w2r(n.strokeBottomWeight)} 0 0 ${colorRef}`)
+        if (n.strokeLeftWeight) shadows.push(`inset ${w2r(n.strokeLeftWeight)} 0 0 0 ${colorRef}`)
+        if (n.strokeRightWeight) shadows.push(`inset -${w2r(n.strokeRightWeight)} 0 0 0 ${colorRef}`)
+        if (shadows.length) inlineStyle.boxShadow = shadows.join(', ')
+      } else {
+        styles.insetBorder = `${n.strokeWeight} ${strokeTokenPath ?? n.strokeColor}`
+      }
     }
   }
   if (n.clipsContent) styles.overflow = 'hidden'
@@ -415,6 +678,12 @@ function emitFrame(n: IRFrame, ctx: CodegenCtx, parent: ParentCtx = { dir: 'none
   const attrs = Object.keys(compactStyles).length
     ? attrsFromObject(pandaize(compactStyles, ctx.remBase))
     : []
+  if (Object.keys(inlineStyle).length) {
+    attrs.push(f.createJsxAttribute(
+      f.createIdentifier('style'),
+      f.createJsxExpression(undefined, valueToExpr(inlineStyle)),
+    ))
+  }
   const open = f.createJsxOpeningElement(
     f.createIdentifier(tag), undefined, f.createJsxAttributes(attrs),
   )
@@ -431,25 +700,25 @@ function emitFrame(n: IRFrame, ctx: CodegenCtx, parent: ParentCtx = { dir: 'none
     const clipDef = f.createJsxElement(
       f.createJsxOpeningElement(f.createIdentifier('svg'), undefined,
         f.createJsxAttributes([
-          f.createJsxAttribute(f.createIdentifier('width'), f.createStringLiteral('0')),
-          f.createJsxAttribute(f.createIdentifier('height'), f.createStringLiteral('0')),
+          f.createJsxAttribute(f.createIdentifier('width'), stringLiteral('0')),
+          f.createJsxAttribute(f.createIdentifier('height'), stringLiteral('0')),
           f.createJsxAttribute(f.createIdentifier('style'),
             f.createJsxExpression(undefined, valueToExpr({ position: 'absolute' }))),
-          f.createJsxAttribute(f.createIdentifier('aria-hidden'), f.createStringLiteral('true')),
+          f.createJsxAttribute(f.createIdentifier('aria-hidden'), stringLiteral('true')),
         ])),
       [f.createJsxElement(
         f.createJsxOpeningElement(f.createIdentifier('defs'), undefined, f.createJsxAttributes([])),
         [f.createJsxElement(
           f.createJsxOpeningElement(f.createIdentifier('clipPath'), undefined,
             f.createJsxAttributes([
-              f.createJsxAttribute(f.createIdentifier('id'), f.createStringLiteral(squircleClipId)),
-              f.createJsxAttribute(f.createIdentifier('clipPathUnits'), f.createStringLiteral('objectBoundingBox')),
+              f.createJsxAttribute(f.createIdentifier('id'), stringLiteral(squircleClipId)),
+              f.createJsxAttribute(f.createIdentifier('clipPathUnits'), stringLiteral('objectBoundingBox')),
             ])),
           [f.createJsxSelfClosingElement(f.createIdentifier('path'), undefined,
             f.createJsxAttributes([
-              f.createJsxAttribute(f.createIdentifier('d'), f.createStringLiteral(squirclePath)),
+              f.createJsxAttribute(f.createIdentifier('d'), stringLiteral(squirclePath)),
               f.createJsxAttribute(f.createIdentifier('transform'),
-                f.createStringLiteral(`scale(${(1 / n.width).toFixed(8)} ${(1 / n.height).toFixed(8)})`)),
+                stringLiteral(`scale(${(1 / n.width).toFixed(8)} ${(1 / n.height).toFixed(8)})`)),
             ]))],
           f.createJsxClosingElement(f.createIdentifier('clipPath')),
         )],
@@ -459,7 +728,7 @@ function emitFrame(n: IRFrame, ctx: CodegenCtx, parent: ParentCtx = { dir: 'none
     )
     children.push(clipDef)
   }
-  let jsx: ts.JsxElement = f.createJsxElement(open, children, close)
+  let jsx: ast.JsxElement = f.createJsxElement(open, children, close)
   // figma rotation on FRAME — wrap in inline-block with transform.
   // Same approach as emitComponent rotation handling: pre-rotation box
   // + transform + translate to compensate origin shift.
@@ -513,7 +782,7 @@ function emitFrame(n: IRFrame, ctx: CodegenCtx, parent: ParentCtx = { dir: 'none
   return jsx
 }
 
-function emitText(n: IRText, ctx: CodegenCtx, parent: ParentCtx = { dir: 'none', mainSizing: 'fixed' }): ts.JsxElement {
+function emitText(n: IRText, ctx: CodegenCtx, parent: ParentCtx = { dir: 'none', mainSizing: 'fixed' }): ast.JsxElement {
   const parentDir = parent.dir
   // If textStyleId matches a registered typography wrapper, use it.
   // The wrapper handles fontSize/lineHeight/weight/y-shift internally.
@@ -549,7 +818,7 @@ function emitText(n: IRText, ctx: CodegenCtx, parent: ParentCtx = { dir: 'none',
   const fixedWidth = !isHug && !fillMain && !fillCross && !collapsedFill ? n.width : undefined
   if (wrapperName) {
     ctx.usedTypography.add(wrapperName)
-    const attrs: ts.JsxAttributeLike[] = []
+    const attrs: ast.JsxAttributeLike[] = []
     const wrapperProps: Record<string, unknown> = {}
     const inlineStyles: Record<string, unknown> = {}
     if (fixedWidth !== undefined) wrapperProps.width = fixedWidth
@@ -599,8 +868,8 @@ function emitText(n: IRText, ctx: CodegenCtx, parent: ParentCtx = { dir: 'none',
     // paragraph splitting itself per design-system metadata. Use a template
     // literal so non-ASCII characters (Korean, emoji, etc.) survive the TS
     // printer's default \uXXXX escape behavior.
-    const child: ts.JsxChild = n.content.includes('\n')
-      ? f.createJsxExpression(undefined, f.createNoSubstitutionTemplateLiteral(n.content))
+    const child: ast.JsxChild = n.content.includes('\n')
+      ? f.createJsxExpression(undefined, f.createNoSubstitutionTemplateLiteral(n.content, noTokenFlags))
       : f.createJsxText(n.content)
     return f.createJsxElement(open, [child], close)
   }
@@ -626,7 +895,7 @@ function emitText(n: IRText, ctx: CodegenCtx, parent: ParentCtx = { dir: 'none',
 
 /** Multi-paragraph block split with `marginBottom: paragraphSpacing` between
  * paragraphs (no spacing on last). Single-paragraph content returns plain text. */
-function paragraphChildren(content: string, paragraphSpacing: number, remBase: number): ts.JsxChild[] {
+function paragraphChildren(content: string, paragraphSpacing: number, remBase: number): ast.JsxChild[] {
   const paragraphs = content.split('\n')
   if (paragraphs.length <= 1 || paragraphSpacing <= 0) return textChildren(content)
   return paragraphs.map((p, i) => {
@@ -654,9 +923,9 @@ function paragraphChildren(content: string, paragraphSpacing: number, remBase: n
  * surrounding white-space CSS — relying on `pre`/`pre-line` is fragile inside
  * `inline-block + width: max-content(...)`.
  */
-function textChildren(content: string): ts.JsxChild[] {
+function textChildren(content: string): ast.JsxChild[] {
   if (!content.includes('\n')) return [f.createJsxText(content)]
-  const out: ts.JsxChild[] = []
+  const out: ast.JsxChild[] = []
   const parts = content.split('\n')
   parts.forEach((p, i) => {
     if (p) out.push(f.createJsxText(p))
@@ -669,7 +938,7 @@ function textChildren(content: string): ts.JsxChild[] {
   return out
 }
 
-function emitVector(n: IRVector): ts.JsxSelfClosingElement {
+function emitVector(n: IRVector): ast.JsxSelfClosingElement {
   const styles = { width: n.width, height: n.height, background: n.fills[0] ?? '#ccc' }
   return f.createJsxSelfClosingElement(
     f.createIdentifier('div'), undefined,
@@ -690,21 +959,23 @@ function emitVector(n: IRVector): ts.JsxSelfClosingElement {
  * are at (0,0) within. Rotation handled via SVG transform attribute (figma
  * CCW deg ↔ SVG rotate CW negative).
  */
-function emitShape(n: IRShape, ctx: CodegenCtx, parent: ParentCtx = { dir: 'none', mainSizing: 'fixed' }): ts.JsxElement {
+function emitShape(n: IRShape, ctx: CodegenCtx, parent: ParentCtx = { dir: 'none', mainSizing: 'fixed' }): ast.JsxElement {
   const { width: w, height: h } = n
   requireTokenPath(n.fillTokenId, ctx.tokenMap, `${n.figmaId}.fill`)
   // SVG `fill=` is a raw attribute — panda token paths like
   // `content.standard.secondary` would not resolve. Use the raw hex/rgba.
   const fill = n.fill ?? 'none'
-  const svgAttrs: Record<string, unknown> = {
-    width: w, height: h,
-    viewBox: `0 0 ${w} ${h}`,
-    style: { display: 'block', flexShrink: 0 },
-  }
+  // Use panda's `styled.svg` so width/height/display/flexShrink become
+  // atomic CSS classes (rem-based, scale with verify-mode supersample
+  // htmlFs=128). viewBox stays as a raw SVG attr — viewBox→box scaling
+  // renders inner cx/cy/rx/ry at the scaled size automatically.
+  ctx.usedJsxPatterns.add('styled')
   // Compute child element attrs based on shape kind
-  let inner: ts.JsxChild
-  const innerAttrs: Record<string, unknown> = {}
-  if (fill !== 'none') innerAttrs.fill = fill
+  let inner: ast.JsxChild
+  // Always emit fill attr — SVG default fill is BLACK when omitted, so a
+  // figma shape with no fill (designer-intentional spacer) would render
+  // as a black blob. fill="none" preserves layout slot with zero ink.
+  const innerAttrs: Record<string, unknown> = { fill }
   if (n.strokeColor) {
     innerAttrs.stroke = n.strokeColor
     innerAttrs['strokeWidth'] = n.strokeWeight ?? 1
@@ -716,6 +987,41 @@ function emitShape(n: IRShape, ctx: CodegenCtx, parent: ParentCtx = { dir: 'none
     innerAttrs.transform = `rotate(${-n.rotation} ${w / 2} ${h / 2})`
   }
   if (n.shape === 'rect') {
+    const tl = n.borderRadiusTopLeft ?? 0
+    const tr = n.borderRadiusTopRight ?? 0
+    const br = n.borderRadiusBottomRight ?? 0
+    const bl = n.borderRadiusBottomLeft ?? 0
+    const hasPerCorner = (tl || tr || br || bl) && !n.borderRadius
+    if (hasPerCorner) {
+      // Per-corner radii — SVG <rect> only supports uniform rx/ry, so emit a
+      // <path> with explicit corner arcs. Path traces top→right→bottom→left,
+      // each corner using `A r r 0 0 1 x y` for a clockwise quarter-circle.
+      const d = [
+        `M${tl},0`,
+        `L${w - tr},0`,
+        tr ? `A${tr},${tr} 0 0 1 ${w},${tr}` : '',
+        `L${w},${h - br}`,
+        br ? `A${br},${br} 0 0 1 ${w - br},${h}` : '',
+        `L${bl},${h}`,
+        bl ? `A${bl},${bl} 0 0 1 0,${h - bl}` : '',
+        `L0,${tl}`,
+        tl ? `A${tl},${tl} 0 0 1 ${tl},0` : '',
+        'Z',
+      ].filter(Boolean).join(' ')
+      innerAttrs.d = d
+      inner = f.createJsxSelfClosingElement(
+        f.createIdentifier('path'), undefined,
+        f.createJsxAttributes(
+          Object.entries(innerAttrs).map(([k, v]) =>
+            f.createJsxAttribute(
+              f.createIdentifier(k),
+              typeof v === 'string' ? stringLiteral(v)
+                : f.createJsxExpression(undefined, valueToExpr(v)),
+            ),
+          ),
+        ),
+      )
+    } else {
     if (n.borderRadius) { innerAttrs.rx = n.borderRadius; innerAttrs.ry = n.borderRadius }
     inner = f.createJsxSelfClosingElement(
       f.createIdentifier('rect'), undefined,
@@ -727,6 +1033,7 @@ function emitShape(n: IRShape, ctx: CodegenCtx, parent: ParentCtx = { dir: 'none
         ),
       ]),
     )
+    }
   } else if (n.shape === 'ellipse') {
     inner = f.createJsxSelfClosingElement(
       f.createIdentifier('ellipse'), undefined,
@@ -753,13 +1060,23 @@ function emitShape(n: IRShape, ctx: CodegenCtx, parent: ParentCtx = { dir: 'none
       ]),
     )
   }
-  const open = f.createJsxOpeningElement(
-    f.createIdentifier('svg'), undefined,
-    f.createJsxAttributes(Object.entries(svgAttrs).map(([k, v]) =>
-      f.createJsxAttribute(f.createIdentifier(k), f.createJsxExpression(undefined, valueToExpr(v))),
-    )),
+  // factory signature: (expression, questionDotToken, name, flags) — pass
+  // undefined for questionDotToken or `name` lands in the wrong slot.
+  const styledSvg = () => f.createPropertyAccessExpression(
+    f.createIdentifier('styled'), undefined, f.createIdentifier('svg'),
   )
-  const close = f.createJsxClosingElement(f.createIdentifier('svg'))
+  const svgAttrs: ast.JsxAttribute[] = [
+    f.createJsxAttribute(f.createIdentifier('viewBox'), stringLiteral(`0 0 ${w} ${h}`)),
+    f.createJsxAttribute(f.createIdentifier('display'), stringLiteral('block')),
+    f.createJsxAttribute(f.createIdentifier('flexShrink'), f.createJsxExpression(undefined, valueToExpr(0))),
+    f.createJsxAttribute(f.createIdentifier('width'), stringLiteral(px2rem(w, ctx.remBase))),
+    f.createJsxAttribute(f.createIdentifier('height'), stringLiteral(px2rem(h, ctx.remBase))),
+  ]
+  if (n.opacity !== undefined) svgAttrs.push(
+    f.createJsxAttribute(f.createIdentifier('opacity'), f.createJsxExpression(undefined, valueToExpr(n.opacity))),
+  )
+  const open = f.createJsxOpeningElement(styledSvg(), undefined, f.createJsxAttributes(svgAttrs))
+  const close = f.createJsxClosingElement(styledSvg())
   return f.createJsxElement(open, [inner], close)
 }
 
@@ -767,25 +1084,29 @@ function emitShape(n: IRShape, ctx: CodegenCtx, parent: ParentCtx = { dir: 'none
  * <img src="data:image/svg+xml;base64,...">. SVG keeps vector fidelity at
  * any DPR; the data URL embedding keeps the generated component
  * self-contained (no external asset dir to ship). */
-function emitImage(n: IRImage): ts.JsxSelfClosingElement {
-  const styles: Record<string, unknown> = { display: 'block', flexShrink: 0 }
+function emitImage(n: IRImage, ctx: CodegenCtx): ast.JsxSelfClosingElement {
+  // HTML <img> width/height attrs are raw px and bypass the verify-mode
+  // 8x html font-size supersample. Use rem-based style.width/height instead
+  // so the img scales with the rest of the codegen output.
+  const styles: Record<string, unknown> = {
+    display: 'block', flexShrink: 0,
+    width: px2rem(n.width, ctx.remBase),
+    height: px2rem(n.height, ctx.remBase),
+  }
+  if (n.opacity !== undefined) styles.opacity = n.opacity
   return f.createJsxSelfClosingElement(
     f.createIdentifier('img'), undefined,
     f.createJsxAttributes([
       f.createJsxAttribute(f.createIdentifier('src'),
-        f.createStringLiteral(n.dataUrl ?? '')),
-      f.createJsxAttribute(f.createIdentifier('width'),
-        f.createJsxExpression(undefined, valueToExpr(n.width))),
-      f.createJsxAttribute(f.createIdentifier('height'),
-        f.createJsxExpression(undefined, valueToExpr(n.height))),
-      f.createJsxAttribute(f.createIdentifier('alt'), f.createStringLiteral('')),
+        stringLiteral(n.dataUrl ?? '')),
+      f.createJsxAttribute(f.createIdentifier('alt'), stringLiteral('')),
       f.createJsxAttribute(f.createIdentifier('style'),
         f.createJsxExpression(undefined, valueToExpr(styles))),
     ]),
   )
 }
 
-function emitUnknown(n: IRUnknown): ts.JsxSelfClosingElement {
+function emitUnknown(n: IRUnknown): ast.JsxSelfClosingElement {
   // Zero-area unknowns (lines, hover-state placeholders) shouldn't perturb flex layout.
   if (n.width === 0 || n.height === 0) {
     return f.createJsxSelfClosingElement(
@@ -825,26 +1146,54 @@ interface CodegenCtx {
 }
 
 /** Wrap a JSX child in a `<span style={...}>`. Exposed to plugins via EmitContext. */
-function wrapWithStyle(jsx: ts.JsxChild, style: Record<string, unknown>): ts.JsxChild {
-  const open = f.createJsxOpeningElement(
-    f.createIdentifier('span'), undefined,
-    f.createJsxAttributes([
-      f.createJsxAttribute(f.createIdentifier('style'),
-        f.createJsxExpression(undefined, valueToExpr(style))),
-    ]),
+function wrapWithStyle(jsx: ast.JsxChild, style: Record<string, unknown>, ctx: CodegenCtx): ast.JsxChild {
+  // styled.span with atomic Panda props — each style entry becomes a CSS
+  // class statically extractable by panda postcss. The `style={{}}` inline
+  // form would bypass Panda's class system and force inline declarations.
+  ctx.usedJsxPatterns.add('styled')
+  const tag = () => f.createPropertyAccessExpression(
+    f.createIdentifier('styled'), undefined, f.createIdentifier('span'),
   )
-  return f.createJsxElement(open, [jsx],
-    f.createJsxClosingElement(f.createIdentifier('span')))
+  const attrs = attrsFromObject(pandaize(style, ctx.remBase))
+  return f.createJsxElement(
+    f.createJsxOpeningElement(tag(), undefined, f.createJsxAttributes(attrs)),
+    [jsx],
+    f.createJsxClosingElement(tag()),
+  )
 }
 
 /** Wrap a JSX child in a `<span className={css({...})}>`. Token-aware. */
-function wrapWithCss(jsx: ts.JsxChild, style: Record<string, unknown>, ctx: CodegenCtx): ts.JsxChild {
+function wrapWithCss(jsx: ast.JsxChild, style: Record<string, unknown>, ctx: CodegenCtx): ast.JsxChild {
   const open = f.createJsxOpeningElement(
     f.createIdentifier('span'), undefined,
     f.createJsxAttributes([cssAttr(style, ctx)]),
   )
   return f.createJsxElement(open, [jsx],
     f.createJsxClosingElement(f.createIdentifier('span')))
+}
+
+function jsxAttr(name: string, value: unknown): ast.JsxAttribute {
+  const initializer: ast.JsxAttributeValue = typeof value === 'string'
+    ? stringLiteral(value)
+    : f.createJsxExpression(undefined, valueToExpr(value))
+  return f.createJsxAttribute(f.createIdentifier(name), initializer)
+}
+
+function styleAttr(style: Record<string, unknown>): ast.JsxAttribute {
+  return f.createJsxAttribute(
+    f.createIdentifier('style'),
+    f.createJsxExpression(undefined, valueToExpr(style)),
+  )
+}
+
+function appendJsxAttr(jsx: ast.JsxChild, attr: ast.JsxAttribute): ast.JsxChild {
+  if (!isJsxSelfClosingElement(jsx)) return jsx
+  return f.updateJsxSelfClosingElement(
+    jsx,
+    jsx.tagName,
+    jsx.typeArguments,
+    f.createJsxAttributes([...jsx.attributes.properties, attr]),
+  )
 }
 
 function resolveTokenPath(tokenId: string | undefined, tokenMap: Record<string, string>): string | undefined {
@@ -947,13 +1296,10 @@ function pandaize(styles: Record<string, unknown>, remBase: number): Record<stri
 }
 
 /** Build `className={css({...})}` JSX attribute (panda CSS). */
-function cssAttr(styles: Record<string, unknown>, ctx: CodegenCtx): ts.JsxAttribute {
+function cssAttr(styles: Record<string, unknown>, ctx: CodegenCtx): ast.JsxAttribute {
   ctx.usesCss = true
   const obj = pandaize(styles, ctx.remBase)
-  const call = f.createCallExpression(
-    f.createIdentifier('css'), undefined,
-    [valueToExpr(obj)],
-  )
+  const call = callExpression(f.createIdentifier('css'), [valueToExpr(obj)])
   return f.createJsxAttribute(
     f.createIdentifier('className'),
     f.createJsxExpression(undefined, call),
@@ -975,15 +1321,15 @@ interface ParentCtx {
   mainSizing: 'fixed' | 'hug' | 'fill'
 }
 
-function emitNode(n: IRNode, ctx: CodegenCtx, parent: ParentCtx = { dir: 'none', mainSizing: 'fixed' }): ts.JsxChild {
-  let jsx: ts.JsxChild
+function emitNode(n: IRNode, ctx: CodegenCtx, parent: ParentCtx = { dir: 'none', mainSizing: 'fixed' }): ast.JsxChild {
+  let jsx: ast.JsxChild
   switch (n.kind) {
     case 'component': jsx = emitComponent(n, ctx, parent); break
     case 'frame': jsx = emitFrame(n, ctx, parent); break
     case 'text': jsx = emitText(n, ctx, parent); break
     case 'vector': jsx = emitVector(n); break
     case 'shape': jsx = emitShape(n, ctx, parent); break
-    case 'image': jsx = emitImage(n); break
+    case 'image': jsx = emitImage(n, ctx); break
     case 'unknown': jsx = emitUnknown(n); break
   }
   // Plugin emitWrap chain — DS-specific wrapping (e.g. Icon currentColor).
@@ -992,11 +1338,13 @@ function emitNode(n: IRNode, ctx: CodegenCtx, parent: ParentCtx = { dir: 'none',
   if (ctx.plugins.length) {
     const ectx = {
       parentDir: parent.dir,
-      f,
       tokenMap: ctx.tokenMap,
       resolveTokenPath: (tokenId: string | undefined) => requireTokenPath(tokenId, ctx.tokenMap, 'plugin token'),
-      wrapWithStyle,
-      wrapWithCss: (child: ts.JsxChild, style: Record<string, unknown>) => wrapWithCss(child, style, ctx),
+      wrapWithStyle: (child: ast.JsxChild, style: Record<string, unknown>) => wrapWithStyle(child, style, ctx),
+      wrapWithCss: (child: ast.JsxChild, style: Record<string, unknown>) => wrapWithCss(child, style, ctx),
+      jsxAttr,
+      styleAttr,
+      appendJsxAttr,
     }
     for (const p of ctx.plugins) {
       if (p.emitWrap) jsx = p.emitWrap(n, jsx, ectx)
@@ -1028,8 +1376,11 @@ function emitNode(n: IRNode, ctx: CodegenCtx, parent: ParentCtx = { dir: 'none',
     }
     if (fixedH && typeof rotW === 'number') ws.width = px2rem(rotW, ctx.remBase)
     if (fixedV && typeof rotH === 'number') ws.height = px2rem(rotH, ctx.remBase)
-    jsx = wrapWithStyle(jsx, { ...ws, display: 'inline-block' })
+    jsx = wrapWithStyle(jsx, { ...ws, display: 'inline-block' }, ctx)
   }
+  // (no shrink-wrap span — AGENTS.md: 1 figma node = 1 JSX element. The
+  // flex-shrink:0 prop is emitted as a Panda style prop directly on the
+  // component element by emitComponent's componentLayoutStyles below.)
   // figma layoutPositioning=ABSOLUTE → child overlays parent at (x,y).
   // Wrap with position:absolute + left/top so the child sits outside flex
   // flow but still in DOM. Parent gets position:relative emitted in emitFrame.
@@ -1038,7 +1389,7 @@ function emitNode(n: IRNode, ctx: CodegenCtx, parent: ParentCtx = { dir: 'none',
       position: 'absolute',
       left: typeof n.absX === 'number' ? px2rem(n.absX, ctx.remBase) : '0rem',
       top: typeof n.absY === 'number' ? px2rem(n.absY, ctx.remBase) : '0rem',
-    })
+    }, ctx)
   }
   return jsx
 }
@@ -1070,81 +1421,75 @@ export function generate(
 
   const componentImports = [...usedComponents].sort().map((n) =>
     f.createImportDeclaration(undefined,
-      f.createImportClause(false, undefined,
+      f.createImportClause(undefined, undefined,
         f.createNamedImports([
           f.createImportSpecifier(false, f.createIdentifier('impl'), f.createIdentifier(n)),
         ])),
-      f.createStringLiteral(`../${n}/impl.tsx`),
+      stringLiteral(`../${n}/impl.tsx`),
     ),
   )
   // Pre-emit body so usedTypography is populated.
-  const body = emitNode(root, ctx) as ts.Expression
+  const body = emitNode(root, ctx) as ast.Expression
   const typographyImports = ctx.usedTypography.size > 0
     ? [f.createImportDeclaration(undefined,
-        f.createImportClause(false, undefined,
+        f.createImportClause(undefined, undefined,
           f.createNamedImports([...ctx.usedTypography].sort().map((n) =>
             f.createImportSpecifier(false, undefined, f.createIdentifier(n))))),
-        f.createStringLiteral('../typography/index.tsx'))]
+        stringLiteral('../typography/index.tsx'))]
     : []
   const cssImport = ctx.usesCss
     ? [f.createImportDeclaration(undefined,
-        f.createImportClause(false, undefined,
+        f.createImportClause(undefined, undefined,
           f.createNamedImports([f.createImportSpecifier(false, undefined, f.createIdentifier('css'))])),
-        f.createStringLiteral('../../../styled-system/css'))]
+        stringLiteral('../../../styled-system/css'))]
     : []
   const jsxPatternImport = ctx.usedJsxPatterns.size > 0
     ? [f.createImportDeclaration(undefined,
-        f.createImportClause(false, undefined,
+        f.createImportClause(undefined, undefined,
           f.createNamedImports([...ctx.usedJsxPatterns].sort().map((n) =>
             f.createImportSpecifier(false, undefined, f.createIdentifier(n))))),
-        f.createStringLiteral('../../../styled-system/jsx'))]
+        stringLiteral('../../../styled-system/jsx'))]
     : []
   const importStatements = [...componentImports, ...typographyImports, ...cssImport, ...jsxPatternImport]
   const fcImport = f.createImportDeclaration(undefined,
-    f.createImportClause(true, undefined,
+    f.createImportClause(ast.SyntaxKind.TypeKeyword, undefined,
       f.createNamedImports([f.createImportSpecifier(false, undefined, f.createIdentifier('FC'))])),
-    f.createStringLiteral('react'),
+    stringLiteral('react'),
   )
   const generatedFn = f.createVariableStatement(
-    [f.createModifier(ts.SyntaxKind.ExportKeyword)],
+    [exportModifier()],
     f.createVariableDeclarationList([
       f.createVariableDeclaration(
         f.createIdentifier('Generated'),
         undefined,
-        f.createTypeReferenceNode('FC'),
+        f.createTypeReferenceNode(f.createIdentifier('FC')),
         f.createArrowFunction(undefined, undefined, [], undefined,
-          f.createToken(ts.SyntaxKind.EqualsGreaterThanToken),
+          f.createToken(ast.SyntaxKind.EqualsGreaterThanToken),
           f.createParenthesizedExpression(body),
         ),
       ),
-    ], ts.NodeFlags.Const),
+    ], nodeFlagsConst),
   )
   const implExport = f.createVariableStatement(
-    [f.createModifier(ts.SyntaxKind.ExportKeyword)],
+    [exportModifier()],
     f.createVariableDeclarationList([
       f.createVariableDeclaration(
         f.createIdentifier('impl'),
         undefined,
-        f.createTypeReferenceNode('FC'),
+        f.createTypeReferenceNode(f.createIdentifier('FC')),
         f.createArrowFunction(undefined, undefined, [], undefined,
-          f.createToken(ts.SyntaxKind.EqualsGreaterThanToken),
+          f.createToken(ast.SyntaxKind.EqualsGreaterThanToken),
           f.createJsxSelfClosingElement(f.createIdentifier('Generated'), undefined, f.createJsxAttributes([])),
         ),
       ),
-    ], ts.NodeFlags.Const),
+    ], nodeFlagsConst),
   )
   const sourceFile = f.createSourceFile(
     [fcImport, ...importStatements, generatedFn, implExport],
-    f.createToken(ts.SyntaxKind.EndOfFileToken),
-    ts.NodeFlags.None,
+    f.createToken(ast.SyntaxKind.EndOfFile),
+    '',
+    '/__pixpec_generated.tsx' as ast.Path,
+    '/__pixpec_generated.tsx' as ast.Path,
   )
-  const printer = ts.createPrinter({ newLine: ts.NewLineKind.LineFeed })
-  // TS printer escapes non-ASCII as \uXXXX. Restore so Korean/emoji content
-  // reads naturally in the generated source. Safe because the codegen never
-  // intentionally emits a `\u` escape sequence — all non-ASCII originates
-  // from figma `characters` which we want as raw glyphs.
-  return printer.printFile(sourceFile).replace(
-    /\\u([0-9a-fA-F]{4})/g,
-    (_, hex) => String.fromCharCode(parseInt(hex, 16)),
-  )
+  return printSourceFile(sourceFile)
 }

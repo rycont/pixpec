@@ -47,6 +47,9 @@ export function boxWrapper(o: BoxWrapperOptions): ComponentType<{ children: Reac
     display: 'inline-flex',
     alignItems: 'center',
     justifyContent: 'center',
+    // Positioning context for absolutely-positioned root children (e.g. the
+    // rotation-wrap codegen emits for rotated FRAME/COMPONENT roots).
+    position: 'relative',
   }
   if (o.width !== undefined) style.width = px2rem(o.width)
   if (o.height !== undefined) style.height = px2rem(o.height)

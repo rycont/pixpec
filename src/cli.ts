@@ -30,7 +30,25 @@ async function main() {
       console.log(
         `scaffolded ${r.componentName} (${r.variantCount} variants) → ${r.componentDir}`,
       )
-      console.log(`  exported ${r.exportedImages.length} images`)
+      console.log(`  files: props.ts, cases.ts, defaults.ts, index.ts (always rewritten)`)
+      console.log(`         impl.tsx, noise.ts (stub — preserved on re-init)`)
+      console.log(`         generated/ (empty — populated by breakdown)`)
+      console.log(``)
+      console.log(`Next: run breakdown for each variant so generated/<id>.tsx exists,`)
+      console.log(`then synthesize impl.tsx by composing the per-variant trees.`)
+      console.log(``)
+      // Resolve the on-disk pixpec scripts dir relative to this cli.ts file.
+      const { fileURLToPath } = await import('node:url')
+      const { dirname: dn, resolve: rs } = await import('node:path')
+      const scriptsDir = rs(dn(fileURLToPath(import.meta.url)), '../scripts')
+      console.log(`  # prepare+verify each variant:`)
+      for (const id of r.variantIds) {
+        console.log(`  pnpm exec tsx ${scriptsDir}/breakdown-prepare.ts ${id} \\`)
+        console.log(`    && pnpm exec tsx ${scriptsDir}/breakdown-verify.ts`)
+      }
+      console.log(``)
+      console.log(`Once every variant passes verify, compose ${r.componentName}/impl.tsx`)
+      console.log(`from the per-variant outputs in ${r.componentDir}/generated/.`)
       break
     }
     case 'dump-figma': {

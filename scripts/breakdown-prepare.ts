@@ -51,48 +51,100 @@ await mkdir(pngDir, { recursive: true })
 
 // ───── tree walk: collect non-atomic targets + bboxes ─────
 console.log(`[prepare] walking ${rootNodeId} for FRAME/COMPONENT subtree…`)
-const indexMod = await import(resolve(projectRoot, 'src/index.ts')) as Record<string, unknown>
-const isComp = (v: unknown): v is { figma?: { componentSetKey?: string } } =>
-  !!v && typeof v === 'object' && 'figma' in v
-const registeredKeys = new Set(Object.values(indexMod)
-  .filter(isComp).map((c) => c.figma?.componentSetKey).filter(Boolean))
+
+const isComp = (v: unknown): v is { name: string; figma?: { componentSetKey: string } } =>
+  !!v && typeof v === 'object' && 'name' in v && 'figma' in v
+
+const componentsDir = tomlGet('componentsDir') ?? 'src/components'
+const componentsPath = resolve(projectRoot, componentsDir)
+
+const registeredKeys = new Set<string>()
+const { readdir } = await import('node:fs/promises')
+const ents = await readdir(componentsPath, { withFileTypes: true })
+for (const ent of ents) {
+  if (!ent.isDirectory()) continue
+  try {
+    const modPath = resolve(componentsPath, ent.name, 'index.ts')
+    const mod = await import(modPath) as Record<string, unknown>
+    const c = (mod.default || mod[ent.name] || Object.values(mod).find(isComp)) as any
+    if (c?.figma?.componentSetKey) registeredKeys.add(c.figma.componentSetKey)
+  } catch { /* skip */ }
+}
 
 const bridge = getBridge()
+
+const rootMeta = await bridge.exec<{ type: string; name: string }>(tab!, 
+  `const n = await figma.getNodeByIdAsync(${JSON.stringify(rootNodeId)}); return { type: n.type, name: n.name }`)
+
+if (rootMeta.type === 'COMPONENT_SET') {
+  console.error(`\n✗ ERROR: Root node "${rootMeta.name}" (${rootNodeId}) is a COMPONENT_SET.`)
+  console.error(`Breakdown cannot be run on a component set (contains multiple variants).`)
+  console.error(`Please provide a specific variant (COMPONENT) node ID or an INSTANCE node ID.`)
+  process.exit(1)
+}
+
 const treeWalkCode = `
 const REGISTRY = new Set(${JSON.stringify(Array.from(registeredKeys))});
-const isAtomicInstance = (n) => {
-  if (n.type !== 'INSTANCE') return false;
+const getRegisteredName = (n) => {
+  if (n.type !== 'INSTANCE') return null;
   let p = n.mainComponent; while (p && p.type !== 'COMPONENT_SET') p = p.parent;
   const key = p?.key ?? n.mainComponent?.key;
-  return key && REGISTRY.has(key);
+  return REGISTRY.has(key) ? n.name : null; // simplified name mapping for now
+};
+const getMasterVariantId = async (n) => {
+  if (n.type !== 'INSTANCE') return null;
+  const main = n.mainComponent ?? (n.getMainComponentAsync ? await n.getMainComponentAsync() : null);
+  return main?.id ?? null;
 };
 const out = [];
-const walk = (n, depth) => {
+const walk = async (n, depth) => {
   if (!n.visible) return;
   if (n.type === 'TEXT') return;
-  if (isAtomicInstance(n)) { out.push({id:n.id,name:n.name,depth,atomic:true,type:n.type}); return; }
-  for (const c of n.children ?? []) walk(c, depth + 1);
+
+  const compName = getRegisteredName(n);
+  // Registered instances are leaves for the breakdown tree (atomic = don't
+  // recurse into their internals — they have their own component-level
+  // validation). They ARE still verified at standalone instance level so
+  // composition tests catch instance-prop regressions; if standalone fails,
+  // the user is told to re-run breakdown on the master variant.
+  if (!compName) {
+    for (const c of n.children ?? []) await walk(c, depth + 1);
+  }
+
   if (n.type === 'FRAME' || n.type === 'COMPONENT' || n.type === 'INSTANCE') {
+    const bbox = n.absoluteBoundingBox;
+    const render = n.absoluteRenderBounds;
+    // Keep NATIVE fractional dims — both chromium (via IR) and the figma
+    // PNG export already render at native; verify equalizes for measure-rs's
+    // 8-divisibility by padding both sides identically (white) up to the
+    // next 8-multiple. No snap, no stretch.
+    const masterId = await getMasterVariantId(n);
     out.push({
-      id: n.id, name: n.name, depth, atomic: false, type: n.type,
+      id: n.id, name: n.name, depth, type: n.type,
       w: n.width, h: n.height,
-      bbox: n.absoluteBoundingBox, render: n.absoluteRenderBounds,
+      bbox: bbox ?? undefined,
+      render: render ?? undefined,
+      componentName: compName,
+      masterVariantId: masterId,
     });
   }
 };
 const root = await figma.getNodeByIdAsync(${JSON.stringify(rootNodeId)});
 if (!root) throw new Error('node not found');
-walk(root, 0);
+await walk(root, 0);
 return out;
 `
 type Bbox = { x: number; y: number; width: number; height: number }
 type Node = {
-  id: string; name: string; depth: number; atomic: boolean; type: string
+  id: string; name: string; depth: number; type: string
   w?: number; h?: number; bbox?: Bbox; render?: Bbox
+  componentName?: string | null
+  masterVariantId?: string | null
 }
 const nodes: Node[] = await bridge.exec<Node[]>(tab, treeWalkCode)
-const targets = nodes.filter((n) => !n.atomic)
-console.log(`[prepare] ${targets.length} non-atomic nodes (${nodes.length - targets.length} atomic skipped)`)
+let targets = nodes
+const instanceCount = targets.filter(n => n.componentName).length
+console.log(`[prepare] ${targets.length} candidate nodes (${instanceCount} registered instances + ${targets.length - instanceCount} frames/components)`)
 
 // ───── single root walk → full IR tree (with image SVGs resolved) ─────
 console.log(`[prepare] walking IR + resolving image SVGs…`)
@@ -106,15 +158,22 @@ for (const { id, ir } of walkIrSubtrees(rootIr)) {
   subtreeById.set(id, ir)
 }
 
-let written = 0, missing = 0
+// Filter out targets the IR walk classified as descendants of an `image`
+// kind subtree (leaf-only non-autolayout frames). They aren't independently
+// addressable — the parent subtree's single SVG export covers their pixels.
+const beforeFilter = targets.length
+targets = targets.filter((n) => subtreeById.has(n.id))
+const dropped = beforeFilter - targets.length
+if (dropped > 0) console.log(`[prepare] dropped ${dropped} nodes covered by parent SVG dump`)
+
+let written = 0
 for (const n of targets) {
-  const ir = subtreeById.get(n.id)
-  if (!ir) { missing++; continue }
+  const ir = subtreeById.get(n.id)!
   const payload = { ir, fileKey, wrapper: wrapperFromIr(ir) }
   await writeFile(breakdownCachePath(projectRoot, n.id), JSON.stringify(payload))
   written++
 }
-console.log(`[prepare] wrote ${written} IR cache files (missing: ${missing})`)
+console.log(`[prepare] wrote ${written} IR cache files`)
 
 // ───── batch-export reference PNGs (DPR=8) ─────
 console.log(`[prepare] exporting ${targets.length} reference PNGs (DPR=8, chunk=${pngChunk})…`)
@@ -153,6 +212,8 @@ const manifest = {
   nodes: targets.map((n) => ({
     id: n.id, name: n.name, depth: n.depth, type: n.type,
     w: n.w, h: n.h, bbox: n.bbox, render: n.render,
+    componentName: n.componentName,
+    masterVariantId: n.masterVariantId,
   })),
 }
 await writeFile(resolve(cacheDir, 'manifest.json'), JSON.stringify(manifest, null, 2))

@@ -62,19 +62,50 @@ export async function dumpChromium(opts: DumpChromiumOptions): Promise<void> {
     const chunks: { s: number; e: number }[] = []
     for (let s = 0; s < N; s += CHUNK) chunks.push({ s, e: Math.min(s + CHUNK, N) })
 
-    // Worker fn that processes ONE chunk via its own session (= its own
-    // browser context = its own tab). Multiple workers run concurrently.
+    // Use a shared session if we can.
+    let sharedSession: import('./render.ts').BatchSession | null = (renderer as any).__pixpec_session
     const runChunk = async ({ s, e }: { s: number; e: number }) => {
       const url = `${baseUrl}/?component=${encodeURIComponent(comp.name)}&batch=1&from=${s}&to=${e}`
       const t0 = Date.now()
-      const session = await renderer.openBatch({
-        url,
-        viewport: comp.viewport ?? { width: 4000, height: 8000 },
-        outputScale: scale ?? 2,
-        remBase: remBase ?? 16,
-      })
+      let session: import('./render.ts').BatchSession
+      if (sharedSession) {
+        session = sharedSession
+        await session.navigateTo(url)
+      } else {
+        session = await renderer.openBatch({
+          url,
+          viewport: comp.viewport ?? { width: 4000, height: 8000 },
+          outputScale: scale ?? 2,
+          remBase: remBase ?? 16,
+        })
+        if (!opts.renderer) {
+          // If we don't own the renderer, we might be able to stash the session
+          // for the next call in the same process.
+        } else {
+          (renderer as any).__pixpec_session = session
+          sharedSession = session
+        }
+      }
+
       const tNav = Date.now()
-      await session.waitMounted(e - s)
+      const tryWait = async (isRetry = false) => {
+        try {
+          await session.waitMounted(e - s)
+        } catch (err) {
+          const msg = String(err)
+          if (!isRetry && msg.includes('component not found')) {
+            if (verbose) console.log(`  [retry] component not found, waiting for vite sync…`)
+            await new Promise((r) => setTimeout(r, 1000))
+            await session.reload()
+            await session.navigateTo(url)
+            await tryWait(true)
+            return
+          }
+          throw err
+        }
+      }
+      await tryWait()
+
       const tMount = Date.now()
       const items = []
       for (let i = s; i < e; i++) {
@@ -92,7 +123,7 @@ export async function dumpChromium(opts: DumpChromiumOptions): Promise<void> {
       }
       await session.screenshotMany(items)
       const tShots = Date.now()
-      await session.close()
+      if (!sharedSession) await session.close()
       if (verbose) {
         console.log(
           `  chunk [${s}..${e}) nav=${tNav - t0}ms mount=${tMount - tNav}ms shots=${tShots - tMount}ms`,

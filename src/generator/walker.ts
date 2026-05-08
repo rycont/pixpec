@@ -38,7 +38,16 @@ function pixpecPropName(name) {
     + parts.slice(1).map((p) => p[0].toUpperCase() + p.slice(1)).join('');
   return normalized === 'style' ? 'styleVariant' : normalized;
 }
+function pixpecCleanValue(value) {
+  if (typeof value === 'string') return value.replace(/[\\x00-\\x08\\x0b\\x0c\\x0e-\\x1f\\x7f]/g, '');
+  if (Array.isArray(value)) return value.map(pixpecCleanValue);
+  if (value && typeof value === 'object') {
+    return Object.fromEntries(Object.entries(value).map(([k, v]) => [k, pixpecCleanValue(v)]));
+  }
+  return value;
+}
 function pixpecSetProp(out, name, value) {
+  value = pixpecCleanValue(value);
   out[name] = value;
   const short = String(name).split('#')[0];
   if (!(short in out)) out[short] = value;
@@ -92,6 +101,29 @@ async function __pixpecIr(node) {
           fields.includes('fills')
         )) return true;
       }
+      // Fallback: figma's overrides API misses textStyle drift (instance text
+      // diverges from its bound textStyle without surfacing as a field
+      // override — happens when library publish sync leaves stale values).
+      // Walk every TEXT descendant and compare effective vs textStyle defn.
+      const textNodes = [];
+      const collectText = (n) => {
+        if (!n.visible) return;
+        if (n.type === 'TEXT') { textNodes.push(n); return; }
+        if (n.type === 'INSTANCE') return;  // nested instances handled separately
+        for (const c of (n.children || [])) collectText(c);
+      };
+      for (const c of (node.children || [])) collectText(c);
+      for (const t of textNodes) {
+        if (!t.textStyleId || typeof t.textStyleId !== 'string') continue;
+        let st;
+        try { st = await figma.getStyleByIdAsync(t.textStyleId); } catch (_) { continue; }
+        if (!st) continue;
+        if (st.fontName && t.fontName && (st.fontName.family !== t.fontName.family || st.fontName.style !== t.fontName.style)) return true;
+        if (typeof st.fontSize === 'number' && st.fontSize !== t.fontSize) return true;
+        const stLh = st.lineHeight, nLh = t.lineHeight;
+        if (stLh && nLh && (stLh.unit !== nLh.unit || stLh.value !== nLh.value)) return true;
+        if (typeof st.paragraphSpacing === 'number' && st.paragraphSpacing !== t.paragraphSpacing) return true;
+      }
       return false;
     })();
     if (structural) {
@@ -141,6 +173,43 @@ async function __pixpecIr(node) {
     } // close else branch — falls through to FRAME walk for detached instances
   }
   if (node.type === 'FRAME' || node.type === 'COMPONENT' || node.type === 'INSTANCE') {
+    // "Leaf-only non-autolayout" optimization: when this frame has no auto-
+    // layout AND every descendant is a render-leaf (TEXT/shape/vector), our
+    // CSS-flow decomposition has nothing to express — children sit at sub-
+    // pixel absolute positions that browsers snap differently than figma's
+    // single-pass rasterizer. Treat the whole subtree as one image kind and
+    // let figma.exportAsync produce the SVG; one raster, exact parity.
+    const isLeafOnly = (n) => {
+      if (!n.visible) return true;
+      const t = n.type;
+      if (t === 'TEXT' || t === 'RECTANGLE' || t === 'ELLIPSE' || t === 'POLYGON'
+          || t === 'STAR' || t === 'LINE' || t === 'VECTOR'
+          || t === 'BOOLEAN_OPERATION' || t === 'GROUP') return true;
+      if (t === 'INSTANCE') {
+        let p = n.mainComponent; while (p && p.type !== 'COMPONENT_SET') p = p.parent;
+        const key = p?.key ?? n.mainComponent?.key;
+        if (key && REGISTRY[key]) return false;
+      }
+      if (t === 'FRAME' || t === 'COMPONENT' || t === 'INSTANCE') {
+        if (n.layoutMode && n.layoutMode !== 'NONE') return false;
+        return (n.children ?? []).every(isLeafOnly);
+      }
+      return false;
+    };
+    const noAutolayout = !node.layoutMode || node.layoutMode === 'NONE';
+    if (noAutolayout && (node.children ?? []).length > 0
+        && (node.children ?? []).every(isLeafOnly)) {
+      return {
+        ...base, kind: 'image',
+        width: node.width, height: node.height,
+        sizingH: mapSizing(node.layoutSizingHorizontal),
+        sizingV: mapSizing(node.layoutSizingVertical),
+        // Round to 2 decimals — figma float precision (0.3 → 0.30000001192092896)
+      // doesn't match panda's atomic class name op_0.3; the runtime value
+      // would generate a class with no rule. Designers use 1-decimal values.
+      opacity: typeof node.opacity === 'number' && node.opacity < 0.999 ? Math.round(node.opacity * 100) / 100 : undefined,
+      };
+    }
     const dir = node.layoutMode === 'HORIZONTAL' ? 'row' : node.layoutMode === 'VERTICAL' ? 'column' : 'none';
     // Respect fills[].visible: a fill toggled OFF in figma is captured in
     // the data but is not painted in the raster — emitting it would invent
@@ -152,7 +221,17 @@ async function __pixpecIr(node) {
     // border's outset addition to layout dim.
     const stroke = (Array.isArray(node.strokes) && node.strokes[0]?.type === 'SOLID' && node.strokes[0]?.visible !== false) ? node.strokes[0] : null;
     const strokeColor = stroke ? rgbaHex(stroke.color, stroke.opacity ?? 1) : undefined;
+    // strokeWeight === figma.mixed (Symbol) when individualStrokeWeights are
+    // set per side. Capture per-side so codegen can emit borderTop/Bottom/etc
+    // instead of a 4-side insetBorder. Pre-stringify to dodge CDP (Symbol
+    // can't serialize) and read individual fields directly.
     const strokeWeight = stroke ? (typeof node.strokeWeight === 'number' ? node.strokeWeight : 1) : 0;
+    const strokeTopWeight = stroke ? (typeof node.strokeTopWeight === 'number' ? node.strokeTopWeight : strokeWeight) : 0;
+    const strokeRightWeight = stroke ? (typeof node.strokeRightWeight === 'number' ? node.strokeRightWeight : strokeWeight) : 0;
+    const strokeBottomWeight = stroke ? (typeof node.strokeBottomWeight === 'number' ? node.strokeBottomWeight : strokeWeight) : 0;
+    const strokeLeftWeight = stroke ? (typeof node.strokeLeftWeight === 'number' ? node.strokeLeftWeight : strokeWeight) : 0;
+    const mixedStroke = typeof node.strokeWeight !== 'number'
+      && (strokeTopWeight !== strokeRightWeight || strokeRightWeight !== strokeBottomWeight || strokeBottomWeight !== strokeLeftWeight);
     // figma boundVariables — when a property's value is bound to a design
     // token, we capture the variable id so codegen can emit a panda token
     // reference (e.g. 'background.standard.primary') instead of raw hex/px.
@@ -199,16 +278,53 @@ async function __pixpecIr(node) {
         counterGap: node.counterAxisSpacing || 0,
       },
       width: node.width, height: node.height,
-      background: bg, borderRadius: node.cornerRadius,
+      background: bg,
+      ...(typeof node.cornerRadius === 'number'
+        ? { borderRadius: node.cornerRadius }
+        : {
+            borderRadiusTopLeft: typeof node.topLeftRadius === 'number' ? node.topLeftRadius : 0,
+            borderRadiusTopRight: typeof node.topRightRadius === 'number' ? node.topRightRadius : 0,
+            borderRadiusBottomRight: typeof node.bottomRightRadius === 'number' ? node.bottomRightRadius : 0,
+            borderRadiusBottomLeft: typeof node.bottomLeftRadius === 'number' ? node.bottomLeftRadius : 0,
+          }),
       strokeColor, strokeWeight,
+      strokeTopWeight: mixedStroke ? strokeTopWeight : undefined,
+      strokeRightWeight: mixedStroke ? strokeRightWeight : undefined,
+      strokeBottomWeight: mixedStroke ? strokeBottomWeight : undefined,
+      strokeLeftWeight: mixedStroke ? strokeLeftWeight : undefined,
       cornerSmoothing: node.cornerSmoothing || 0,
       clipsContent: !!node.clipsContent,
       tokenIds,
       rotation: typeof node.rotation === 'number' && Math.abs(node.rotation) >= 0.01 ? node.rotation : undefined,
+      // Node-level opacity (figma "Layer opacity" slider). Disabled-state
+      // variants typically carry root opacity 0.3 — without capturing this,
+      // codegen renders at full opacity and disabled vs enabled diff explodes.
+      // Round to 2 decimals — figma float precision (0.3 → 0.30000001192092896)
+      // doesn't match panda's atomic class name op_0.3; the runtime value
+      // would generate a class with no rule. Designers use 1-decimal values.
+      opacity: typeof node.opacity === 'number' && node.opacity < 0.999 ? Math.round(node.opacity * 100) / 100 : undefined,
       children,
     };
   }
   if (node.type === 'TEXT') {
+    // Leading/trailing whitespace doesn't translate cleanly: figma counts it
+    // toward text width (advance), chromium collapses it under default
+    // white-space:normal. Even with pre-wrap the centering algorithm differs
+    // (figma centers visible ink, chromium centers advance box) — there is
+    // no clean CSS rendering of the same intent. Surface as a hard error
+    // so the designer can fix the figma node instead.
+    // Preserve figma's whitespace width semantics in CSS: leading/trailing
+    // spaces and runs of 2+ spaces get collapsed under default white-space
+    // rules. Substitute U+00A0 (no-break space) so the advance is kept
+    // without forcing white-space:pre (which would also break soft-wrap).
+    // Single inter-word spaces are left as-is so line breaks still work.
+    let pixpecText = node.characters;
+    if (typeof pixpecText === 'string') {
+      const NBSP = '\\u00A0';
+      pixpecText = pixpecText.replace(/ {2,}/g, (m) => NBSP.repeat(m.length - 1) + ' ');
+      pixpecText = pixpecText.replace(/^( +)/, (m) => NBSP.repeat(m.length));
+      pixpecText = pixpecText.replace(/( +)$/, (m) => NBSP.repeat(m.length));
+    }
     const fill = (Array.isArray(node.fills) && node.fills[0]?.type === 'SOLID') ? node.fills[0] : null;
     const tbv = node.boundVariables || {};
     const tokenIds = {
@@ -217,9 +333,44 @@ async function __pixpecIr(node) {
       paragraphSpacing: tbv.paragraphSpacing?.id,
       fontSize: tbv.fontSize?.id,
     };
+    // Compare effective vs textStyle definition — figma plugin API has no
+    // "is overridden" flag, so we resolve the textStyle and diff each field.
+    // Any divergence means the codegen MUST emit the explicit value (typo
+    // wrapper alone won't match figma's render).
+    const textStyleOverrides = {};
+    if (node.textStyleId && typeof node.textStyleId === 'string') {
+      try {
+        const st = await figma.getStyleByIdAsync(node.textStyleId);
+        if (st) {
+          if (st.fontName && node.fontName && (st.fontName.family !== node.fontName.family || st.fontName.style !== node.fontName.style)) {
+            textStyleOverrides.fontName = node.fontName;
+          }
+          if (typeof st.fontSize === 'number' && st.fontSize !== node.fontSize) {
+            textStyleOverrides.fontSize = node.fontSize;
+          }
+          const stLh = st.lineHeight, nLh = node.lineHeight;
+          if (stLh && nLh && (stLh.unit !== nLh.unit || stLh.value !== nLh.value)) {
+            textStyleOverrides.lineHeight = nLh;
+          }
+          if (typeof st.paragraphSpacing === 'number' && st.paragraphSpacing !== node.paragraphSpacing) {
+            textStyleOverrides.paragraphSpacing = node.paragraphSpacing;
+          }
+          if (st.textCase && node.textCase && st.textCase !== node.textCase) {
+            textStyleOverrides.textCase = node.textCase;
+          }
+          if (st.textDecoration && node.textDecoration && st.textDecoration !== node.textDecoration) {
+            textStyleOverrides.textDecoration = node.textDecoration;
+          }
+          const stLs = st.letterSpacing, nLs = node.letterSpacing;
+          if (stLs && nLs && (stLs.unit !== nLs.unit || stLs.value !== nLs.value)) {
+            textStyleOverrides.letterSpacing = nLs;
+          }
+        }
+      } catch (_) { /* style fetch failed (deleted style etc.) — skip override diff */ }
+    }
     return {
       ...base, kind: 'text',
-      content: node.characters,
+      content: pixpecText,
       fontSize: node.fontSize, fontWeight: node.fontName?.style === 'Bold' ? 700 : 500,
       lineHeight: typeof node.lineHeight === 'object' && node.lineHeight.unit === 'PIXELS' ? node.lineHeight.value : node.fontSize,
       paragraphSpacing: typeof node.paragraphSpacing === 'number' ? node.paragraphSpacing : 0,
@@ -227,6 +378,7 @@ async function __pixpecIr(node) {
       tokenIds,
       textAlign: node.textAlignHorizontal?.toLowerCase(),
       textStyleId: typeof node.textStyleId === 'string' ? node.textStyleId : undefined,
+      textStyleOverrides: Object.keys(textStyleOverrides).length ? textStyleOverrides : undefined,
       autoResize: mapAutoResize(node.textAutoResize),
       width: node.width,
       sizingH: mapSizing(node.layoutSizingHorizontal),
@@ -252,6 +404,14 @@ async function __pixpecIr(node) {
   if (shapeMap[node.type]) {
     const fill = (Array.isArray(node.fills) && node.fills[0]?.type === 'SOLID' && node.fills[0]?.visible !== false) ? node.fills[0] : null;
     const stroke = (Array.isArray(node.strokes) && node.strokes[0]?.type === 'SOLID' && node.strokes[0]?.visible !== false) ? node.strokes[0] : null;
+    // Skip only zero-area degenerate shapes (e.g. designer left a 0-height
+    // LINE). Positive-area shapes with no fill/stroke must be PRESERVED —
+    // they often act as layout spacers (e.g. toggle's invisible "off-side
+    // knob" reservation that keeps the pill width stable across on/off).
+    // Codegen emits fill="none" so they make zero visual contribution while
+    // still occupying layout slots in flex.
+    const zeroArea = !(node.width > 0) || !(node.height > 0);
+    if (zeroArea && !fill && !stroke) return null;
     return {
       ...base, kind: 'shape',
       shape: shapeMap[node.type],
@@ -260,8 +420,21 @@ async function __pixpecIr(node) {
       fillTokenId: fill?.boundVariables?.color?.id,
       strokeColor: stroke ? rgbaHex(stroke.color, stroke.opacity ?? 1) : undefined,
       strokeWeight: stroke ? (typeof node.strokeWeight === 'number' ? node.strokeWeight : 1) : 0,
-      borderRadius: node.cornerRadius,
+      // cornerRadius is figma.mixed (Symbol, non-serializable) when corners
+      // differ — capture per-corner values in that case.
+      ...(typeof node.cornerRadius === 'number'
+        ? { borderRadius: node.cornerRadius }
+        : {
+            borderRadiusTopLeft: typeof node.topLeftRadius === 'number' ? node.topLeftRadius : 0,
+            borderRadiusTopRight: typeof node.topRightRadius === 'number' ? node.topRightRadius : 0,
+            borderRadiusBottomRight: typeof node.bottomRightRadius === 'number' ? node.bottomRightRadius : 0,
+            borderRadiusBottomLeft: typeof node.bottomLeftRadius === 'number' ? node.bottomLeftRadius : 0,
+          }),
       rotation: typeof node.rotation === 'number' && Math.abs(node.rotation) >= 0.01 ? node.rotation : undefined,
+      // Round to 2 decimals — figma float precision (0.3 → 0.30000001192092896)
+      // doesn't match panda's atomic class name op_0.3; the runtime value
+      // would generate a class with no rule. Designers use 1-decimal values.
+      opacity: typeof node.opacity === 'number' && node.opacity < 0.999 ? Math.round(node.opacity * 100) / 100 : undefined,
       sizingH: mapSizing(node.layoutSizingHorizontal),
       sizingV: mapSizing(node.layoutSizingVertical),
     };
@@ -316,7 +489,7 @@ function assertAllInstancesRegistered(n: unknown, registry: Record<string, strin
       `  mainComponent: ${u.mainComponentName ?? '<none>'}\n` +
       `  componentSetKey: ${u.componentKey ?? '<none>'}\n` +
       `Register a defineComponent in src/index.ts with figma binding:\n` +
-      `  figma: { componentSetKey: ${JSON.stringify(u.componentKey ?? '<unknown>')}, fromInstance: (raw) => ({...}) }\n` +
+      `  figma: { componentSetKey: ${JSON.stringify(u.componentKey ?? '<unknown>')}, propsFromFigma: (raw) => ({...}) }\n` +
       `Currently registered keys: ${Object.keys(registry).join(', ') || '<none>'}`,
     )
   }

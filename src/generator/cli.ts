@@ -43,25 +43,37 @@ export function breakdownCachePath(root: string, nodeId: string): string {
   return resolve(root, '.pixpec-out/_breakdown-cache/ir', `${safe}.json`)
 }
 
+export async function discoverComponents(root: string, componentsDir: string): Promise<Component<unknown>[]> {
+  const { readdir } = await import('node:fs/promises')
+  const components: Component<unknown>[] = []
+  const ents = await readdir(resolve(root, componentsDir), { withFileTypes: true })
+  for (const ent of ents) {
+    if (!ent.isDirectory()) continue
+    try {
+      const modPath = resolve(root, componentsDir, ent.name, 'index.ts')
+      const mod = await import(modPath) as Record<string, unknown>
+      const c = (mod.default || mod[ent.name] || Object.values(mod).find(isComponent)) as Component<unknown>
+      if (c && isComponent(c)) components.push(c)
+    } catch { /* skip non-component dirs */ }
+  }
+  return components
+}
+
 export async function runGenerate(
   nodeId: string,
-  opts: { tab?: string; name?: string; payload?: FigmaPayload } = {},
+  opts: { tab?: string; name?: string; payload?: FigmaPayload; components?: Component<unknown>[] } = {},
 ): Promise<{ jsx: string; ir: IRNode; componentDir: string; componentName: string }> {
   const { cfg, root } = await loadConfig()
-  // cfigmaBin only required when we actually have to talk to figma — a
-  // cached payload (or one passed in) lets us skip that branch entirely.
-  // Sanitize: figma INSTANCE ids carry `;` and leading `I` (e.g.
-  // `I14252:90810;3686:12769`). Strip to alphanumerics for a valid JS
-  // identifier and a directory-safe name.
   const componentName = opts.name ?? `Gen_${nodeId.replace(/[^A-Za-z0-9]/g, '_')}`
   const componentsDir = cfg.componentsDir ?? 'src/components'
   const componentDir = resolve(root, componentsDir, componentName)
 
-  // Discover all components from project's src/index.ts (their figma bindings).
-  const registryMod = (await import(resolve(root, 'src/index.ts'))) as Record<string, unknown>
-  const components = Object.values(registryMod).filter(isComponent)
-  console.log(`[generate] loaded ${components.length} components, ${components.filter(c => c.figma).length} with figma bindings`)
+  const components = opts.components ?? await discoverComponents(root, componentsDir)
+  if (!opts.components) {
+    console.log(`[generate] loaded ${components.length} components, ${components.filter(c => c.figma).length} with figma bindings`)
+  }
   const registry = buildRegistry(components)
+
 
   // Optional codegen plugins from `pixpec.config.ts` in project root.
   // Plugins extend the walker (figma data extraction) and codegen (JSX
@@ -213,8 +225,8 @@ export async function buildRootPayload(
 ): Promise<{ ir: IRNode; fileKey: string }> {
   const { cfg, root } = await loadConfig()
   if (!cfg.cfigmaBin) throw new Error('pixpec.toml: cfigmaBin required')
-  const registryMod = (await import(resolve(root, 'src/index.ts'))) as Record<string, unknown>
-  const components = Object.values(registryMod).filter(isComponent)
+  const componentsDir = cfg.componentsDir ?? 'src/components'
+  const components = await discoverComponents(root, componentsDir)
   const registry = buildRegistry(components)
   type Plugin = import('../types.ts').CodegenPlugin
   let plugins: Plugin[] = []
@@ -238,11 +250,18 @@ export function wrapperFromIr(ir: IRNode): FigmaPayload['wrapper'] {
     ?? (ir as { sizingH?: string }).sizingH
   const sV = (ir as { layout?: { sizingV?: string } }).layout?.sizingV
     ?? (ir as { sizingV?: string }).sizingV
-  let w = sH === 'hug' ? undefined : (ir as { width?: number }).width
-  let h = sV === 'hug' ? undefined : (ir as { height?: number }).height
   const rotation = (ir as { rotation?: number }).rotation
-  if (typeof rotation === 'number' && Math.abs(rotation) >= 0.01
-      && typeof w === 'number' && typeof h === 'number') {
+  const isRotated = typeof rotation === 'number' && Math.abs(rotation) >= 0.01
+  // For rotated roots we MUST give the boxWrapper an explicit dim — the
+  // rotation-wrap codegen uses position:absolute (escaping flex centering),
+  // which removes it from the wrapper's intrinsic sizing. A HUG-along-axis
+  // root would collapse to 0 dim and produce a degenerate screenshot bbox.
+  // Use the IR's resolved dim regardless of HUG, then take post-rotation bbox.
+  const rawW = (ir as { width?: number }).width
+  const rawH = (ir as { height?: number }).height
+  let w = (sH === 'hug' && !isRotated) ? undefined : rawW
+  let h = (sV === 'hug' && !isRotated) ? undefined : rawH
+  if (isRotated && typeof w === 'number' && typeof h === 'number') {
     const css = (-rotation) * Math.PI / 180
     const c = Math.abs(Math.cos(css)), s = Math.abs(Math.sin(css))
     const snap = (v: number) => Math.abs(v - Math.round(v)) < 1e-9 ? Math.round(v) : v

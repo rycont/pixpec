@@ -108,7 +108,7 @@ export interface ComponentWithFigma<P> extends ComponentBase<P> {
   /**
    * Figma binding — generator uses this to recognize INSTANCE nodes
    * whose mainComponent.parent.key matches `componentSetKey` and convert
-   * them to <Component {...fromInstance(raw)} /> JSX.
+   * them to <Component {...propsFromFigma(raw)} /> JSX.
    */
   figma: FigmaBinding<P>
   /**
@@ -138,7 +138,7 @@ export type Component<P> = ComponentWithFigma<P> | ComponentWithoutFigma<P>
  * Serialized figma INSTANCE shape (extracted by walker, no live figma API).
  * `props`: componentProperties values, keyed by full ("Label#524:131"),
  * Figma-short ("Label"), and normalized camelCase ("label") names —
- * fromInstance uses whichever is convenient.
+ * propsFromFigma uses whichever is convenient.
  * `exposed`: nested instances surfaced for editing (icons, etc.).
  */
 export interface FigmaInstanceRaw {
@@ -153,10 +153,10 @@ export interface FigmaInstanceRaw {
     props: Record<string, string | boolean>
   }>
   /** Figma node-set defaults (componentPropertyDefinitions). Available for
-   * fromInstance to compare against and decide which props to emit. */
+   * propsFromFigma to compare against and decide which props to emit. */
   defaults?: Record<string, unknown>
   /** Resolved instance dim. Differs from master when the instance was resized
-   * (e.g., 24×24 Icon master used at 20×20). Lets fromInstance pass the
+   * (e.g., 24×24 Icon master used at 20×20). Lets propsFromFigma pass the
    * actual rendered size as a prop. */
   width?: number
   height?: number
@@ -172,7 +172,7 @@ export interface FigmaBinding<P> {
   /** Master ComponentSetNode.key (NOT individual variant key). */
   componentSetKey: string
   /** Pure function: serialized instance → React props. */
-  fromInstance: (raw: FigmaInstanceRaw) => P
+  propsFromFigma: (raw: FigmaInstanceRaw) => P
 }
 
 export function defineComponent<P>(c: Component<P>): Component<P> {
@@ -208,35 +208,42 @@ export interface CodegenPlugin {
    * AFTER the default JSX is built. Return a replacement JSX (typically a
    * wrapping span) to alter, or the input unchanged to pass through.
    *
-   * The TypeScript factory `f` and helpers to build wrapper spans are exposed
-   * via the context. Use `wrapWithCss` for Panda token-aware values, and
-   * `wrapWithStyle` for already-valid CSS inline values.
+   * Use `wrapWithCss` for Panda token-aware values, `wrapWithStyle` for
+   * already-valid CSS inline values, and `appendJsxAttr`/`jsxAttr` for
+   * direct prop edits on JSX self-closing elements.
    */
   emitWrap?: (
     n: import('./generator/ir.ts').IRNode,
-    jsx: import('typescript').JsxChild,
+    jsx: import('@typescript/native-preview/ast').JsxChild,
     ctx: EmitContext,
-  ) => import('typescript').JsxChild
+  ) => import('@typescript/native-preview/ast').JsxChild
 }
 
 export interface EmitContext {
   parentDir: 'row' | 'column' | 'none'
-  /** TypeScript factory — for plugins that need to build AST nodes. */
-  f: typeof import('typescript').factory
   /** figma variable id → panda token path (e.g. "core.accent"). */
   tokenMap: Record<string, string>
   /** Resolve figma variable ids, including live ids with remote-key prefixes. */
   resolveTokenPath: (tokenId: string | undefined) => string | undefined
   /** Convenience: wrap an existing JSX element in a `<span style={{...}}>`. */
   wrapWithStyle: (
-    jsx: import('typescript').JsxChild,
+    jsx: import('@typescript/native-preview/ast').JsxChild,
     style: Record<string, unknown>,
-  ) => import('typescript').JsxChild
+  ) => import('@typescript/native-preview/ast').JsxChild
   /** Convenience: wrap an existing JSX element in a `<span className={css({...})}>`. */
   wrapWithCss: (
-    jsx: import('typescript').JsxChild,
+    jsx: import('@typescript/native-preview/ast').JsxChild,
     style: Record<string, unknown>,
-  ) => import('typescript').JsxChild
+  ) => import('@typescript/native-preview/ast').JsxChild
+  /** Build a JSX attribute from a primitive/object value. */
+  jsxAttr: (name: string, value: unknown) => import('@typescript/native-preview/ast').JsxAttribute
+  /** Build `style={...}` from a plain style object. */
+  styleAttr: (style: Record<string, unknown>) => import('@typescript/native-preview/ast').JsxAttribute
+  /** Append an attribute to a JSX self-closing element; returns input unchanged otherwise. */
+  appendJsxAttr: (
+    jsx: import('@typescript/native-preview/ast').JsxChild,
+    attr: import('@typescript/native-preview/ast').JsxAttribute,
+  ) => import('@typescript/native-preview/ast').JsxChild
 }
 
 /** Result for one (component, case) verification. */
