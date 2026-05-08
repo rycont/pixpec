@@ -132,9 +132,15 @@ export async function runGenerate(
   // variable name uses '/' separators and matches the panda token path with
   // case-folded segments — "Background/Standard/Primary" → "background.standard.primary".
   let tokenMap: Record<string, string> = {}
+  // Numeric token values keyed by figma variable id. Codegen compares
+  // figma's effective node value (e.g. 6.857 from a scaled instance) to
+  // the variable's intrinsic value (e.g. radius/200 → 6); when they
+  // diverge, codegen emits the raw value instead of the token path so
+  // the rendered CSS reflects figma's scaled raster.
+  let tokenValueMap: Record<string, number> = {}
   try {
     const path = resolve(root, 'tokens/figma-tokens.json')
-    const ft = JSON.parse(await (await import('node:fs/promises')).readFile(path, 'utf8')) as { variables: { id: string; name: string; key?: string; resolvedType: string }[] }
+    const ft = JSON.parse(await (await import('node:fs/promises')).readFile(path, 'utf8')) as { variables: { id: string; name: string; key?: string; resolvedType: string; valuesByMode?: Record<string, unknown> }[] }
     for (const v of ft.variables) {
       const tokenPath = v.name
         // Strip control characters (figma variable names sometimes carry a
@@ -144,10 +150,17 @@ export async function runGenerate(
         .join('.')
       tokenMap[v.id] = tokenPath
       if (v.key) tokenMap[v.key] = tokenPath
+      if (v.resolvedType === 'FLOAT' && v.valuesByMode) {
+        const num = Object.values(v.valuesByMode).find((x): x is number => typeof x === 'number')
+        if (typeof num === 'number') {
+          tokenValueMap[v.id] = num
+          if (v.key) tokenValueMap[v.key] = num
+        }
+      }
     }
-    console.log(`[generate] loaded ${Object.keys(tokenMap).length} design-token bindings`)
+    console.log(`[generate] loaded ${Object.keys(tokenMap).length} design-token bindings (${Object.keys(tokenValueMap).length} numeric)`)
   } catch { /* optional */ }
-  const jsx = generate(ir, components, typographyMap, tokenMap, plugins, cfg.remBase)
+  const jsx = generate(ir, components, typographyMap, tokenMap, plugins, cfg.remBase, tokenValueMap)
 
   await mkdir(componentDir, { recursive: true })
   // Format generator output with Prettier so the source is human-reviewable.

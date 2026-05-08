@@ -301,7 +301,19 @@ function deepEq(a: unknown, b: unknown): boolean {
 }
 
 function componentLayoutStyles(n: IRComponent, parent: ParentCtx, ctx: CodegenCtx): Record<string, unknown> {
-  if (parent.dir === 'none') return {}
+  if (parent.dir === 'none') {
+    // Root case: still emit explicit width/height when designer resized the
+    // instance off its master dim (e.g. IconButton Small=28 stretched to 32
+    // inside Input). Skip when no resize — recipe handles default.
+    const ws: Record<string, unknown> = {}
+    if (n.sizingH === 'fixed' && typeof n.width === 'number' && typeof n.mainWidth === 'number' && n.width !== n.mainWidth) {
+      ws.width = px2remPanda(n.width, ctx.remBase)
+    }
+    if (n.sizingV === 'fixed' && typeof n.height === 'number' && typeof n.mainHeight === 'number' && n.height !== n.mainHeight) {
+      ws.height = px2remPanda(n.height, ctx.remBase)
+    }
+    return ws
+  }
   const ws: Record<string, unknown> = {}
   // Registered components own their root layout by default. Codegen only
   // expresses axes where the instance differs from the main component root.
@@ -421,10 +433,10 @@ function emitComponent(n: IRComponent, ctx: CodegenCtx, parent: ParentCtx = { di
       ? { position: 'absolute', top: 0, left: 0 }
       : { display: 'inline-flex', alignSelf: 'flex-start', flexShrink: 0, verticalAlign: 'top' }
     pandaProps.transformOrigin = '0 0'
-    pandaProps.translate = `${px2rem(tx, ctx.remBase)} ${px2rem(-minY, ctx.remBase)}`
+    pandaProps.translate = `${px2remPanda(tx, ctx.remBase)} ${px2remPanda(-minY, ctx.remBase)}`
     pandaProps.rotate = `${-n.rotation}deg`
-    if (typeof n.width === 'number') pandaProps.width = px2rem(n.width, ctx.remBase)
-    if (typeof n.height === 'number') pandaProps.height = px2rem(n.height, ctx.remBase)
+    if (typeof n.width === 'number') pandaProps.width = px2remPanda(n.width, ctx.remBase)
+    if (typeof n.height === 'number') pandaProps.height = px2remPanda(n.height, ctx.remBase)
     const extraAttrs = attrsFromObject(pandaize(pandaProps, ctx.remBase))
     return f.updateJsxSelfClosingElement(
       inner as ast.JsxSelfClosingElement,
@@ -485,7 +497,7 @@ function emitFrame(n: IRFrame, ctx: CodegenCtx, parent: ParentCtx = { dir: 'none
     // Stack pattern may carry a default gap, so preserve column gap=0. Flex
     // row has no default gap, so omit zero for terser generated JSX.
     if (n.layout.gap !== 0 || n.layout.direction === 'column') {
-      styles.gap = resolveValue(n.layout.gap, tids.gap, ctx.tokenMap, `${n.figmaId}.gap`)
+      styles.gap = resolveValue(n.layout.gap, tids.gap, ctx.tokenMap, `${n.figmaId}.gap`, ctx.tokenValueMap)
     }
     // figma layoutWrap=WRAP → flex-wrap:wrap. counterAxisSpacing maps to
     // rowGap (horizontal flow) or columnGap (vertical flow). The single
@@ -509,10 +521,10 @@ function emitFrame(n: IRFrame, ctx: CodegenCtx, parent: ParentCtx = { dir: 'none
     && (n.layout.paddingTop + n.layout.paddingBottom > n.height)
   const dropH = n.layout.sizingH === 'fixed' && typeof n.width === 'number'
     && (n.layout.paddingLeft + n.layout.paddingRight > n.width)
-  if (n.layout.paddingTop && !dropV) styles.paddingTop = resolveValue(n.layout.paddingTop, tids.paddingTop, ctx.tokenMap, `${n.figmaId}.paddingTop`)
-  if (n.layout.paddingRight && !dropH) styles.paddingRight = resolveValue(n.layout.paddingRight, tids.paddingRight, ctx.tokenMap, `${n.figmaId}.paddingRight`)
-  if (n.layout.paddingBottom && !dropV) styles.paddingBottom = resolveValue(n.layout.paddingBottom, tids.paddingBottom, ctx.tokenMap, `${n.figmaId}.paddingBottom`)
-  if (n.layout.paddingLeft && !dropH) styles.paddingLeft = resolveValue(n.layout.paddingLeft, tids.paddingLeft, ctx.tokenMap, `${n.figmaId}.paddingLeft`)
+  if (n.layout.paddingTop && !dropV) styles.paddingTop = resolveValue(n.layout.paddingTop, tids.paddingTop, ctx.tokenMap, `${n.figmaId}.paddingTop`, ctx.tokenValueMap)
+  if (n.layout.paddingRight && !dropH) styles.paddingRight = resolveValue(n.layout.paddingRight, tids.paddingRight, ctx.tokenMap, `${n.figmaId}.paddingRight`, ctx.tokenValueMap)
+  if (n.layout.paddingBottom && !dropV) styles.paddingBottom = resolveValue(n.layout.paddingBottom, tids.paddingBottom, ctx.tokenMap, `${n.figmaId}.paddingBottom`, ctx.tokenValueMap)
+  if (n.layout.paddingLeft && !dropH) styles.paddingLeft = resolveValue(n.layout.paddingLeft, tids.paddingLeft, ctx.tokenMap, `${n.figmaId}.paddingLeft`, ctx.tokenValueMap)
   // FIXED → explicit figma resolved width/height (CSS default stretch != figma).
   // FILL → flex:1 (main) or alignSelf:stretch (cross). HUG → omit (intrinsic).
   // At root (parent.dir === 'none') there is no real auto-layout parent, so
@@ -530,7 +542,7 @@ function emitFrame(n: IRFrame, ctx: CodegenCtx, parent: ParentCtx = { dir: 'none
       else if (r === 'cross') { styles.alignSelf = 'stretch'; styles.minWidth = 0 }
     }
   } else if (n.layout.sizingH === 'fixed' && n.width !== undefined) {
-    styles.width = resolveValue(n.width, tids.width, ctx.tokenMap, `${n.figmaId}.width`)
+    styles.width = resolveValue(n.width, tids.width, ctx.tokenMap, `${n.figmaId}.width`, ctx.tokenValueMap)
     // figma's FIXED sizing means "this dim is the truth" even if padding +
     // children would normally push the flex container larger. CSS flex
     // items get `min-width: auto` by default (= intrinsic min-content) which
@@ -548,7 +560,7 @@ function emitFrame(n: IRFrame, ctx: CodegenCtx, parent: ParentCtx = { dir: 'none
       else if (r === 'cross') { styles.alignSelf = 'stretch'; styles.minHeight = 0 }
     }
   } else if (n.layout.sizingV === 'fixed' && n.height !== undefined) {
-    styles.height = resolveValue(n.height, tids.height, ctx.tokenMap, `${n.figmaId}.height`)
+    styles.height = resolveValue(n.height, tids.height, ctx.tokenMap, `${n.figmaId}.height`, ctx.tokenValueMap)
     if (parentDir !== 'none') styles.minHeight = 0
   }
   // figma's FIXED-on-main-axis means "do not shrink to fit container," but
@@ -557,7 +569,7 @@ function emitFrame(n: IRFrame, ctx: CodegenCtx, parent: ParentCtx = { dir: 'none
   // flex-shrink:0 on FIXED main-axis frame children so they overflow like figma.
   if (parentDir === 'row' && n.layout.sizingH === 'fixed') styles.flexShrink = 0
   if (parentDir === 'column' && n.layout.sizingV === 'fixed') styles.flexShrink = 0
-  if (n.background) styles.background = resolveValue(n.background, tids.background, ctx.tokenMap, `${n.figmaId}.background`)
+  if (n.background) styles.background = resolveValue(n.background, tids.background, ctx.tokenMap, `${n.figmaId}.background`, ctx.tokenValueMap)
   if (n.opacity !== undefined) styles.opacity = n.opacity
   // figma cornerSmoothing > 0 → render the rounded shape via clip-path with
   // figma-squircle's path. CSS `border-radius` is a circular arc; figma uses
@@ -581,7 +593,7 @@ function emitFrame(n: IRFrame, ctx: CodegenCtx, parent: ParentCtx = { dir: 'none
     squircleClipId = `pxp-clip-${n.figmaId.replace(/[^A-Za-z0-9]/g, '_')}`
     styles.clipPath = `url(#${squircleClipId})`
   } else if (n.borderRadius) {
-    styles.borderRadius = resolveValue(n.borderRadius, tids.borderRadius, ctx.tokenMap, `${n.figmaId}.borderRadius`)
+    styles.borderRadius = resolveValue(n.borderRadius, tids.borderRadius, ctx.tokenMap, `${n.figmaId}.borderRadius`, ctx.tokenValueMap)
   } else if (
     (n.borderRadiusTopLeft || n.borderRadiusTopRight ||
      n.borderRadiusBottomRight || n.borderRadiusBottomLeft)
@@ -659,8 +671,15 @@ function emitFrame(n: IRFrame, ctx: CodegenCtx, parent: ParentCtx = { dir: 'none
         if (n.strokeLeftWeight) shadows.push(`inset ${w2r(n.strokeLeftWeight)} 0 0 0 ${colorRef}`)
         if (n.strokeRightWeight) shadows.push(`inset -${w2r(n.strokeRightWeight)} 0 0 0 ${colorRef}`)
         if (shadows.length) inlineStyle.boxShadow = shadows.join(', ')
-      } else {
+      } else if (Number.isInteger(n.strokeWeight)) {
         styles.insetBorder = `${n.strokeWeight} ${strokeTokenPath ?? n.strokeColor}`
+      } else {
+        // Fractional uniform stroke (scaled-instance — figma 28→32 yields
+        // 1.14px stroke). Panda's insetBorder atomic extraction is flaky
+        // for non-integer values across panda postcss cache states. Use
+        // inline boxShadow with var() so the rule is always applied.
+        const colorRef = strokeTokenPath ? colorTokenVar(strokeTokenPath) : n.strokeColor
+        inlineStyle.boxShadow = `inset 0 0 0 ${px2rem(n.strokeWeight, ctx.remBase)} ${colorRef}`
       }
     }
   }
@@ -875,10 +894,10 @@ function emitText(n: IRText, ctx: CodegenCtx, parent: ParentCtx = { dir: 'none',
   }
   // Fallback: styled span (when textStyleId missing or unknown).
   const styles: Record<string, unknown> = {
-    fontSize: resolveValue(n.fontSize, n.tokenIds?.fontSize, ctx.tokenMap, `${n.figmaId}.fontSize`),
-    lineHeight: resolveValue(n.lineHeight, n.tokenIds?.lineHeight, ctx.tokenMap, `${n.figmaId}.lineHeight`),
+    fontSize: resolveValue(n.fontSize, n.tokenIds?.fontSize, ctx.tokenMap, `${n.figmaId}.fontSize`, ctx.tokenValueMap),
+    lineHeight: resolveValue(n.lineHeight, n.tokenIds?.lineHeight, ctx.tokenMap, `${n.figmaId}.lineHeight`, ctx.tokenValueMap),
     fontWeight: n.fontWeight,
-    color: resolveValue(n.color, n.tokenIds?.color, ctx.tokenMap, `${n.figmaId}.color`),
+    color: resolveValue(n.color, n.tokenIds?.color, ctx.tokenMap, `${n.figmaId}.color`, ctx.tokenValueMap),
   }
   if (n.textAlign) styles.textAlign = n.textAlign
   if (fixedWidth !== undefined) styles.width = fixedWidth
@@ -1069,8 +1088,8 @@ function emitShape(n: IRShape, ctx: CodegenCtx, parent: ParentCtx = { dir: 'none
     f.createJsxAttribute(f.createIdentifier('viewBox'), stringLiteral(`0 0 ${w} ${h}`)),
     f.createJsxAttribute(f.createIdentifier('display'), stringLiteral('block')),
     f.createJsxAttribute(f.createIdentifier('flexShrink'), f.createJsxExpression(undefined, valueToExpr(0))),
-    f.createJsxAttribute(f.createIdentifier('width'), stringLiteral(px2rem(w, ctx.remBase))),
-    f.createJsxAttribute(f.createIdentifier('height'), stringLiteral(px2rem(h, ctx.remBase))),
+    f.createJsxAttribute(f.createIdentifier('width'), stringLiteral(px2remPanda(w, ctx.remBase))),
+    f.createJsxAttribute(f.createIdentifier('height'), stringLiteral(px2remPanda(h, ctx.remBase))),
   ]
   if (n.opacity !== undefined) svgAttrs.push(
     f.createJsxAttribute(f.createIdentifier('opacity'), f.createJsxExpression(undefined, valueToExpr(n.opacity))),
@@ -1137,6 +1156,11 @@ interface CodegenCtx {
   usedJsxPatterns: Set<string>
   /** figma variable id → panda token path (e.g. "background.standard.primary"). */
   tokenMap: Record<string, string>
+  /** figma variable id → numeric value (FLOAT vars only). Used to detect
+   * scaled-instance values that diverge from the bound token's intrinsic
+   * value (e.g. master radius=6 with token radius/200, instance scaled
+   * 32/28 → cornerRadius=6.857). When raw ≠ token value, emit raw. */
+  tokenValueMap: Record<string, number>
   /** REM base in CSS px. From pixpec.toml `remBase` (default 16). All emitted
    * numeric figma-px values become `(value/remBase)rem`. */
   remBase: number
@@ -1221,9 +1245,19 @@ function colorTokenVar(tokenPath: string): string {
 
 /** Token-or-px helper: when a figma variable id is bound, emit the panda
  * token path. Otherwise emit `<n>px` (or pass-through string). */
-function resolveValue(rawValue: number | string | undefined, tokenId: string | undefined, tokenMap: Record<string, string>, label: string): string | number | undefined {
+function resolveValue(rawValue: number | string | undefined, tokenId: string | undefined, tokenMap: Record<string, string>, label: string, tokenValueMap?: Record<string, number>): string | number | undefined {
   const tokenPath = requireTokenPath(tokenId, tokenMap, label)
-  if (tokenPath) return tokenPath
+  if (tokenPath) {
+    // Scaled instance: figma inherits the master's variable binding through
+    // a corner-drag, but the rendered numeric value diverges from the
+    // variable's intrinsic value. Compare and emit raw on mismatch — the
+    // variable name is no longer truthful for this node.
+    if (typeof rawValue === 'number' && tokenId && tokenValueMap && tokenId in tokenValueMap) {
+      const tokVal = tokenValueMap[tokenId]
+      if (Math.abs(rawValue - tokVal) > 0.01) return rawValue
+    }
+    return tokenPath
+  }
   return rawValue
 }
 
@@ -1238,6 +1272,13 @@ function resolveValue(rawValue: number | string | undefined, tokenId: string | u
  */
 const px2rem = (v: number, base: number): string =>
   `${+(v / base).toFixed(6)}rem`
+
+/** Panda atomic class names cap at 3-decimal precision in our setup —
+ * `bdr_0.4286rem` (4dp) doesn't extract a CSS rule while `bdr_0.429rem`
+ * (3dp) does. Use this when emitting Panda style props (atomic class).
+ * Inline `style={{...}}` callers should keep `px2rem` (full precision). */
+const px2remPanda = (v: number, base: number): string =>
+  `${+(v / base).toFixed(3)}rem`
 
 /**
  * Numeric → 'rem' string for properties that panda interprets as token
@@ -1290,7 +1331,10 @@ function compactPaddingStyles(styles: Record<string, unknown>): Record<string, u
 function pandaize(styles: Record<string, unknown>, remBase: number): Record<string, unknown> {
   const out: Record<string, unknown> = {}
   for (const [k, v] of Object.entries(styles)) {
-    out[k] = typeof v === 'number' && PX_PROPS.has(k) ? px2rem(v, remBase) : v
+    // Use 3dp rem for Panda atomic emit — Panda's class-name extractor
+    // tops out at 3 decimals (`bdr_0.429rem` extracts; `bdr_0.4286rem`
+    // doesn't). For 4+dp we emit raw value via inline `style` instead.
+    out[k] = typeof v === 'number' && PX_PROPS.has(k) ? px2remPanda(v, remBase) : v
   }
   return out
 }
@@ -1374,8 +1418,8 @@ function emitNode(n: IRNode, ctx: CodegenCtx, parent: ParentCtx = { dir: 'none',
       rotW = snap(rotW)
       rotH = snap(rotH)
     }
-    if (fixedH && typeof rotW === 'number') ws.width = px2rem(rotW, ctx.remBase)
-    if (fixedV && typeof rotH === 'number') ws.height = px2rem(rotH, ctx.remBase)
+    if (fixedH && typeof rotW === 'number') ws.width = px2remPanda(rotW, ctx.remBase)
+    if (fixedV && typeof rotH === 'number') ws.height = px2remPanda(rotH, ctx.remBase)
     jsx = wrapWithStyle(jsx, { ...ws, display: 'inline-block' }, ctx)
   }
   // (no shrink-wrap span — AGENTS.md: 1 figma node = 1 JSX element. The
@@ -1387,8 +1431,8 @@ function emitNode(n: IRNode, ctx: CodegenCtx, parent: ParentCtx = { dir: 'none',
   if (n.absolute) {
     jsx = wrapWithStyle(jsx, {
       position: 'absolute',
-      left: typeof n.absX === 'number' ? px2rem(n.absX, ctx.remBase) : '0rem',
-      top: typeof n.absY === 'number' ? px2rem(n.absY, ctx.remBase) : '0rem',
+      left: typeof n.absX === 'number' ? px2remPanda(n.absX, ctx.remBase) : '0rem',
+      top: typeof n.absY === 'number' ? px2remPanda(n.absY, ctx.remBase) : '0rem',
     }, ctx)
   }
   return jsx
@@ -1407,6 +1451,7 @@ export function generate(
   tokenMap: Record<string, string> = {},
   plugins: import('../types.ts').CodegenPlugin[] = [],
   remBase: number = 16,
+  tokenValueMap: Record<string, number> = {},
 ): string {
   hydrate(root, components)
   const usedComponents = new Set<string>()
@@ -1415,6 +1460,7 @@ export function generate(
     typographyMap, usedTypography: new Set(),
     usesCss: false, usedJsxPatterns: new Set(),
     tokenMap,
+    tokenValueMap,
     remBase,
     plugins,
   }

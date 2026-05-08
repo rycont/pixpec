@@ -100,6 +100,13 @@ async function __pixpecIr(node) {
           fields.includes('fontSize') ||
           fields.includes('fills')
         )) return true;
+        // Descendant FIXED-sized dim override — designer scaled an inner
+        // node off its master dim (figma "drag corner" on a child). The
+        // registered component API has no prop for arbitrary descendant
+        // dim, so render the actual override tree (e.g. Input's IconButton
+        // 28→32 with inner Icon 20→22.857).
+        if ((fields.includes('width') || fields.includes('height'))
+            && (target.layoutSizingHorizontal === 'FIXED' || target.layoutSizingVertical === 'FIXED')) return true;
       }
       // Fallback: figma's overrides API misses textStyle drift (instance text
       // diverges from its bound textStyle without surfacing as a field
@@ -225,11 +232,16 @@ async function __pixpecIr(node) {
     // set per side. Capture per-side so codegen can emit borderTop/Bottom/etc
     // instead of a 4-side insetBorder. Pre-stringify to dodge CDP (Symbol
     // can't serialize) and read individual fields directly.
-    const strokeWeight = stroke ? (typeof node.strokeWeight === 'number' ? node.strokeWeight : 1) : 0;
-    const strokeTopWeight = stroke ? (typeof node.strokeTopWeight === 'number' ? node.strokeTopWeight : strokeWeight) : 0;
-    const strokeRightWeight = stroke ? (typeof node.strokeRightWeight === 'number' ? node.strokeRightWeight : strokeWeight) : 0;
-    const strokeBottomWeight = stroke ? (typeof node.strokeBottomWeight === 'number' ? node.strokeBottomWeight : strokeWeight) : 0;
-    const strokeLeftWeight = stroke ? (typeof node.strokeLeftWeight === 'number' ? node.strokeLeftWeight : strokeWeight) : 0;
+    // Round to 2 decimals — figma reports scaled-instance stroke at full
+    // float precision (e.g. 1.1428570747375488 from a 32/28 scale) which
+    // becomes a Panda atomic class name with no extractable rule.
+    const rawStrokeWeight = stroke ? (typeof node.strokeWeight === 'number' ? node.strokeWeight : 1) : 0;
+    const strokeWeight = Math.round(rawStrokeWeight * 100) / 100;
+    const r2 = (v) => Math.round(v * 100) / 100;
+    const strokeTopWeight = stroke ? r2(typeof node.strokeTopWeight === 'number' ? node.strokeTopWeight : strokeWeight) : 0;
+    const strokeRightWeight = stroke ? r2(typeof node.strokeRightWeight === 'number' ? node.strokeRightWeight : strokeWeight) : 0;
+    const strokeBottomWeight = stroke ? r2(typeof node.strokeBottomWeight === 'number' ? node.strokeBottomWeight : strokeWeight) : 0;
+    const strokeLeftWeight = stroke ? r2(typeof node.strokeLeftWeight === 'number' ? node.strokeLeftWeight : strokeWeight) : 0;
     const mixedStroke = typeof node.strokeWeight !== 'number'
       && (strokeTopWeight !== strokeRightWeight || strokeRightWeight !== strokeBottomWeight || strokeBottomWeight !== strokeLeftWeight);
     // figma boundVariables — when a property's value is bound to a design
