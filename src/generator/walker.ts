@@ -362,6 +362,12 @@ async function __pixpecIr(node) {
       let segText = seg.characters;
       if (typeof segText === 'string') {
         const NBSP = '\\u00A0';
+        // Boundary-position spaces between styled runs collapse under Skia's
+        // Korean text shaping (advance ≈ 0 instead of font's natural ~0.6em).
+        // figma renders them at full advance. Substitute leading/trailing
+        // ASCII spaces with NBSP (U+00A0) which Skia preserves verbatim.
+        segText = segText.replace(/^ +/, (m) => NBSP.repeat(m.length));
+        segText = segText.replace(/ +$/, (m) => NBSP.repeat(m.length));
         segText = segText.replace(/ {2,}/g, (m) => NBSP.repeat(m.length - 1) + ' ');
       }
       return {
