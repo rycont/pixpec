@@ -43,11 +43,20 @@ function cleanControlValue(value: unknown): unknown {
  * instance props whose values match the declared defaults. Without defaults
  * declared, NO elision happens (safe fallback for un-migrated components). */
 export function hydrate(node: IRNode, components: Component<unknown>[]): IRNode {
+  // Depth-first: hydrate children BEFORE the parent so a parent's
+  // propsFromFigma can read its children's already-typed `.props` (e.g.
+  // Tab.propsFromFigma collecting labels from each TabItem's `.props.label`).
+  if (node.kind === 'frame') for (const ch of node.children) hydrate(ch, components)
+  if (node.kind === 'component' && node.children) for (const ch of node.children) hydrate(ch, components)
   if (node.kind === 'component') {
     const c = node as IRComponentRaw
     const comp = components.find((x) => x.name === c.componentName)
     if (comp?.figma) {
-      const raw = comp.figma.propsFromFigma(c.raw as never) as Record<string, unknown>
+      // Pass the IR node itself as second arg — propsFromFigma may walk
+      // `node.children` (instance children captured by walker as IR with
+      // `.props` already populated by their own propsFromFigma above) to
+      // collect array props (e.g. Tab.labels from N nested Tab_Item).
+      const raw = (comp.figma.propsFromFigma as (r: never, n: never) => Record<string, unknown>)(c.raw as never, c as never)
       c.props = Object.fromEntries(
         Object.entries(raw)
           .filter(([, v]) => v !== undefined)
@@ -57,7 +66,6 @@ export function hydrate(node: IRNode, components: Component<unknown>[]): IRNode 
     if (comp?.defaults) c.defaultProps = cleanControlValue(comp.defaults) as Record<string, unknown>
     delete (c as Partial<IRComponentRaw>).raw
   }
-  if (node.kind === 'frame') for (const ch of node.children) hydrate(ch, components)
   return node
 }
 
@@ -81,171 +89,6 @@ const propertyAssignment = (
 ): ast.PropertyAssignment => f.createPropertyAssignment(undefined, name, undefined, noType, initializer)
 const callExpression = (expression: ast.Expression, args: readonly ast.Expression[]): ast.CallExpression =>
   f.createCallExpression(expression, undefined, undefined, args, noNodeFlags)
-
-function printStringLiteral(text: string): string {
-  return JSON.stringify(text)
-}
-
-function printTemplateLiteral(text: string): string {
-  return `\`${text.replace(/\\/g, '\\\\').replace(/`/g, '\\`').replace(/\$\{/g, '\\${')}\``
-}
-
-function printIdentifier(node: ast.Identifier): string {
-  return node.text
-}
-
-function printPropertyName(node: ast.PropertyName): string {
-  return node.kind === ast.SyntaxKind.Identifier
-    ? printIdentifier(node as ast.Identifier)
-    : printStringLiteral((node as ast.StringLiteral).text)
-}
-
-function printExpr(node: ast.Expression): string {
-  switch (node.kind) {
-    case ast.SyntaxKind.Identifier:
-      return printIdentifier(node as ast.Identifier)
-    case ast.SyntaxKind.StringLiteral:
-      return printStringLiteral((node as ast.StringLiteral).text)
-    case ast.SyntaxKind.NumericLiteral:
-      return (node as ast.NumericLiteral).text
-    case ast.SyntaxKind.TrueKeyword:
-      return 'true'
-    case ast.SyntaxKind.FalseKeyword:
-      return 'false'
-    case ast.SyntaxKind.NullKeyword:
-      return 'null'
-    case ast.SyntaxKind.ArrayLiteralExpression:
-      return `[${[...(node as ast.ArrayLiteralExpression).elements].map(printExpr).join(', ')}]`
-    case ast.SyntaxKind.ObjectLiteralExpression:
-      return `{ ${[...(node as ast.ObjectLiteralExpression).properties].map((p) => {
-        if (p.kind !== ast.SyntaxKind.PropertyAssignment) {
-          throw new Error(`[pixpec generate] unsupported object property kind: ${p.kind}`)
-        }
-        const prop = p as ast.PropertyAssignment
-        return `${printPropertyName(prop.name)}: ${printExpr(prop.initializer)}`
-      }).join(', ')} }`
-    case ast.SyntaxKind.CallExpression: {
-      const call = node as ast.CallExpression
-      return `${printExpr(call.expression)}(${[...call.arguments].map(printExpr).join(', ')})`
-    }
-    case ast.SyntaxKind.ParenthesizedExpression:
-      return `(${printExpr((node as ast.ParenthesizedExpression).expression)})`
-    case ast.SyntaxKind.ArrowFunction:
-      return printArrowFunction(node as ast.ArrowFunction)
-    case ast.SyntaxKind.NoSubstitutionTemplateLiteral:
-      return printTemplateLiteral((node as ast.NoSubstitutionTemplateLiteral).text)
-    case ast.SyntaxKind.JsxSelfClosingElement:
-    case ast.SyntaxKind.JsxElement:
-      return printJsx(node as ast.JsxChild)
-    case ast.SyntaxKind.PropertyAccessExpression: {
-      // ts-go stores child nodes in node._data (factory.generated.js:1757);
-      // typed `.expression`/`.name` getters from ast.d.ts aren't materialized
-      // on factory-created nodes.
-      const data = (node as unknown as { _data: { expression: ast.Expression; name: ast.Identifier } })._data
-      return `${printExpr(data.expression)}.${printIdentifier(data.name)}`
-    }
-    default:
-      throw new Error(`[pixpec generate] unsupported expression kind: ${node.kind}`)
-  }
-}
-
-function printJsxTagName(node: ast.JsxTagNameExpression): string {
-  return node.kind === ast.SyntaxKind.Identifier
-    ? printIdentifier(node as ast.Identifier)
-    : printExpr(node as ast.Expression)
-}
-
-function printJsxAttr(attr: ast.JsxAttributeLike): string {
-  if (attr.kind === ast.SyntaxKind.JsxSpreadAttribute) {
-    return `{...${printExpr((attr as ast.JsxSpreadAttribute).expression)}}`
-  }
-  const a = attr as ast.JsxAttribute
-  const name = a.name.kind === ast.SyntaxKind.Identifier
-    ? printIdentifier(a.name as ast.Identifier)
-    : `${printIdentifier((a.name as ast.JsxNamespacedName).namespace)}:${printIdentifier((a.name as ast.JsxNamespacedName).name)}`
-  if (!a.initializer) return name
-  if (a.initializer.kind === ast.SyntaxKind.StringLiteral) {
-    return `${name}=${printStringLiteral((a.initializer as ast.StringLiteral).text)}`
-  }
-  return `${name}={${printExpr((a.initializer as ast.JsxExpression).expression!)}}`
-}
-
-function printJsxAttrs(attrs: ast.JsxAttributes): string {
-  const printed = [...attrs.properties].map(printJsxAttr)
-  return printed.length ? ` ${printed.join(' ')}` : ''
-}
-
-function printJsxText(text: string): string {
-  return text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/{/g, '&#123;')
-}
-
-function printJsx(node: ast.JsxChild): string {
-  switch (node.kind) {
-    case ast.SyntaxKind.JsxText:
-      return printJsxText((node as ast.JsxText).text)
-    case ast.SyntaxKind.JsxExpression: {
-      const expr = (node as ast.JsxExpression).expression
-      return `{${expr ? printExpr(expr) : ''}}`
-    }
-    case ast.SyntaxKind.JsxSelfClosingElement: {
-      const el = node as ast.JsxSelfClosingElement
-      return `<${printJsxTagName(el.tagName)}${printJsxAttrs(el.attributes)} />`
-    }
-    case ast.SyntaxKind.JsxElement: {
-      const el = node as ast.JsxElement
-      const tag = printJsxTagName(el.openingElement.tagName)
-      const attrs = printJsxAttrs(el.openingElement.attributes)
-      return `<${tag}${attrs}>${[...el.children].map(printJsx).join('')}</${tag}>`
-    }
-    default:
-      throw new Error(`[pixpec generate] unsupported JSX kind: ${node.kind}`)
-  }
-}
-
-function printImportDeclaration(node: ast.ImportDeclaration): string {
-  const clause = node.importClause
-  const moduleSpecifier = printExpr(node.moduleSpecifier as ast.Expression)
-  if (!clause?.namedBindings || clause.namedBindings.kind !== ast.SyntaxKind.NamedImports) {
-    return `import ${moduleSpecifier};`
-  }
-  const typePrefix = clause.phaseModifier === ast.SyntaxKind.TypeKeyword ? ' type' : ''
-  const imports = [...(clause.namedBindings as ast.NamedImports).elements]
-    .map((s) => s.propertyName ? `${printIdentifier(s.propertyName as ast.Identifier)} as ${printIdentifier(s.name)}` : printIdentifier(s.name))
-    .join(', ')
-  return `import${typePrefix} { ${imports} } from ${moduleSpecifier};`
-}
-
-function printVariableStatement(node: ast.VariableStatement): string {
-  const exported = node.modifiers?.some((m) => m.kind === ast.SyntaxKind.ExportKeyword) ? 'export ' : ''
-  const declarations = [...node.declarationList.declarations].map((d) => {
-    const type = d.type ? `: ${printTypeNode(d.type)}` : ''
-    const init = d.initializer ? ` = ${printExpr(d.initializer)}` : ''
-    return `${printIdentifier(d.name as ast.Identifier)}${type}${init}`
-  })
-  return `${exported}const ${declarations.join(', ')};`
-}
-
-function printTypeNode(node: ast.TypeNode): string {
-  if (node.kind === ast.SyntaxKind.TypeReference) {
-    const typeRef = node as ast.TypeReferenceNode
-    return printPropertyName(typeRef.typeName as ast.PropertyName)
-  }
-  throw new Error(`[pixpec generate] unsupported type node kind: ${node.kind}`)
-}
-
-function printArrowFunction(node: ast.ArrowFunction): string {
-  return `() => ${printExpr(node.body as ast.Expression)}`
-}
-
-function printStatement(node: ast.Statement): string {
-  if (node.kind === ast.SyntaxKind.ImportDeclaration) return printImportDeclaration(node as ast.ImportDeclaration)
-  if (node.kind === ast.SyntaxKind.VariableStatement) return printVariableStatement(node as ast.VariableStatement)
-  throw new Error(`[pixpec generate] unsupported statement kind: ${node.kind}`)
-}
-
-function printSourceFile(sourceFile: ast.SourceFile): string {
-  return [...sourceFile.statements].map(printStatement).join('\n') + '\n'
-}
 
 /** JS value → ts AST expression. Handles primitives, arrays, plain objects. */
 function valueToExpr(v: unknown): ast.Expression {
@@ -319,6 +162,13 @@ function componentLayoutStyles(n: IRComponent, parent: ParentCtx, ctx: CodegenCt
     } else if (n.sizingV === 'fill') {
       ws.height = '100%'
     }
+    // Forward instance-level layout overrides (padding/gap that diverge
+    // from master) — same as the nested-instance path below.
+    if (n.layoutOverride) {
+      for (const [k, v] of Object.entries(n.layoutOverride)) {
+        if (typeof v === 'number') ws[k] = px2remPanda(v, ctx.remBase)
+      }
+    }
     return ws
   }
   const ws: Record<string, unknown> = {}
@@ -369,6 +219,13 @@ function componentLayoutStyles(n: IRComponent, parent: ParentCtx, ctx: CodegenCt
     if (parent.dir === 'row' && n.sizingH === 'fixed') ws.flexShrink = 0
     if (parent.dir === 'column' && n.sizingV === 'fixed') ws.flexShrink = 0
   }
+  // Forward instance-level layout overrides (padding/gap that diverge from
+  // master). The component impl is expected to apply these on its root.
+  if (n.layoutOverride) {
+    for (const [k, v] of Object.entries(n.layoutOverride)) {
+      if (typeof v === 'number') ws[k] = px2remPanda(v, ctx.remBase)
+    }
+  }
   return ws
 }
 
@@ -380,7 +237,26 @@ function emitComponent(n: IRComponent, ctx: CodegenCtx, parent: ParentCtx = { di
   const props = n.defaultProps
     ? Object.fromEntries(Object.entries(n.props).filter(([k, v]) => !deepEq(v, n.defaultProps![k])))
     : n.props
-  const attrs = attrsFromObject(props)
+  // IR may carry per-attr binding annotations (`boundProps[attrKey]` →
+  // owner prop key) set by walker from the variant's bindings spec.
+  // For bound attrs, emit `<Inner attr={props.<ownerKey>}>`; otherwise
+  // fall through to the literal value via attrsFromObject.
+  const boundProps = n.boundProps ?? {}
+  const attrs: ast.JsxAttributeLike[] = []
+  // Iterate the union of literal-prop keys and bound-prop keys: a prop
+  // bound to an owner key must be emitted unconditionally even when its
+  // literal value matches the component's default (otherwise the
+  // default-elision filter above hides the attr and the binding is lost).
+  const attrKeys = new Set<string>([...Object.keys(props), ...Object.keys(boundProps)])
+  for (const k of attrKeys) {
+    const boundKey = boundProps[k]
+    if (boundKey) {
+      ctx.usedPropBindings.add(boundKey)
+      attrs.push(f.createJsxAttribute(f.createIdentifier(k), propExpression(boundKey)))
+    } else {
+      attrs.push(...attrsFromObject({ [k]: props[k] }))
+    }
+  }
   // When this component is a direct child of an autolayout frame, put Figma's
   // flex item sizing on the component itself as Panda style props. Registered
   // DS components are expected to split/forward Panda style props to their
@@ -869,10 +745,10 @@ function emitText(n: IRText, ctx: CodegenCtx, parent: ParentCtx = { dir: 'none',
     if (fillCross) wrapperProps.alignSelf = 'stretch'
     // figma HUG: width = intrinsic max-content, parent overflows. CSS equivalent:
     // whiteSpace:nowrap (don't soft-wrap) + flex-shrink:0 (don't shrink below natural).
-    // figma HUG: width = intrinsic max-content. `nowrap` prevents soft-wrap;
-    // explicit `<br/>` (see textChildren) still creates the figma-authored
-    // hard breaks regardless of nowrap.
-    if (isHug) wrapperProps.whiteSpace = 'nowrap'
+    // figma HUG text: `<Text>` (the typography wrappers' base) auto-applies
+    // the `hugText` Panda utility when no explicit width is set — that
+    // bundles width-ceil + nowrap + flex-shrink:0. Codegen need not emit
+    // those props separately.
     // Typography wrappers extend HTMLStyledProps<'span'>, so panda style props
     // (color, bg, etc.) pass through `splitCssProps` and merge into className
     // via css(). Prefer the bound token path (resolves to var(--colors-...))
@@ -883,15 +759,20 @@ function emitText(n: IRText, ctx: CodegenCtx, parent: ParentCtx = { dir: 'none',
     } else if (n.color) {
       inlineStyles.color = n.color
     }
-    // figma fontName — emit verbatim (family + style). family is e.g.
-    // "Wanted Sans Variable" or "goorm Sans Code"; style is the
-    // designer-authored string (any text — "Bold", "400", "Regular").
-    // The DS layer (typography wrapper / Text impl) maps style to CSS
-    // font-weight/font-style if needed; pixpec stays format-agnostic.
-    if (n.fontFamily) {
+    // figma fontName — only emit fontFamily when figma's text overrides the
+    // textStyle's default font (typography wrapper already sets fontFamily
+    // via textStyle token). textStyleOverrides.fontName is set by walker
+    // exactly in that case. Same for fontWeight: emit only when overridden.
+    // textStyleOverrides.fontName is set by walker only when figma's
+    // effective fontName diverges from the bound textStyle's default — the
+    // exact signal that family/weight need an explicit emit on top of the
+    // wrapper. Without override the wrapper's textStyle covers both.
+    if (n.textStyleOverrides?.fontName?.family && n.fontFamily) {
       inlineStyles.fontFamily = `"${n.fontFamily}", system-ui, sans-serif`
     }
-    if (n.fontStyle) wrapperProps.fontStyle = n.fontStyle
+    if (n.textStyleOverrides?.fontName && typeof n.fontWeight === 'number') {
+      wrapperProps.fontWeight = n.fontWeight
+    }
     // figma's HUG width = ceil(advance) creates 0..1 css slack. textAlignHorizontal
     // distributes that slack: LEFT→right, CENTER→half each side, RIGHT→left. Chromium
     // default text-align: start (= LEFT) leaves slack on the right, mismatching figma's
@@ -917,11 +798,18 @@ function emitText(n: IRText, ctx: CodegenCtx, parent: ParentCtx = { dir: 'none',
     // paragraph splitting itself per design-system metadata. Use a template
     // literal so non-ASCII characters (Korean, emoji, etc.) survive the TS
     // printer's default \uXXXX escape behavior.
+    // IR may carry a binding annotation (`boundProp`) set by walker from
+    // the variant's bindings spec — emit `{props.<key>}` instead of the
+    // master literal so the per-variant tree is parametric.
+    const boundKey = n.boundProp
+    if (boundKey) ctx.usedPropBindings.add(boundKey)
     const children: ast.JsxChild[] = n.runs?.length
       ? emitRunSpans(n.runs, ctx)
-      : [n.content.includes('\n')
-          ? f.createJsxExpression(undefined, f.createNoSubstitutionTemplateLiteral(n.content, noTokenFlags))
-          : f.createJsxText(n.content)]
+      : boundKey
+        ? [propExpression(boundKey)]
+        : [n.content.includes('\n')
+            ? f.createJsxExpression(undefined, f.createNoSubstitutionTemplateLiteral(n.content, noTokenFlags))
+            : f.createJsxText(n.content)]
     return f.createJsxElement(open, children, close)
   }
   // Fallback: styled span (when textStyleId missing or unknown).
@@ -931,7 +819,7 @@ function emitText(n: IRText, ctx: CodegenCtx, parent: ParentCtx = { dir: 'none',
     color: resolveValue(n.color, n.tokenIds?.color, ctx.tokenMap, `${n.figmaId}.color`, ctx.tokenValueMap),
   }
   if (n.fontFamily) styles.fontFamily = `"${n.fontFamily}", system-ui, sans-serif`
-  if (n.fontStyle) styles.fontStyle = n.fontStyle
+  if (typeof n.fontWeight === 'number') styles.fontWeight = n.fontWeight
   if (n.textAlign) styles.textAlign = n.textAlign
   // figma → CSS text-decoration: UNDERLINE → underline, STRIKETHROUGH →
   // line-through. Fallthrough on unknown values keeps the figma string.
@@ -965,7 +853,7 @@ function emitRunSpans(runs: import('./ir.ts').TextRun[], ctx: CodegenCtx): ast.J
       inlineStyles.color = tokenPath ? colorTokenVar(tokenPath) : r.color
     }
     if (r.fontFamily) inlineStyles.fontFamily = `"${r.fontFamily}", system-ui, sans-serif`
-    if (r.fontStyle) inlineStyles.fontWeight = /^\d+$/.test(r.fontStyle) ? Number(r.fontStyle) : r.fontStyle
+    if (typeof r.fontWeight === 'number') inlineStyles.fontWeight = r.fontWeight
     if (typeof r.fontSize === 'number') inlineStyles.fontSize = px2rem(r.fontSize, ctx.remBase)
     if (typeof r.lineHeight === 'number') inlineStyles.lineHeight = px2rem(r.lineHeight, ctx.remBase)
     if (r.textDecoration) inlineStyles.textDecoration =
@@ -1147,8 +1035,44 @@ function emitShape(n: IRShape, ctx: CodegenCtx, parent: ParentCtx = { dir: 'none
         ),
       ]),
     )
+  } else if (n.shape === 'line') {
+    // figma LINE has zero height (or width). A `<rect height=0>` with stroke
+    // fails to render because the SVG viewport collapses to 0. Emit a real
+    // `<line>` and (further down) inflate the SVG viewBox by strokeWidth on
+    // the collapsed axis. The line sits at the half-stroke offset so the
+    // centerline stays where figma drew it.
+    const horizontal = h === 0 || h < w
+    const sw = n.strokeWeight ?? 1
+    const cap = n.strokeCap ?? 'butt'
+    // Round/square caps extend ink past the geometric endpoint by sw/2.
+    // figma's absoluteRenderBounds shows the bbox already absorbs this
+    // extension (LINE bbox 146 wide = full ink envelope, with geometric
+    // endpoints at sw/2..146-sw/2). To match, pull the svg endpoints in
+    // by sw/2 on each end so the cap's outward growth lands back on the
+    // bbox edges. Butt cap = no extension → use the original endpoints.
+    const capInset = cap === 'butt' ? 0 : sw / 2
+    const lx = horizontal ? capInset : sw / 2
+    const ly = horizontal ? sw / 2 : capInset
+    const lx2 = horizontal ? w - capInset : sw / 2
+    const ly2 = horizontal ? sw / 2 : h - capInset
+    const lineAttrs = [
+      f.createJsxAttribute(f.createIdentifier('x1'), f.createJsxExpression(undefined, valueToExpr(lx))),
+      f.createJsxAttribute(f.createIdentifier('y1'), f.createJsxExpression(undefined, valueToExpr(ly))),
+      f.createJsxAttribute(f.createIdentifier('x2'), f.createJsxExpression(undefined, valueToExpr(lx2))),
+      f.createJsxAttribute(f.createIdentifier('y2'), f.createJsxExpression(undefined, valueToExpr(ly2))),
+      ...Object.entries(innerAttrs).map(([k, v]) =>
+        f.createJsxAttribute(f.createIdentifier(k), f.createJsxExpression(undefined, valueToExpr(v))),
+      ),
+    ]
+    if (cap !== 'butt') lineAttrs.push(
+      f.createJsxAttribute(f.createIdentifier('strokeLinecap'), stringLiteral(cap)),
+    )
+    inner = f.createJsxSelfClosingElement(
+      f.createIdentifier('line'), undefined,
+      f.createJsxAttributes(lineAttrs),
+    )
   } else {
-    // polygon/star/line — fallback to filled rect (will be a coarse approx)
+    // polygon/star — fallback to filled rect (coarse approx)
     inner = f.createJsxSelfClosingElement(
       f.createIdentifier('rect'), undefined,
       f.createJsxAttributes([
@@ -1165,13 +1089,26 @@ function emitShape(n: IRShape, ctx: CodegenCtx, parent: ParentCtx = { dir: 'none
   const styledSvg = () => f.createPropertyAccessExpression(
     f.createIdentifier('styled'), undefined, f.createIdentifier('svg'),
   )
+  // figma `line` shapes have w=0 or h=0; the stroke renders OUTSIDE that
+  // collapsed bbox. Inflate the SVG viewport by the stroke width on the
+  // collapsed axis so chromium has paint area; offset the line by half the
+  // inflation to keep the centerline at the original position.
+  let viewW = w, viewH = h, strokeOffsetX = 0, strokeOffsetY = 0
+  if (n.shape === 'line' && n.strokeColor) {
+    const sw = n.strokeWeight ?? 1
+    if (h === 0) { viewH = sw; strokeOffsetY = sw / 2 }
+    if (w === 0) { viewW = sw; strokeOffsetX = sw / 2 }
+  }
   const svgAttrs: ast.JsxAttribute[] = [
-    f.createJsxAttribute(f.createIdentifier('viewBox'), stringLiteral(`0 0 ${w} ${h}`)),
+    f.createJsxAttribute(f.createIdentifier('viewBox'), stringLiteral(`0 0 ${viewW} ${viewH}`)),
     f.createJsxAttribute(f.createIdentifier('display'), stringLiteral('block')),
     f.createJsxAttribute(f.createIdentifier('flexShrink'), f.createJsxExpression(undefined, valueToExpr(0))),
-    f.createJsxAttribute(f.createIdentifier('width'), stringLiteral(px2remPanda(w, ctx.remBase))),
-    f.createJsxAttribute(f.createIdentifier('height'), stringLiteral(px2remPanda(h, ctx.remBase))),
+    f.createJsxAttribute(f.createIdentifier('width'), stringLiteral(px2remPanda(viewW, ctx.remBase))),
+    f.createJsxAttribute(f.createIdentifier('height'), stringLiteral(px2remPanda(viewH, ctx.remBase))),
   ]
+  // Apply line-offset transform on the inner element so the stroke sits at
+  // the original bbox origin (not at strokeWidth/2 inset).
+  void strokeOffsetX; void strokeOffsetY
   if (n.opacity !== undefined) svgAttrs.push(
     f.createJsxAttribute(f.createIdentifier('opacity'), f.createJsxExpression(undefined, valueToExpr(n.opacity))),
   )
@@ -1260,6 +1197,26 @@ interface CodegenCtx {
   /** DS-specific codegen extensions (Icon currentColor, etc.). Each plugin's
    * `emitWrap` runs after the default JSX is built per node. */
   plugins: import('../types.ts').CodegenPlugin[]
+  /** Tracks owner-prop keys actually bound during this codegen pass —
+   * IR carries the binding annotations on TEXT/Component nodes; codegen
+   * collects which keys got referenced so the emitted FC signature can
+   * declare a typed `Pick<OwnerProps, …>` props arg. */
+  usedPropBindings: Set<string>
+}
+
+/** Build `{props.<key>}` JSX expression. Used to swap a literal prop
+ * value for a typed prop reference based on IR binding annotations. */
+function propExpression(key: string): ast.JsxExpression {
+  return f.createJsxExpression(
+    undefined,
+    // factory signature: (expression, questionDotToken, name, flags)
+    f.createPropertyAccessExpression(
+      f.createIdentifier('props'),
+      undefined,
+      f.createIdentifier(key),
+      noNodeFlags,
+    ),
+  )
 }
 
 /** Wrap a JSX child in a `<span style={...}>`. Exposed to plugins via EmitContext. */
@@ -1446,8 +1403,12 @@ function cssAttr(styles: Record<string, unknown>, ctx: CodegenCtx): ast.JsxAttri
 function lookupTypoByPrefix(liveId: string, map: Record<string, string>): string | undefined {
   // Direct match first.
   if (map[liveId]) return map[liveId]
+  // figma's textStyleId looks like `S:<hash>,<localNodeId>`; the binding map
+  // may have been recorded with or without the trailing localNodeId. Match
+  // the shared `S:<hash>,` prefix from either direction so a binding written
+  // against one figma file resolves text from another.
   for (const key of Object.keys(map)) {
-    if (liveId.startsWith(key)) return map[key]
+    if (liveId.startsWith(key) || key.startsWith(liveId)) return map[key]
   }
   return undefined
 }
@@ -1522,10 +1483,26 @@ function emitNode(n: IRNode, ctx: CodegenCtx, parent: ParentCtx = { dir: 'none',
   // Wrap with position:absolute + left/top so the child sits outside flex
   // flow but still in DOM. Parent gets position:relative emitted in emitFrame.
   if (n.absolute) {
+    // figma LINE bbox.x/y is the LINE CENTER (line has zero geom on the
+    // collapsed axis). Our svg emit inflates the viewport by strokeWidth on
+    // that axis with the line drawn at the half-stroke offset — without
+    // matching the absolute coord, the rendered line sits half-stroke off
+    // figma's mark. Pull the wrapper back by sw/2 on the collapsed axis.
+    let absX = typeof n.absX === 'number' ? n.absX : 0
+    let absY = typeof n.absY === 'number' ? n.absY : 0
+    if (n.kind === 'shape' && n.shape === 'line') {
+      // figma LINE bbox y/x marks the FAR edge of the stroke (not the line
+      // center) on the collapsed axis. Pull the wrapper back by the full
+      // stroke width so chromium's svg stroke (drawn from svg top toward
+      // bottom) lands in the same position as figma's render.
+      const sw = n.strokeWeight ?? 1
+      if (n.height === 0) absY -= sw
+      if (n.width === 0) absX -= sw
+    }
     jsx = wrapWithStyle(jsx, {
       position: 'absolute',
-      left: typeof n.absX === 'number' ? px2remPanda(n.absX, ctx.remBase) : '0rem',
-      top: typeof n.absY === 'number' ? px2remPanda(n.absY, ctx.remBase) : '0rem',
+      left: px2remPanda(absX, ctx.remBase),
+      top: px2remPanda(absY, ctx.remBase),
     }, ctx)
   }
   return jsx
@@ -1536,16 +1513,22 @@ function collectComponents(node: IRNode, set: Set<string>): void {
   if (node.kind === 'frame') for (const c of node.children) collectComponents(c, set)
 }
 
-/** Generate self-contained tsx file source. */
+/** Generate self-contained tsx file source.
+ *
+ * `printNode` is the tsgo Emitter's `printNode` bound function. Caller
+ * boots an API/Snapshot/Project once and passes the emitter in so this
+ * pure transform stays free of subprocess/IO concerns.
+ */
 export function generate(
   root: IRNode,
   components: Component<unknown>[],
+  printNode: (node: ast.Node) => string,
   typographyMap: Record<string, string> = {},
   tokenMap: Record<string, string> = {},
   plugins: import('../types.ts').CodegenPlugin[] = [],
   remBase: number = 16,
   tokenValueMap: Record<string, number> = {},
-): string {
+): { jsx: string; usedPropBindings: Set<string> } {
   hydrate(root, components)
   const usedComponents = new Set<string>()
   collectComponents(root, usedComponents)
@@ -1556,6 +1539,7 @@ export function generate(
     tokenValueMap,
     remBase,
     plugins,
+    usedPropBindings: new Set<string>(),
   }
 
   const componentImports = [...usedComponents].sort().map((n) =>
@@ -1595,14 +1579,34 @@ export function generate(
       f.createNamedImports([f.createImportSpecifier(false, undefined, f.createIdentifier('FC'))])),
     stringLiteral('react'),
   )
+  // Signature varies based on whether codegen bound any owning-component
+  // props: with bindings the function takes a `props` arg typed as
+  // Pick<OwnerProps, …boundKeys>; without, it stays the historical
+  // zero-arg `FC` for backwards compat.
+  const boundKeys = [...ctx.usedPropBindings].sort()
+  // For now, use `FC<Record<string, unknown>>` when bindings exist —
+  // typed Pick<OwnerProps, ...> requires PropertySignature ASTs that
+  // the native-preview factory exposes with a quirky API; deferring to
+  // a follow-up that bridges via the owner's props.ts type import.
+  const fcType = boundKeys.length === 0
+    ? f.createTypeReferenceNode(f.createIdentifier('FC'), undefined)
+    : f.createTypeReferenceNode(f.createIdentifier('FC'), [
+        f.createTypeReferenceNode(f.createIdentifier('Record'), [
+          f.createKeywordTypeNode(ast.SyntaxKind.StringKeyword),
+          f.createKeywordTypeNode(ast.SyntaxKind.UnknownKeyword),
+        ]),
+      ])
+  const fnParams = boundKeys.length === 0
+    ? []
+    : [f.createParameterDeclaration(undefined, undefined, f.createIdentifier('props'), undefined, undefined, undefined)]
   const generatedFn = f.createVariableStatement(
     [exportModifier()],
     f.createVariableDeclarationList([
       f.createVariableDeclaration(
         f.createIdentifier('Generated'),
         undefined,
-        f.createTypeReferenceNode(f.createIdentifier('FC')),
-        f.createArrowFunction(undefined, undefined, [], undefined,
+        fcType,
+        f.createArrowFunction(undefined, undefined, fnParams, undefined,
           f.createToken(ast.SyntaxKind.EqualsGreaterThanToken),
           f.createParenthesizedExpression(body),
         ),
@@ -1615,20 +1619,27 @@ export function generate(
       f.createVariableDeclaration(
         f.createIdentifier('impl'),
         undefined,
-        f.createTypeReferenceNode(f.createIdentifier('FC')),
-        f.createArrowFunction(undefined, undefined, [], undefined,
+        fcType,
+        f.createArrowFunction(undefined, undefined, fnParams, undefined,
           f.createToken(ast.SyntaxKind.EqualsGreaterThanToken),
-          f.createJsxSelfClosingElement(f.createIdentifier('Generated'), undefined, f.createJsxAttributes([])),
+          f.createJsxSelfClosingElement(
+            f.createIdentifier('Generated'),
+            undefined,
+            f.createJsxAttributes(boundKeys.length === 0 ? [] : [
+              f.createJsxSpreadAttribute(f.createIdentifier('props')),
+            ]),
+          ),
         ),
       ),
     ], nodeFlagsConst),
   )
-  const sourceFile = f.createSourceFile(
-    [fcImport, ...importStatements, generatedFn, implExport],
-    f.createToken(ast.SyntaxKind.EndOfFile),
-    '',
-    '/__pixpec_generated.tsx' as ast.Path,
-    '/__pixpec_generated.tsx' as ast.Path,
-  )
-  return printSourceFile(sourceFile)
+  // Print each top-level statement individually and join. Cannot use a
+  // synthetic SourceFile here: tsgo's printer panics in
+  // `scanner.SkipTriviaEx` when the SourceFile entry path tries to read
+  // trivia from an empty `text` against synthetic (pos=-1) child nodes.
+  // Statement-level entry skips that path entirely. Prettier reformats
+  // the joined output downstream so layout differences don't matter.
+  const statements: ast.Statement[] = [fcImport, ...importStatements, generatedFn, implExport]
+  const jsx = statements.map(printNode).join('\n') + '\n'
+  return { jsx, usedPropBindings: ctx.usedPropBindings }
 }

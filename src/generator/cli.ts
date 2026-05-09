@@ -21,14 +21,21 @@
  */
 import { writeFile, mkdir } from 'node:fs/promises'
 import { resolve } from 'node:path'
+import { parse as parseToml } from 'smol-toml'
 import { loadConfig } from '../init.ts'
 import type { Component } from '../types.ts'
 import { walk, buildRegistry } from './walker.ts'
 import { generate } from './codegen.ts'
 import type { IRNode } from './ir.ts'
+import { API } from '@typescript/native-preview/sync'
+import type * as ast from '@typescript/native-preview/ast'
 
 const isComponent = (v: unknown): v is Component<unknown> =>
-  !!v && typeof v === 'object' && 'name' in v && 'cases' in v && 'noise' in v
+  // Accept both new (`variants`) and legacy (`cases`) component shapes
+  // — registration only needs name + figma binding to bridge IR walking,
+  // not the test-case data. Components mid-migration can keep their old
+  // exports while still getting walked.
+  !!v && typeof v === 'object' && 'name' in v && 'noise' in v && ('variants' in v || 'cases' in v)
 
 export interface FigmaPayload {
   ir: IRNode
@@ -61,7 +68,16 @@ export async function discoverComponents(root: string, componentsDir: string): P
 
 export async function runGenerate(
   nodeId: string,
-  opts: { tab?: string; name?: string; payload?: FigmaPayload; components?: Component<unknown>[] } = {},
+  opts: {
+    tab?: string
+    name?: string
+    payload?: FigmaPayload
+    components?: Component<unknown>[]
+    /** Per-figma-node binding map — generate consumes the variant's
+     * bindings spec to annotate IR nodes during walk. When omitted,
+     * runGenerate auto-discovers via the owning component's cases.ts. */
+    bindings?: Record<string, import('../types.ts').NodeBinding<unknown>>
+  } = {},
 ): Promise<{ jsx: string; ir: IRNode; componentDir: string; componentName: string }> {
   const { cfg, root } = await loadConfig()
   const componentName = opts.name ?? `Gen_${nodeId.replace(/[^A-Za-z0-9]/g, '_')}`
@@ -105,12 +121,17 @@ export async function runGenerate(
     console.log(`[generate] using cached IR (.pixpec-out/_breakdown-cache/ir/${nodeId.replace(/[^A-Za-z0-9]/g, '_')}.json)`)
   } else {
     if (!cfg.cfigmaBin) throw new Error('pixpec.toml: cfigmaBin required (no cached IR for this nodeId)')
-    const ir = await walk({ cfigmaBin: cfg.cfigmaBin, tab, nodeId, registry, walkExtend })
+    const fileKey = await getFileKey(cfg.cfigmaBin, tab)
+    // Discover the owning component's variant bindings for this nodeId
+    // (caller can override via opts.bindings). Walker stamps each
+    // matching IR node with `boundProp` / `boundProps` so codegen emits
+    // `{props.<key>}` instead of master literals.
+    const bindings = opts.bindings ?? await discoverVariantBindings(root, componentsDir, `${fileKey}:${nodeId}`)
+    const ir = await walk({ cfigmaBin: cfg.cfigmaBin, tab, nodeId, registry, walkExtend, bindings })
     if (ir.kind === 'text') {
       throw new Error(`Cannot generate from a bare TEXT node. figma exportAsync trims to ink bbox (render bounds), making dim-parity with chromium's line-box impossible. Wrap the text in a frame first, then generate from the frame's nodeId.`)
     }
     await resolveImages(ir, tab)
-    const fileKey = await getFileKey(cfg.cfigmaBin, tab)
     const wrapper = await getNodeDim(cfg.cfigmaBin, tab, nodeId)
     payload = { ir, fileKey, wrapper }
   }
@@ -160,7 +181,103 @@ export async function runGenerate(
     }
     console.log(`[generate] loaded ${Object.keys(tokenMap).length} design-token bindings (${Object.keys(tokenValueMap).length} numeric)`)
   } catch { /* optional */ }
-  const jsx = generate(ir, components, typographyMap, tokenMap, plugins, cfg.remBase, tokenValueMap)
+  // Font registry: pixpec mandates `src/fonts/<name>/meta.toml` per font.
+  // Each meta.toml declares the canonical `family` and (optionally) per-fs
+  // `[yShift]` calibration. cli.ts is the only TOML reader — for the
+  // browser harness we serialize the verify-mode data into a JSON file
+  // (`src/fonts/__pixpec-fonts.json`) so the harness needs neither a TOML
+  // parser nor knowledge of pixpec's spec.
+  const registeredFonts = new Set<string>()
+  const fontMetas: Array<{ family: string; yShift?: Record<string, number> }> = []
+  try {
+    const fs = await import('node:fs/promises')
+    const fontsRoot = resolve(root, 'src/fonts')
+    const ents = await fs.readdir(fontsRoot, { withFileTypes: true }).catch(() => [])
+    for (const ent of ents) {
+      if (!ent.isDirectory()) continue
+      const metaPath = resolve(fontsRoot, ent.name, 'meta.toml')
+      try {
+        const raw = await fs.readFile(metaPath, 'utf8')
+        const parsed = parseToml(raw) as Record<string, unknown>
+        if (typeof parsed.family !== 'string') {
+          throw new Error(`${metaPath}: missing 'family' (string)`)
+        }
+        registeredFonts.add(parsed.family)
+        const yShift: Record<string, number> = {}
+        if (parsed.yShift && typeof parsed.yShift === 'object') {
+          for (const [k, v] of Object.entries(parsed.yShift as Record<string, unknown>)) {
+            if (typeof v === 'number') yShift[k] = v
+          }
+        }
+        fontMetas.push({ family: parsed.family, yShift: Object.keys(yShift).length ? yShift : undefined })
+      } catch (e) {
+        if ((e as NodeJS.ErrnoException).code === 'ENOENT') continue
+        throw e
+      }
+    }
+    if (registeredFonts.size > 0) {
+      console.log(`[generate] loaded ${registeredFonts.size} font(s) from src/fonts/*/meta.toml: ${[...registeredFonts].map((f) => JSON.stringify(f)).join(', ')}`)
+      // Emit a CSS file that the project's global stylesheet imports.
+      // pixpec is the single source of truth for @font-face — the project
+      // just `@import`s. Re-reading meta.toml on each generate keeps the
+      // CSS in lockstep with the font directory.
+      const cssLines: string[] = ['/* AUTO-GENERATED by pixpec from src/fonts/*/meta.toml — do not edit. */']
+      for (const ent of ents) {
+        if (!ent.isDirectory()) continue
+        const metaPath = resolve(fontsRoot, ent.name, 'meta.toml')
+        try {
+          const raw = await fs.readFile(metaPath, 'utf8')
+          const m = parseToml(raw) as Record<string, unknown>
+          if (typeof m.family !== 'string' || typeof m.file !== 'string') continue
+          const fmt = typeof m.format === 'string' ? m.format : 'truetype'
+          const weight = Array.isArray(m.weightRange)
+            ? `${m.weightRange[0]} ${m.weightRange[1]}`
+            : (typeof m.weight === 'number' || typeof m.weight === 'string') ? String(m.weight) : '400'
+          const style = typeof m.style === 'string' ? m.style : 'normal'
+          cssLines.push(
+            `@font-face {`,
+            `  font-family: '${m.family}';`,
+            `  src: url('./${ent.name}/${m.file}') format('${fmt}');`,
+            `  font-weight: ${weight};`,
+            `  font-style: ${style};`,
+            `  font-display: block;`,
+            `}`,
+          )
+        } catch { /* already reported above */ }
+      }
+      await fs.writeFile(resolve(fontsRoot, '__pixpec-fonts.css'), cssLines.join('\n') + '\n')
+      // Emit Y_SHIFT JSON for the harness (verify-only). CSS can't express
+      // per-fontSize translateY, so the runtime applies it via JS.
+      await fs.writeFile(
+        resolve(fontsRoot, '__pixpec-fonts.json'),
+        JSON.stringify({ fonts: fontMetas }, null, 2) + '\n',
+      )
+    }
+  } catch (e) {
+    console.warn(`[generate] font registry load failed: ${(e as Error).message}`)
+  }
+  // Run IR-level rules (e.g., font registry coverage) before codegen so
+  // failures point at the figma node, not the emitted JSX.
+  const { validateIR } = await import('./validator.ts')
+  validateIR(ir, { registeredFonts })
+  // IR carries binding annotations on its TEXT/Component nodes (set by
+  // walker from the variant's bindings spec); codegen reads those and
+  // emits `props.<key>` references. Pure transform — no FS access here.
+  // Boot tsgo Emitter to print factory-built AST. tsgo is a Go subprocess
+  // (spawned by @typescript/native-preview), so we open one snapshot for the
+  // current project and reuse its emitter for all printNode calls in this
+  // generate run. Closed in the finally below.
+  const tsgoApi = new API({ cwd: root })
+  let jsx: string
+  try {
+    const snap = tsgoApi.updateSnapshot({ openProject: resolve(root, 'tsconfig.json') })
+    const proj = snap.getProjects()[0]
+    if (!proj) throw new Error('[generate] tsgo: no project loaded from tsconfig.json')
+    const printNode = (node: ast.Node) => proj.emitter.printNode(node)
+    ;({ jsx } = generate(ir, components, printNode, typographyMap, tokenMap, plugins, cfg.remBase, tokenValueMap))
+  } finally {
+    tsgoApi.close()
+  }
 
   await mkdir(componentDir, { recursive: true })
   // Format generator output with Prettier so the source is human-reviewable.
@@ -177,19 +294,29 @@ export async function runGenerate(
 ${jsx}export interface GeneratedProps {}
 `
   await writeFile(resolve(componentDir, 'impl.tsx'), await fmt(implRaw, 'babel-ts'))
+  const figmaIdLit = JSON.stringify(`${fileKey}:${nodeId}`)
+  const wrapperLit = `boxWrapper({ ${wrapper.width !== undefined ? `width: ${wrapper.width}, ` : ''}${wrapper.height !== undefined ? `height: ${wrapper.height}, ` : ''}padding: 0, bg: '#ffffff' })`
+  // BD has exactly one usecase (the rendered node itself). Wrap it in a
+  // synthetic Variant whose key = the figmaId — Variant.key is normally
+  // figma's cross-file durable variant key, but for an arbitrary BD node
+  // the figmaId itself is unique enough to identify the bucket.
   const casesRaw =
 `// AUTO-GENERATED by \`pixpec generate ${nodeId}\`.
-import type { Case } from 'pixpec/spec'
+import type { Variant } from 'pixpec/spec'
 import { boxWrapper } from 'pixpec/spec'
 import type { GeneratedProps } from './impl.tsx'
 
-export const cases: Case<GeneratedProps>[] = [
+export const variants: Variant<GeneratedProps>[] = [
   {
-    name: ${JSON.stringify(`${componentName}_main`)},
-    props: {},
-    fileKey: ${JSON.stringify(fileKey)},
-    nodeId: ${JSON.stringify(nodeId)},
-    wrapper: boxWrapper({ ${wrapper.width !== undefined ? `width: ${wrapper.width}, ` : ''}${wrapper.height !== undefined ? `height: ${wrapper.height}, ` : ''}padding: 0, bg: '#ffffff' }),
+    key: ${figmaIdLit},
+    usecases: [
+      {
+        props: {},
+        figmaId: ${figmaIdLit},
+        wrapper: ${wrapperLit},
+        isMainCase: true,
+      },
+    ],
   },
 ]
 `
@@ -204,14 +331,14 @@ export const cases: Case<GeneratedProps>[] = [
     await writeFile(indexPath,
 `// AUTO-GENERATED.
 import { defineComponent, dE00 } from 'pixpec/spec'
-import { cases } from './cases.ts'
+import { variants } from './cases.ts'
 import type { GeneratedProps } from './impl.tsx'
 
 export type { GeneratedProps }
 
 export const ${componentName} = defineComponent<GeneratedProps>({
   name: ${JSON.stringify(componentName)},
-  cases,
+  variants,
   noise: () => dE00(1e6), // generator output: pass-through, dE checked manually
 })
 `)
@@ -235,6 +362,17 @@ export const ${componentName} = defineComponent<GeneratedProps>({
 export async function buildRootPayload(
   rootNodeId: string,
   tab: string,
+  opts: {
+    expandRootInstance?: boolean
+    expandAllInstances?: boolean
+    /** Per-node binding map (typically discovered from the owning
+     * component's cases.ts variant entry) — passed to walker so the
+     * emitted IR carries `boundProp` / `boundProps` annotations. */
+    bindings?: Record<string, {
+      attr?: { text?: string; color?: string; visible?: string }
+      instanceProps?: Record<string, string>
+    }>
+  } = {},
 ): Promise<{ ir: IRNode; fileKey: string }> {
   const { cfg, root } = await loadConfig()
   if (!cfg.cfigmaBin) throw new Error('pixpec.toml: cfigmaBin required')
@@ -249,9 +387,15 @@ export async function buildRootPayload(
     plugins = mod.default?.plugins ?? mod.plugins ?? []
   }
   const walkExtend = plugins.map(p => p.walkExtend ?? '').filter(Boolean).join('\n')
-  const ir = await walk({ cfigmaBin: cfg.cfigmaBin, tab, nodeId: rootNodeId, registry, walkExtend })
-  await resolveImages(ir, tab)
+  // Resolve fileKey first (cheap cfigma call) so we can find the owning
+  // component's variant bindings via cases.ts BEFORE walking. Walker
+  // stamps the matching IR nodes with annotations → codegen emits
+  // parametric prop refs without any post-processing.
   const fileKey = await getFileKey(cfg.cfigmaBin, tab)
+  const bindings = opts.bindings
+    ?? await discoverVariantBindings(root, componentsDir, `${fileKey}:${rootNodeId}`)
+  const ir = await walk({ cfigmaBin: cfg.cfigmaBin, tab, nodeId: rootNodeId, registry, walkExtend, expandRootInstance: opts.expandRootInstance, expandAllInstances: opts.expandAllInstances, bindings })
+  await resolveImages(ir, tab)
   return { ir, fileKey }
 }
 
@@ -298,6 +442,41 @@ export function* walkIrSubtrees(ir: IRNode): Iterable<{ id: string; ir: IRNode }
   if (ir.kind === 'frame') {
     for (const c of ir.children) yield* walkIrSubtrees(c)
   }
+}
+
+/** Walk components dirs, find the cases.ts whose variant.usecases
+ * contain this `<fileKey>:<nodeId>` figmaId, and return that variant's
+ * `bindings` map (or undefined if no owner / no bindings). Pure-data
+ * lookup so the codegen / walker chain stays FS-free downstream. */
+async function discoverVariantBindings(
+  root: string,
+  componentsDir: string,
+  figmaId: string,
+): Promise<Record<string, { attr?: { text?: string; color?: string; visible?: string }; instanceProps?: Record<string, string> }> | undefined> {
+  const fs = await import('node:fs')
+  const fsp = await import('node:fs/promises')
+  const path = await import('node:path')
+  const { pathToFileURL } = await import('node:url')
+  const componentsPath = path.resolve(root, componentsDir)
+  if (!fs.existsSync(componentsPath)) return undefined
+  const ents = await fsp.readdir(componentsPath, { withFileTypes: true })
+  for (const ent of ents) {
+    if (!ent.isDirectory() || ent.name.startsWith('BD_')) continue
+    const casesPath = path.resolve(componentsPath, ent.name, 'cases.ts')
+    if (!fs.existsSync(casesPath)) continue
+    const src = await fsp.readFile(casesPath, 'utf8')
+    if (!src.includes(`"${figmaId}"`) && !src.includes(`'${figmaId}'`)) continue
+    try {
+      const mod = await import(`${pathToFileURL(casesPath).href}?t=${Date.now()}`) as {
+        variants?: Array<{ key: string; bindings?: Record<string, { attr?: { text?: string; color?: string; visible?: string }; instanceProps?: Record<string, string> }>; usecases: Array<{ figmaId: string }> }>
+      }
+      const matchingVariant = mod.variants?.find((v) => v.usecases.some((u) => u.figmaId === figmaId))
+      return matchingVariant?.bindings
+    } catch {
+      return undefined
+    }
+  }
+  return undefined
 }
 
 function standaloneRoot(ir: IRNode): IRNode {
