@@ -25,11 +25,37 @@ export interface WalkOptions {
    * the cfigma exec script — runs after the IR is built for each node, with
    * `node` (live FigmaNode) and `ir` (the just-built IR object) in scope. */
   walkExtend?: string
+  /** When true, the root nodeId — even if it's a registered INSTANCE — gets
+   * walked as a FRAME (full layout + children IR captured) instead of
+   * collapsed to `kind: 'component'`. Used by breakdown-prepare so verify
+   * can render the root from IR alone, without depending on the registered
+   * React impl. Nested INSTANCEs of the same registered set still emit as
+   * `kind: 'component'`. */
+  expandRootInstance?: boolean
+  /** When true, EVERY INSTANCE (root + nested) walks as a FRAME — codegen
+   * never emits a registered React component, IR carries the full tree.
+   * Used when verifying a container whose children's React impls aren't
+   * synthesized yet (e.g. Tab containing TabItem before the per-variant
+   * compose step) — sidesteps the missing impl with raw IR rendering. */
+  expandAllInstances?: boolean
+  /** Per-figma-node binding map (Variant.bindings shape). Walker stamps
+   * each matching IR node with `boundProp` (TEXT) / `boundProps`
+   * (Component) annotations so codegen emits `{props.<key>}` instead
+   * of the master literal. Caller (generate) discovers this via the
+   * owning component's cases.ts; walker just consumes the map. */
+  bindings?: Record<string, {
+    attr?: { text?: string; color?: string; visible?: string }
+    instanceProps?: Record<string, string>
+  }>
 }
 
 export async function walk(opts: WalkOptions): Promise<IRNode> {
   const code = `
 const REGISTRY = ${JSON.stringify(opts.registry)};
+const ROOT_ID = ${JSON.stringify(opts.nodeId)};
+const EXPAND_ROOT_INSTANCE = ${opts.expandRootInstance ? 'true' : 'false'};
+const EXPAND_ALL_INSTANCES = ${opts.expandAllInstances ? 'true' : 'false'};
+const BINDINGS = ${JSON.stringify(opts.bindings ?? {})};
 function pixpecPropName(name) {
   const stripped = String(name).replace(/[\\x00-\\x1f\\x7f]/g, '').replace(/#[^#]*$/, '').trim();
   const parts = stripped.split(/[^A-Za-z0-9]+/).filter(Boolean);
@@ -98,7 +124,11 @@ async function __pixpecIr(node) {
         if (target.type === 'TEXT' && (
           fields.includes('fontName') ||
           fields.includes('fontSize') ||
-          fields.includes('fills')
+          fields.includes('fills') ||
+          // textStyleId rebind cascades fontSize/font/lineHeight/etc. from
+          // the new style — same effective divergence as a direct font
+          // override, so detach and walk the actual text properties.
+          fields.includes('textStyleId')
         )) return true;
         // DESCENDANT FIXED-sized dim override — designer scaled an inner
         // node off its master dim (figma "drag corner" on a child). The
@@ -137,7 +167,11 @@ async function __pixpecIr(node) {
       }
       return false;
     })();
-    if (structural) {
+    // expandRootInstance: caller (breakdown-prepare) wants the root walked
+    // as a frame so verify can render from IR alone, not via the registered
+    // React impl. Nested same-set INSTANCEs are unaffected.
+    const expandThisRoot = EXPAND_ROOT_INSTANCE && node.id === ROOT_ID;
+    if (structural || expandThisRoot || EXPAND_ALL_INSTANCES) {
       // Fall through to FRAME-style walking. INSTANCE's children/.layoutMode/etc.
       // already reflect overrides applied on top of the master.
       // Drop into the FRAME branch by treating the node as if type were FRAME.
@@ -145,6 +179,57 @@ async function __pixpecIr(node) {
     const props = {};
     for (const [k, v] of Object.entries(node.componentProperties)) {
       pixpecSetProp(props, k, v.value);
+    }
+    // Capture every TEXT-characters override on the instance keyed by the
+    // master-relative descendant id (figma reports instance child ids as
+    // I<inst>;<masterDescId> -- strip prefix). The registered component's
+    // propsFromFigma reads textOverrides[descId] when init detected the
+    // single-varying-text pattern and bound it to a typed prop (commonly
+    // "label"). Walker stays shape-agnostic; init owns the binding.
+    const textOverrides = {};
+    // Key textOverrides by the TEXT layer NAME instead of master descId.
+    // Layer names stay constant across variants (figma copies child names
+    // when authoring variants); ids diverge per variant copy. Looking up
+    // by name in propsFromFigma collapses N variant id branches to one
+    // string lookup. Last write wins on same-name duplicates (rare; init
+    // surfaces ambiguity in detection).
+    const nestedProps = {};
+    const isOwn = (n) => {
+      let pp = n.parent;
+      while (pp && pp.id !== node.id) {
+        if (pp.type === 'INSTANCE') return false;
+        pp = pp.parent;
+      }
+      return true;
+    };
+    for (const ov of (node.overrides || [])) {
+      const fields = ov.overriddenFields || [];
+      const t = await figma.getNodeByIdAsync(ov.id);
+      if (!t) continue;
+      if (t.type === 'TEXT' && fields.includes('characters')) {
+        textOverrides[t.name] = t.characters;
+        continue;
+      }
+      // Nested INSTANCE componentProperties override — capture as
+      // nestedProps[layerName][propKey] = value. Init scan flagged which
+      // (layerName, propKey) pairs to expose; walker just dumps everything.
+      if (t.type === 'INSTANCE' && isOwn(t) && fields.includes('componentProperties')) {
+        const layer = nestedProps[t.name] = nestedProps[t.name] || {};
+        for (const [pk, pv] of Object.entries(t.componentProperties || {})) {
+          layer[pk] = pv.value;
+        }
+      }
+    }
+    // Snapshot children as IR — passed as second arg to propsFromFigma so
+    // DS components that wrap N nested instances (Tab → Tab_Items) can
+    // navigate the tree and extract per-child data into array props.
+    const snapshotChildren = [];
+    if (node.children) {
+      for (const c of node.children) {
+        if (c.visible === false) continue;
+        const childIr = await ir(c);
+        if (childIr) snapshotChildren.push(childIr);
+      }
     }
     // Component-set-level defaults (componentPropertyDefinitions). Codegen
     // uses these to omit redundant prop emissions on the instance.
@@ -165,21 +250,46 @@ async function __pixpecIr(node) {
     const sizingV = mapSizing(node.layoutSizingVertical);
     const mainSizingH = mapSizing(node.mainComponent?.layoutSizingHorizontal);
     const mainSizingV = mapSizing(node.mainComponent?.layoutSizingVertical);
+    // Layout-property overrides on the instance — figma instances can change
+    // padding/gap/alignment without detaching. Capture only the keys whose
+    // value diverges from the master so codegen can forward them as style
+    // props on the registered component invocation. (Empty object → no
+    // override; codegen skips emit.)
+    const main = node.mainComponent;
+    const layoutOverride = {};
+    const cmpNum = (k, instV, mainV) => {
+      if (typeof instV === 'number' && typeof mainV === 'number' && instV !== mainV) layoutOverride[k] = instV;
+    };
+    cmpNum('paddingTop', node.paddingTop, main && main.paddingTop);
+    cmpNum('paddingRight', node.paddingRight, main && main.paddingRight);
+    cmpNum('paddingBottom', node.paddingBottom, main && main.paddingBottom);
+    cmpNum('paddingLeft', node.paddingLeft, main && main.paddingLeft);
+    cmpNum('gap', node.itemSpacing, main && main.itemSpacing);
+    // Per-node binding annotation: figmaPropKey → ownerPropKey for any
+    // INSTANCE attrs the variant's bindings spec covers (e.g. nested
+    // Icon's Type → owner's iconType prop).
+    const __binding = BINDINGS[node.id];
+    const __boundProps = __binding && __binding.instanceProps;
     return {
       ...base,
       kind: 'component',
       componentName: REGISTRY[key],
+      ...(__boundProps && Object.keys(__boundProps).length ? { boundProps: __boundProps } : {}),
       raw: { id: node.id, name: node.name, mainComponentName: node.mainComponent?.name,
              componentSetKey: key, props, exposed, defaults,
              width: node.width, height: node.height,
              sizingH, sizingV,
              mainWidth: node.mainComponent?.width, mainHeight: node.mainComponent?.height,
-             mainSizingH, mainSizingV },
+             mainSizingH, mainSizingV,
+             textOverrides: Object.keys(textOverrides).length ? textOverrides : undefined,
+             nestedProps: Object.keys(nestedProps).length ? nestedProps : undefined },
       rotation: typeof node.rotation === 'number' && Math.abs(node.rotation) >= 0.01 ? node.rotation : undefined,
       sizingH, sizingV,
       mainSizingH, mainSizingV,
       mainWidth: node.mainComponent?.width, mainHeight: node.mainComponent?.height,
       width: node.width, height: node.height,
+      layoutOverride: Object.keys(layoutOverride).length ? layoutOverride : undefined,
+      children: snapshotChildren.length ? snapshotChildren : undefined,
     };
     } // close else branch — falls through to FRAME walk for detached instances
   }
@@ -375,7 +485,7 @@ async function __pixpecIr(node) {
         color: segFill ? rgbaHex(segFill.color, segFill.opacity ?? 1) : undefined,
         colorTokenId: segFill?.boundVariables?.color?.id,
         fontFamily: typeof seg.fontName?.family === 'string' ? seg.fontName.family : undefined,
-        fontStyle: typeof seg.fontName?.style === 'string' ? seg.fontName.style : undefined,
+        fontWeight: typeof seg.fontWeight === 'number' ? seg.fontWeight : undefined,
         fontSize: typeof seg.fontSize === 'number' ? seg.fontSize : undefined,
         lineHeight: typeof seg.lineHeight === 'object' && seg.lineHeight.unit === 'PIXELS' ? seg.lineHeight.value : undefined,
         textDecoration: typeof seg.textDecoration === 'string' && seg.textDecoration !== 'NONE' ? seg.textDecoration : undefined,
@@ -424,16 +534,22 @@ async function __pixpecIr(node) {
         }
       } catch (_) { /* style fetch failed (deleted style etc.) — skip override diff */ }
     }
+    // Per-node binding annotation: bindings spec may map this node id
+    // to { attr.text: ownerKey } so codegen emits a prop reference
+    // instead of the literal content.
+    const __binding = BINDINGS[node.id];
+    const __boundProp = __binding && __binding.attr && __binding.attr.text;
     return {
       ...base, kind: 'text',
       content: pixpecText,
+      ...(__boundProp ? { boundProp: __boundProp } : {}),
       fontSize: node.fontSize,
-      // Capture figma fontName verbatim — family + style are designer-
-      // authored strings (style is NOT a numeric weight: it can be any
-      // text the designer typed, e.g. "Bold", "400", "Regular Italic").
-      // The DS layer maps style → CSS font-weight if needed.
+      // Capture figma fontName.family verbatim. fontWeight is figma's
+      // resolved numeric CSS weight — no fragile name→number mapping.
+      // Italic is dropped (figma has no separate italic axis; italic faces
+      // are distinct font files exposed via fontName.style — out of scope).
       fontFamily: typeof node.fontName?.family === 'string' ? node.fontName.family : undefined,
-      fontStyle: typeof node.fontName?.style === 'string' ? node.fontName.style : undefined,
+      fontWeight: typeof node.fontWeight === 'number' ? node.fontWeight : undefined,
       lineHeight: typeof node.lineHeight === 'object' && node.lineHeight.unit === 'PIXELS' ? node.lineHeight.value : node.fontSize,
       paragraphSpacing: typeof node.paragraphSpacing === 'number' ? node.paragraphSpacing : 0,
       color: fill ? rgbaHex(fill.color, fill.opacity ?? 1) : '#000000',
@@ -501,6 +617,14 @@ async function __pixpecIr(node) {
       fillTokenId: fill?.boundVariables?.color?.id,
       strokeColor: stroke ? rgbaHex(stroke.color, stroke.opacity ?? 1) : undefined,
       strokeWeight: stroke ? (typeof node.strokeWeight === 'number' ? node.strokeWeight : 1) : 0,
+      // figma strokeCap controls endpoint shape on open paths. ROUND adds
+      // a half-circle (radius = strokeWeight/2) at each endpoint — without
+      // forwarding this, chromium's svg defaults to butt and the line ink
+      // ends square, diverging from figma by ~strokeWeight/2 px on each
+      // side (visible on TabItem's bottom indicator line).
+      ...(stroke && (node.strokeCap === 'ROUND' || node.strokeCap === 'SQUARE')
+        ? { strokeCap: node.strokeCap === 'ROUND' ? 'round' : 'square' }
+        : {}),
       // cornerRadius is figma.mixed (Symbol, non-serializable) when corners
       // differ — capture per-corner values in that case.
       ...(typeof node.cornerRadius === 'number'

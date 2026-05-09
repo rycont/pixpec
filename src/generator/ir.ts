@@ -48,6 +48,10 @@ export interface IRComponent extends IRBase {
   componentName: string
   /** Props produced by Component.figma.propsFromFigma(raw). */
   props: Record<string, unknown>
+  /** prop-key → owning-component prop key. When set, codegen emits the
+   * matching attr as `{props.<ownerKey>}` instead of the literal value
+   * — turning the per-variant tree into a parametric Generated FC. */
+  boundProps?: Record<string, string>
   /** Default-equivalent props (also via propsFromFigma) — for codegen to elide
    * redundant prop emission. Source: figma COMPONENT_SET.componentPropertyDefinitions. */
   defaultProps?: Record<string, unknown>
@@ -66,6 +70,24 @@ export interface IRComponent extends IRBase {
   mainHeight?: number
   width?: number
   height?: number
+  /** Layout-property overrides on the instance — figma lets designers tweak
+   * padding/gap on an instance without detaching. Walker captures only the
+   * keys whose value differs from the master; codegen forwards each as a
+   * style prop on the registered component invocation. The DS component
+   * impl is expected to accept the prop on its root element. */
+  layoutOverride?: {
+    paddingTop?: number
+    paddingRight?: number
+    paddingBottom?: number
+    paddingLeft?: number
+    gap?: number
+  }
+  /** IR children — populated by walker for snapshot purposes (passed as
+   * second arg to `propsFromFigma`). Codegen ignores these (the registered
+   * component impl owns its render); they exist only so DS authors can
+   * extract data the flat `raw` shape can't cover (e.g. labels from N
+   * nested Tab_Item instances). */
+  children?: IRNode[]
   /** Open extension slot — plugin walkExtend hooks attach DS-specific data
    * here (e.g. `effectiveFill` for icons that use currentColor). Plugins
    * read these in their emitWrap to decide whether to wrap the instance. */
@@ -162,7 +184,8 @@ export interface TextRun {
   color?: string
   colorTokenId?: string
   fontFamily?: string
-  fontStyle?: string
+  /** Numeric CSS font-weight resolved by figma (100..900). */
+  fontWeight?: number
   fontSize?: number
   lineHeight?: number
   textDecoration?: string
@@ -171,14 +194,15 @@ export interface TextRun {
 export interface IRText extends IRBase {
   kind: 'text'
   content: string
+  /** When set, codegen emits `{props.<boundProp>}` instead of the literal
+   * `content` — turns a per-variant text node into a parametric prop ref. */
+  boundProp?: string
   fontSize: number
   /** figma `fontName.family` — designer-authored string (e.g.
    * "Wanted Sans Variable", "goorm Sans Code"). Emitted verbatim. */
   fontFamily?: string
-  /** figma `fontName.style` — designer-authored string. NOT a numeric
-   * weight: figma stores it as text the designer typed ("Bold", "400",
-   * "Regular Italic"). DS layer maps to CSS font-weight/font-style. */
-  fontStyle?: string
+  /** figma-resolved CSS font-weight (100..900). */
+  fontWeight?: number
   lineHeight: number
   /** figma `paragraphSpacing` (PIXELS). Inserted between paragraphs (split by
    * `\n` in `content`). Soft-wrapped lines do NOT receive this gap; only hard
@@ -261,6 +285,14 @@ export interface IRShape extends IRBase {
   fillTokenId?: string
   strokeColor?: string
   strokeWeight?: number
+  /** Figma `strokeCap` ('NONE' | 'ROUND' | 'SQUARE' | ARROW_*) — only
+   * meaningful for open paths (lines, vectors). ROUND adds a half-circle
+   * at each endpoint (radius = strokeWeight/2), so it shifts the visible
+   * ink envelope past the geometric endpoints by ~strokeWeight/2 pixels.
+   * Codegen maps this to svg `stroke-linecap`. Without it the chromium
+   * render uses default `butt` and diverges by exactly that margin from
+   * figma's rasterized line endpoints. */
+  strokeCap?: 'butt' | 'round' | 'square'
   borderRadius?: number
   borderRadiusTopLeft?: number
   borderRadiusTopRight?: number

@@ -51,11 +51,58 @@ export type NoiseFn<P> = (props: P) => DE00
  *   fileKey + nodeId — handed to cfigma for export.
  */
 export interface Case<P> {
-  /** Stable, human-readable identifier (used in reports + filenames). */
-  name: string
   props: P
-  fileKey: string
-  nodeId: string
+  /** Combined figma reference `<fileKey>:<nodeId>` — the SOLE identifier
+   * used everywhere downstream: filenames (sanitize → `_`), the harness
+   * `data-case` attribute, the React key, measure-rs's pair key. caseName
+   * was redundant once everything keyed off this; figmaId carries enough
+   * uniqueness, and the figma node label can be re-fetched lazily for
+   * human-facing reports if needed. */
+  figmaId: string
+  /** Marks the master figma node within its variant bucket — the canonical
+   * one whose IR feeds codegen for that variant. Exactly one usecase per
+   * variant should carry this flag. Composition picks the main case's
+   * generated tree and parametrises it for the bucket's other usecases. */
+  isMainCase?: boolean
+}
+
+/** Per-figma-node binding map — generate consumes this to annotate IR
+ * nodes during walk so codegen emits `props.<ownerKey>` JSX expressions
+ * in place of master-baked literals. Keyed by figma node id (within the
+ * variant's master subtree); each entry classifies the bindings by kind
+ * so future detachable-attribute additions slot in cleanly. */
+export interface NodeBinding<P> {
+  /** Direct attrs on the node — text content, color, visible, etc. */
+  attr?: {
+    text?: keyof P & string
+    color?: keyof P & string
+    visible?: keyof P & string
+  }
+  /** componentProperty key (figma's prop name on this INSTANCE) →
+   * owning-component prop key. e.g. `{ Type: 'iconType' }` for a nested
+   * Icon whose Type should track the owner's `iconType` prop. */
+  instanceProps?: Record<string, keyof P & string>
+}
+
+/** A master variant of a registered component — pure addressable
+ *  bucket. Variant carries no render data; the master is one of the
+ *  `usecases` (the entry with `isMainCase: true`). breakdown / codegen /
+ *  verify iterate the variant level (one bucket = one IR codegen
+ *  output); usecases sit nested as runtime data + optional regression.
+ *
+ *  `key` is figma's cross-file durable variant key (the same id figma
+ *  uses internally to resolve published library components). It's
+ *  globally unique and resolvable in any file via
+ *  `figma.importComponentByKeyAsync(key)`, so downstream tooling never
+ *  needs an extra (fileKey + nodeId) lookup to find the master.
+ *
+ *  `bindings` is the per-node owner-prop map init computed during scan
+ *  — generate threads it through walker → codegen so the emitted
+ *  per-variant tree is parametric without any post-processing pass. */
+export interface Variant<P> {
+  key: string
+  bindings?: Record<string, NodeBinding<P>>
+  usecases: Case<P>[]
   /**
    * Optional React component that wraps the impl during render. Owns all
    * styling concerns (dim, padding, bg, color, layout) so the harness/type
@@ -86,7 +133,11 @@ export interface Case<P> {
 interface ComponentBase<P> {
   /** Matches the directory `<componentsDir>/<name>/`. */
   name: string
-  cases: Case<P>[]
+  /** Master variants — what breakdown / codegen / verify iterate. Each
+   *  variant carries a nested `usecases` array of figma instance
+   *  occurrences that map to it; composition consumes the variant level
+   *  only, while usecases feed runtime data + optional regression. */
+  variants: Variant<P>[]
   noise: NoiseFn<P>
   /** CSS selector clipped on screenshot. Default: `#pixpec-target`. */
   clipSelector?: string
@@ -166,7 +217,20 @@ export interface FigmaInstanceRaw {
   mainHeight?: number
   mainSizingH?: 'fixed' | 'hug' | 'fill'
   mainSizingV?: 'fixed' | 'hug' | 'fill'
+  /** Per-descendant TEXT `characters` overrides keyed by master-relative
+   * descendant id (figma reports instance child id as `I<inst>;<masterId>`;
+   * walker strips the prefix). Undefined when no descendant text was
+   * overridden. propsFromFigma reads this when `pixpec init` detected the
+   * single-varying-text pattern and emitted a `label` prop binding. */
+  textOverrides?: Record<string, string>
+  /** Per-(nested-instance-layer-name, propKey) componentProperties overrides
+   * — figma instances can change variant/boolean values on nested instances
+   * (e.g. an Icon child's Type) without detaching. Walker dumps all such
+   * overrides; init's auto-detect picks which (layer, prop) combos are
+   * worth exposing as parent-level props. */
+  nestedProps?: Record<string, Record<string, unknown>>
 }
+
 
 export interface FigmaBinding<P> {
   /** Master ComponentSetNode.key (NOT individual variant key). Pass an array
@@ -174,8 +238,27 @@ export interface FigmaBinding<P> {
    * (e.g. when a remote library was republished under a new key but the old
    * instances still exist in the file). */
   componentSetKey: string | string[]
-  /** Pure function: serialized instance → React props. */
-  propsFromFigma: (raw: FigmaInstanceRaw) => P
+  /** Master ComponentSetNode.id within the source figma file. Optional —
+   * `pixpec init <ComponentName>` reads this to refetch metadata without
+   * the user re-passing the figma node id. The key is the durable cross-
+   * file identifier; this is the in-file node reference (changes if the
+   * master is moved/duplicated to a new file). */
+  componentSetId?: string
+  /** Pure function: serialized instance → React props. The second arg is
+   * the IR node for this instance (with `children` populated through
+   * nested instances) for cases that the flat `raw` shape can't cover —
+   * e.g. a Tab whose `labels: string[]` prop is collected from N nested
+   * Tab_Item children. Most components ignore it. */
+  propsFromFigma: (raw: FigmaInstanceRaw, node?: import('./generator/ir.ts').IRComponent) => P
+}
+
+/** Split a `<fileKey>:<nodeId>` figmaId into its parts. Splits on the
+ * FIRST `:` only — nodeIds themselves contain `:` (e.g. `2127:1825`)
+ * and `;` (nested-instance `I<inst>;<descId>`). */
+export function splitFigmaId(figmaId: string): { fileKey: string; nodeId: string } {
+  const i = figmaId.indexOf(':')
+  if (i < 0) throw new Error(`splitFigmaId: missing ':' separator in '${figmaId}' (expected '<fileKey>:<nodeId>')`)
+  return { fileKey: figmaId.slice(0, i), nodeId: figmaId.slice(i + 1) }
 }
 
 export function defineComponent<P>(c: Component<P>): Component<P> {

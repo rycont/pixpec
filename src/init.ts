@@ -18,16 +18,28 @@ import { dirname, join, resolve } from 'node:path'
 import { parse as parseToml } from 'smol-toml'
 import {
   fetchComponentMeta,
+  listFigmaTabs,
+  scanAllOpenTabsForInit,
   type FigmaComponentMeta,
   type FigmaExposedInstanceSchema,
   type FigmaPropertyDefinition,
   type FigmaPropValue,
   type FigmaVariantMeta,
+  type ChildVariationSample,
 } from './cfigma-meta.ts'
+import type { FigmaInstanceRaw } from './types.ts'
+import type { IRComponent } from './generator/ir.ts'
 
 export interface PixpecConfig {
   figmaFileId: string
+  /** Primary tab pattern — used by single-target commands (dump-figma,
+   * breakdown-prepare default). Equal to `tabPatterns[0]`. */
   tabPattern: string
+  /** All tab patterns the project may need to talk to. init walks this list
+   * trying each until it finds the requested componentId (so a DS that
+   * pulls masters from a separate library file can declare both). Falls
+   * back to `[tabPattern]` for legacy single-tab toml. */
+  tabPatterns: string[]
   /** Where component directories live. Default `src/components`. */
   componentsDir?: string
   /** Override cfigma binary path. */
@@ -58,11 +70,19 @@ export async function loadConfig(start: string = process.cwd()): Promise<{
       const parsed = parseToml(raw) as Record<string, unknown>
       if (typeof parsed.figmaFileId !== 'string')
         throw new Error(`${p}: missing figmaFileId`)
-      if (typeof parsed.tabPattern !== 'string')
-        throw new Error(`${p}: missing tabPattern`)
+      // Accept either `tabPattern: string` (legacy single) or
+      // `tabPatterns: string[]` (multi-tab projects pulling from a library).
+      const tabPatterns: string[] = Array.isArray(parsed.tabPatterns)
+        ? parsed.tabPatterns.filter((x): x is string => typeof x === 'string')
+        : typeof parsed.tabPattern === 'string'
+          ? [parsed.tabPattern]
+          : []
+      if (tabPatterns.length === 0)
+        throw new Error(`${p}: missing tabPattern (or tabPatterns array)`)
       const cfg: PixpecConfig = {
         figmaFileId: parsed.figmaFileId,
-        tabPattern: parsed.tabPattern,
+        tabPattern: tabPatterns[0],
+        tabPatterns,
         componentsDir:
           typeof parsed.componentsDir === 'string'
             ? parsed.componentsDir
@@ -179,6 +199,28 @@ function tsTypeForProp(def: FigmaPropertyDefinition): string {
   }
 }
 
+/** Mirror walker's `pixpecSetProp`: store each componentProperty value
+ * under its full ("Status#1234:0"), short ("Status"), and camelCase
+ * ("status") forms so a generated propsFromFigma can read whichever
+ * form it picked. Used by init when it needs to hydrate a scanned
+ * instance without re-running the whole walker. */
+function normalizeRawProps(componentProperties: Record<string, unknown>): Record<string, unknown> {
+  const out: Record<string, unknown> = {}
+  for (const [name, value] of Object.entries(componentProperties)) {
+    out[name] = value
+    const short = String(name).split('#')[0]
+    if (!(short in out)) out[short] = value
+    const stripped = short.replace(/[\x00-\x1f\x7f]/g, '').trim()
+    const parts = stripped.split(/[^A-Za-z0-9]+/).filter(Boolean)
+    if (parts.length) {
+      const camel = parts[0][0].toLowerCase() + parts[0].slice(1)
+        + parts.slice(1).map((p) => p[0].toUpperCase() + p.slice(1)).join('')
+      if (!(camel in out)) out[camel] = value
+    }
+  }
+  return out
+}
+
 function literalForValue(
   def: FigmaPropertyDefinition,
   value: FigmaPropValue,
@@ -233,6 +275,11 @@ function generateProps(
   componentName: string,
   defs: Record<string, FigmaPropertyDefinition>,
   nestedSchemas: Record<string, FigmaExposedInstanceSchema>,
+  detectedItemsProp?: {
+    propName: string
+    childComponentName: string
+    varyingHydratedKeys: string[]
+  },
 ): string {
   const ownLines = defsToFieldLines(defs)
 
@@ -260,12 +307,30 @@ function generateProps(
     return `/** Exposed nested-instance slot${sourceTag}. */\nexport interface ${name} {\n${lines.join('\n') || '  // no properties'}\n}`
   })
 
-  const propLines = [...ownLines, ...nestedLines].join('\n')
+  // Container pattern (auto-detected): props subset = the keys observed to
+  // vary across same-kind sibling instances. Pulled FROM the child's
+  // already-generated `<Child>Props` interface so types stay in sync —
+  // `Pick<>` on the child means re-init of either component refreshes both.
+  let containerImport = ''
+  let containerLine = ''
+  if (detectedItemsProp) {
+    const camelChild = detectedItemsProp.childComponentName.replace(/[^A-Za-z0-9]/g, '')
+    const propsTypeName = `${camelChild}Props`
+    // Pick is computed bottom-up: init hydrated each scanned child via the
+    // child's own propsFromFigma and kept the keys whose values varied
+    // across siblings. Re-init either side to refresh the surface.
+    const keys = detectedItemsProp.varyingHydratedKeys
+    containerImport = `import type { ${propsTypeName} } from '../${camelChild}/props.ts'\n`
+    containerLine = `  ${detectedItemsProp.propName}?: Array<Pick<${propsTypeName}, ${keys.map((k) => JSON.stringify(k)).join(' | ')}>>`
+  }
+
+  const propLines = [...ownLines, ...nestedLines, ...(containerLine ? [containerLine] : [])].join('\n')
   const allDefs = [defs, ...[...interfaceByKey.values()].map(v => v.schema.propertyDefinitions)]
   const hasInstanceSwap = allDefs.some(d => Object.values(d).some((p) => p.type === 'INSTANCE_SWAP'))
-  const reactNodeImport = hasInstanceSwap ? `import type { ReactNode } from 'react'\n\n` : ''
+  const reactNodeImport = hasInstanceSwap ? `import type { ReactNode } from 'react'\n` : ''
   const subBlock = subInterfaceBlocks.length ? `\n${subInterfaceBlocks.join('\n\n')}\n` : ''
-  return `${reactNodeImport}/**
+  const headerImports = `${reactNodeImport}${containerImport}`
+  return `${headerImports}${headerImports ? '\n' : ''}/**
  * AUTO-GENERATED from figma componentPropertyDefinitions for ${componentName}.
  * Re-run \`pixpec init\` to refresh after figma changes. Hand-edits here will
  * be overwritten — narrow types in impl.tsx instead.
@@ -315,7 +380,7 @@ ${lines.join('\n')}
 }
 
 function generateNoise(componentName: string): string {
-  return `import type { NoiseFn } from 'pixpec/spec'
+  return `import { dE00, type NoiseFn } from 'pixpec/spec'
 import type { ${componentName}Props } from './props.ts'
 
 /**
@@ -324,66 +389,283 @@ import type { ${componentName}Props } from './props.ts'
  * Example shape (depends on the component):
  *   noise: (p) => textLeaf(p.label) + iconLeaf(p.icon, p.size) + base(p.radius, p.stroke)
  */
-export const noise: NoiseFn<${componentName}Props> = () => 0
+export const noise: NoiseFn<${componentName}Props> = () => dE00(0)
 `
+}
+
+/** A generated case row — used both for master variants (dim unknown,
+ * fileKey = library file) and for real usage instances (with figma dim
+ * and the consuming file's fileKey). `signature` is the dedup key. */
+interface CaseRow {
+  /** Combined `<fileKey>:<nodeId>` — the only addressable form Case
+   * carries now (matches the `pixpec init` CLI form). */
+  figmaId: string
+  /** True for variant-row entries (figma master nodes). Emit as
+   * `isMainCase: true` so consumers can pick the bucket's master without
+   * a second sweep through the variants list. */
+  isMain?: boolean
+  /** For variant rows: the figma cross-file durable key — Variant.key in
+   * the emitted cases.ts. For usage rows: the matching master variant's
+   * key (= `inst.mainComponent.key`), used for bucketing under the
+   * right variant without any per-file id translation. */
+  variantKey?: string
+  /** For variant rows only: per-node bindings spec emitted as
+   * `Variant.bindings` in cases.ts. generate threads this through the
+   * walker so IR nodes get parametric annotations. */
+  bindings?: Record<string, { attr?: { text?: string }; instanceProps?: Record<string, string> }>
+  /** Pre-rendered TS object literal (already-formatted prop entries
+   * with `literalForValue`-friendly value forms). */
+  propsLiteral: string
+  /** JSON.stringify of an order-stable {props, width, height} blob. Two
+   * rows with the same signature collapse to one (the first wins). */
+  signature: string
+  /** When the figma usage overrode the root component's sizing (instance
+   * dim differs from master dim), init emits a wrapper that locks the
+   * chromium render to the same width/height — otherwise hug-content
+   * impl would diverge from figma's fixed-size frame. Stored as the
+   * literal source of the wrapper expression so generateCases can drop
+   * it straight into the case object. */
+  wrapperLiteral?: string
+}
+
+function stableSignature(props: Record<string, unknown>, width?: number, height?: number): string {
+  const sorted = Object.keys(props).sort().reduce<Record<string, unknown>>((a, k) => { a[k] = props[k]; return a }, {})
+  return JSON.stringify({ p: sorted, w: width ?? null, h: height ?? null })
 }
 
 function generateCases(
   componentName: string,
   fileKey: string,
   meta: FigmaComponentMeta,
+  usageRows: CaseRow[] = [],
+  // Synthetic-prop hooks detected by usage scan — init injects each master
+  // variant's actual TEXT chars / nested-INSTANCE values so master cases
+  // render identically to figma's master node (otherwise impl falls back to
+  // defaults that are sample-derived, not master-authored).
+  detectedLabelProp?: { name: string },
+  detectedNestedProps: Array<{ propName: string; layerName: string; propKey: string }> = [],
+  // Map of prop key → default value (built from augmentedDefs at the call
+  // site). Variant rows drop fields equal to this map so the emitted
+  // master case props stay slim — impl spreads `{...defaults, ...props}`
+  // and recovers any dropped fields from defaults.ts.
+  defaultsMap: Record<string, unknown> = {},
 ): string {
-  const lines = meta.variants.map((v) => {
-    const propEntries = Object.entries(v.propValues).map(([name, value]) => {
+  // Master variants live in the library file (`fileKey` arg); usage rows
+  // already arrived with their own `figmaId` (per-tab fileKey baked in).
+  const variantRows: CaseRow[] = meta.variants.map((v) => {
+    // Build full hydrated prop set first; emit only the diff vs defaults
+    // (computed below from augmentedDefs). Mirrors usecase emit so case
+    // props stay minimal across both layers.
+    const allProps: Record<string, unknown> = { ...v.propValues }
+    if (detectedLabelProp && v.textLayers) {
+      const chars = v.textLayers[detectedLabelProp.name]
+      if (chars !== undefined) allProps.label = chars
+    }
+    for (const np of detectedNestedProps) {
+      const val = v.nestedProps?.[np.layerName]?.[np.propKey]
+      if (val !== undefined) allProps[np.propName] = val
+    }
+    if (v.layout) {
+      const px2rem = (px: number) => `${+(px / 16).toFixed(6)}rem`
+      for (const k of ['paddingTop','paddingRight','paddingBottom','paddingLeft','gap'] as const) {
+        const val = v.layout[k]
+        if (val != null) allProps[k] = px2rem(val)
+      }
+    }
+    // Drop fields whose value equals the default impl will spread.
+    const slimProps: Record<string, unknown> = {}
+    for (const [k, val] of Object.entries(allProps)) {
+      const defVal = defaultsMap[k] as unknown
+      if (defVal === undefined || JSON.stringify(defVal) !== JSON.stringify(val)) {
+        slimProps[k] = val
+      }
+    }
+    const propEntries = Object.entries(slimProps).map(([name, value]) => {
       const def = meta.propertyDefinitions[name]
-      if (!def) return `    ${propsKey(name)}: ${JSON.stringify(value)}`
-      return `    ${propsKey(name)}: ${literalForValue(def, value)}`
+      if (!def) return `    ${name}: ${JSON.stringify(value)}`
+      return `    ${propsKey(name)}: ${literalForValue(def, value as FigmaPropValue)}`
     })
-    return `  {
-    name: ${JSON.stringify(variantKey(v))},
-    props: {
-${propEntries.join(',\n')}
-    },
-    fileKey: FILE_KEY,
-    nodeId: ${JSON.stringify(v.id)},
-  }`
+    // Lock master variant case to its figma dim so the impl's CSS-flex
+    // hug doesn't drift sub-pixel from figma's layout-engine hug.
+    // boxWrapper rem-converts internally so the verify-mode supersample
+    // applies to the wrapper alongside the codegen'd JSX.
+    const wrapperLiteral = (v.width != null && v.height != null)
+      ? `boxWrapper({ width: ${v.width}, height: ${v.height} })`
+      : undefined
+    // Per-node bindings — for each TEXT layer matching detectedLabelProp
+    // and each nested INSTANCE matching detectedNestedProps, record the
+    // figma node id with its owner-prop key. generate uses these to
+    // annotate IR nodes during walk → codegen emits {props.<key>}.
+    const bindings: Record<string, { attr?: { text?: string }; instanceProps?: Record<string, string> }> = {}
+    if (detectedLabelProp && v.textNodes) {
+      for (const tn of v.textNodes) {
+        if (tn.name === detectedLabelProp.name) {
+          bindings[tn.id] = bindings[tn.id] ?? {}
+          bindings[tn.id].attr = { ...(bindings[tn.id].attr ?? {}), text: 'label' }
+        }
+      }
+    }
+    if (v.nestedNodes) {
+      for (const nn of v.nestedNodes) {
+        for (const np of detectedNestedProps) {
+          if (nn.name !== np.layerName) continue
+          if (!(np.propKey in nn.props)) continue
+          bindings[nn.id] = bindings[nn.id] ?? {}
+          bindings[nn.id].instanceProps = {
+            ...(bindings[nn.id].instanceProps ?? {}),
+            [np.propKey]: np.propName,
+          }
+        }
+      }
+    }
+    return {
+      figmaId: `${fileKey}:${v.id}`,
+      variantKey: v.key,
+      propsLiteral: `{\n${propEntries.join(',\n')}\n    }`,
+      bindings: Object.keys(bindings).length > 0 ? bindings : undefined,
+      // Include w/h so two visually-identical masters with different dims
+      // (e.g. Tab_Item Status=true at 96×64 vs same props at 132×64)
+      // don't collapse to one variant.
+      signature: stableSignature(allProps, v.width, v.height),
+      wrapperLiteral,
+      isMain: true,
+    }
   })
-  return `import type { Case } from 'pixpec/spec'
+  // Hierarchical model:
+  //   variants — every master variant of this component. Each carries a
+  //              nested `usecases` array of figma instance occurrences
+  //              that map to it (instance.mainComponent.id === variant
+  //              figmaId). breakdown + codegen iterate the variant level;
+  //              usecases inside feed runtime data + optional regression.
+  // Composition (impl synthesis) consumes the variant level, never the
+  // nested usecases — those just describe how designers actually used
+  // each variant.
+  const dedup = (rows: CaseRow[]): CaseRow[] => {
+    const seen = new Set<string>()
+    return rows.filter((r) => {
+      if (seen.has(r.signature)) return false
+      seen.add(r.signature)
+      return true
+    })
+  }
+  // Variant is a pure key bucket — no figma id, no render data of its
+  // own. The master figma node becomes ONE of the bucket's `usecases`
+  // (the entry with isMainCase). Bucketing matches by figma's cross-file
+  // durable variant key — usecase.variantKey === variant.key — so no
+  // per-file id translation is ever needed.
+  const allUsecases = dedup([...variantRows, ...usageRows])
+  const knownVariantKeys = new Set(variantRows.map((v) => v.variantKey).filter((k): k is string => !!k))
+  const usecasesByVariant = new Map<string, CaseRow[]>()
+  for (const u of allUsecases) {
+    const key = u.variantKey && knownVariantKeys.has(u.variantKey) ? u.variantKey : '<unknown>'
+    if (!usecasesByVariant.has(key)) usecasesByVariant.set(key, [])
+    usecasesByVariant.get(key)!.push(u)
+  }
+  const renderUsecase = (r: CaseRow) => {
+    const wrap = r.wrapperLiteral ? `\n        wrapper: ${r.wrapperLiteral},` : ''
+    const main = r.isMain ? `\n        isMainCase: true,` : ''
+    return `      {
+        props: ${r.propsLiteral.replace(/\n/g, '\n    ')},
+        figmaId: ${JSON.stringify(r.figmaId)},${wrap}${main}
+      }`
+  }
+  const variantByKey = new Map(variantRows.filter((v) => v.variantKey).map((v) => [v.variantKey!, v]))
+  const renderVariant = (variantKey: string) => {
+    const variant = variantByKey.get(variantKey)
+    const us = usecasesByVariant.get(variantKey) ?? []
+    const bindingsLit = variant?.bindings
+      ? `\n    bindings: ${JSON.stringify(variant.bindings, null, 2).replace(/\n/g, '\n    ')},`
+      : ''
+    return `  {
+    key: ${JSON.stringify(variantKey)},${bindingsLit}
+    usecases: [
+${us.map(renderUsecase).join(',\n')},
+    ],
+  }`
+  }
+  const variantKeys = variantRows.map((v) => v.variantKey).filter((k): k is string => !!k)
+  const needsBoxWrapper = allUsecases.some((r) => r.wrapperLiteral)
+  const wrapperImport = needsBoxWrapper ? `import { boxWrapper } from 'pixpec/spec'\n` : ''
+  return `${wrapperImport}import type { Variant } from 'pixpec/spec'
 import type { ${componentName}Props } from './props.ts'
 
-const FILE_KEY = ${JSON.stringify(fileKey)}
-
-export const cases: Case<${componentName}Props>[] = [
-${lines.join(',\n')},
+/** Master variants — what breakdown / codegen / verify iterate. Each
+ *  carries a nested usecases array of figma instance occurrences that
+ *  map to it (deduped by props+dim). impl is composed from the per-variant
+ *  generated trees; usecases feed the runtime + optional regression. */
+export const variants: Variant<${componentName}Props>[] = [
+${variantKeys.map(renderVariant).join(',\n')},
 ]
 `
 }
 
 function generateIndex(componentName: string, componentSetKey: string | undefined,
-                        defs: Record<string, FigmaPropertyDefinition>): string {
+                        componentSetId: string | undefined,
+                        defs: Record<string, FigmaPropertyDefinition>,
+                        autoLabelLayerName?: string,
+                        detectedItemsProp?: {
+                          propName: string
+                          childComponentName: string
+                          varyingHydratedKeys: string[]
+                        },
+                        detectedNestedProps: Array<{ propName: string; layerName: string; propKey: string }> = []): string {
   // raw.props is already pre-cleaned (walker's pixpecSetProp strips control
   // chars). Just pass through with a type cast to the prop's narrowed type.
   // INSTANCE_SWAP needs user-supplied wiring → emit undefined as a TODO marker.
+  // The synthetic 'label' prop (if init detected the single-text-override
+  // pattern) reads walker's textOverrides[descId] map instead of raw.props
+  // — designer didn't expose the text via figma componentProperties, so
+  // walker keys it by the master descendant id instead.
   const propMappings = Object.entries(defs).map(([name, def]) => {
     const k = propsKey(name)
+    if (name === 'label' && autoLabelLayerName) {
+      // walker keys textOverrides by the TEXT layer NAME, which stays
+      // consistent across master variants (figma copies child names when
+      // authoring variants) — no per-variant id enumeration needed.
+      return `    ${k}: raw.textOverrides?.[${JSON.stringify(autoLabelLayerName)}] as ${componentName}Props[${JSON.stringify(name)}],`
+    }
+    // Auto-detected nested INSTANCE prop — read from
+    // raw.nestedProps[layerName][propKey], populated by walker.
+    const nested = detectedNestedProps.find((n) => n.propName === name)
+    if (nested) {
+      return `    ${k}: raw.nestedProps?.[${JSON.stringify(nested.layerName)}]?.[${JSON.stringify(nested.propKey)}] as ${componentName}Props[${JSON.stringify(name)}],`
+    }
     const access = `raw.props[${JSON.stringify(name)}]`
     if (def.type === 'INSTANCE_SWAP') {
       return `    ${k}: undefined, // INSTANCE_SWAP — wire to a React node lookup`
     }
     return `    ${k}: ${access} as ${componentName}Props[${JSON.stringify(name)}],`
   }).join('\n')
+  // Container array prop — auto-detected. propsFromFigma walks the IR
+  // children (each one is a hydrated nested instance with `.props`
+  // already populated by its OWN propsFromFigma) and pulls only the
+  // varying keys into a Pick<>-shaped object per child.
+  let containerMapping = ''
+  if (detectedItemsProp) {
+    // Child IR's `.props` is already hydrated by the child's own
+    // propsFromFigma → it IS a `<Child>Props`. Pick only the keys init
+    // observed to vary across siblings, matching the parent's Pick<>
+    // type: runtime shape stays in lock-step with the declared interface.
+    const pickFields = detectedItemsProp.varyingHydratedKeys
+      .map((k) => `${k}: c.props?.[${JSON.stringify(k)}]`)
+      .join(', ')
+    containerMapping = `\n    ${detectedItemsProp.propName}: (node?.children ?? [])
+      .filter((c) => c.kind === 'component')
+      .map((c) => ({ ${pickFields} })) as ${componentName}Props[${JSON.stringify(detectedItemsProp.propName)}],`
+  }
+  const fnSig = detectedItemsProp ? '(raw, node)' : '(raw)'
   const figmaBlock = componentSetKey
     ? `,
   figma: {
-    componentSetKey: ${JSON.stringify(componentSetKey)},
-    propsFromFigma: (raw) => ({
-${propMappings}
+    componentSetKey: ${JSON.stringify(componentSetKey)},${componentSetId ? `\n    componentSetId: ${JSON.stringify(componentSetId)},` : ''}
+    propsFromFigma: ${fnSig} => ({
+${propMappings}${containerMapping}
     }),
   }`
     : ''
   return `import { defineComponent } from 'pixpec/spec'
 import { noise } from './noise.ts'
-import { cases } from './cases.ts'
+import { variants } from './cases.ts'
 import { defaults } from './defaults.ts'
 import type { ${componentName}Props } from './props.ts'
 
@@ -392,7 +674,7 @@ export { defaults }
 
 export const ${componentName} = defineComponent<${componentName}Props>({
   name: ${JSON.stringify(componentName)},
-  cases,
+  variants,
   noise,
   defaults${figmaBlock},
 })
@@ -416,11 +698,22 @@ export async function init(opts: {
   skipExisting?: boolean
 }): Promise<InitResult> {
   const { cfg, root } = await loadConfig(opts.cwd)
-  const meta = await fetchComponentMeta({
-    tabPattern: cfg.tabPattern,
-    componentId: opts.componentId,
-    cfigmaBin: cfg.cfigmaBin,
-  })
+  // componentId MUST be `<fileKey>:<nodeId>` (e.g.
+  // "XuZaMcO3FuA8B0GEZRYvLG:2128:1609"). Figma file keys are 20+
+  // alphanumeric chars; node ids contain a colon. Splits on the FIRST
+  // colon. Pinning on fileKey eliminates the ambiguous-tab guessing the
+  // older bare-nodeId form required.
+  const firstColon = opts.componentId.indexOf(':')
+  const head = firstColon > 0 ? opts.componentId.slice(0, firstColon) : ''
+  const nodeId = firstColon > 0 ? opts.componentId.slice(firstColon + 1) : ''
+  if (!head || !nodeId.includes(':') || !/^[A-Za-z0-9]{20,}$/.test(head)) {
+    throw new Error(`pixpec init: componentId must be in <fileKey>:<nodeId> form (e.g. "XuZaMcO3FuA8B0GEZRYvLG:2128:1609"). Got: ${opts.componentId}`)
+  }
+  const explicitFileKey = head
+  const tabs = await listFigmaTabs({ cfigmaBin: cfg.cfigmaBin })
+  const tab = tabs.find((t) => t.key === explicitFileKey)
+  if (!tab) throw new Error(`pixpec init: no open figma tab matches fileKey ${explicitFileKey} (open tabs: ${tabs.map((t) => `${t.title} (${t.key})`).join(', ') || '<none>'})`)
+  const meta = await fetchComponentMeta({ tabPattern: tab.key, componentId: nodeId, cfigmaBin: cfg.cfigmaBin })
   const normalizedMeta = normalizeMetaProps(meta)
   const componentName = pascalize(normalizedMeta.name)
   const componentsDir = resolve(root, cfg.componentsDir ?? 'src/components')
@@ -458,6 +751,222 @@ export async function init(opts: {
       if (!nestedSchemas[slotKey]) nestedSchemas[slotKey] = schema
     }
   }
+
+  // Auto-detect "the only descendant TEXT that varies across instance
+  // usages" → expose as a `label` prop. Spares the design system author
+  // from manually exposing TEXT properties in figma + plumbing
+  // propsFromFigma. Scans every open figma tab so usages in any consuming
+  // file count. Skipped silently when normalizedMeta.key is unset (no
+  // ComponentSet → no instance fan-out to scan).
+  // Single combined scan across all open tabs (parallel) — yields BOTH
+  // label-detection summaries and child-variation samples in one pass.
+  let detectedLabelProp: { name: string; sample: string } | undefined
+  let scanResult: import('./cfigma-meta.ts').InitScanResult | undefined
+  if (normalizedMeta.key) {
+    try {
+      const tScan = Date.now()
+      scanResult = await scanAllOpenTabsForInit({
+        componentSetKey: normalizedMeta.key,
+        cfigmaBin: cfg.cfigmaBin,
+      })
+      console.log(`[init] instance scan complete (${Date.now() - tScan}ms): ${scanResult.textSummaries.length} text summaries, ${scanResult.childVariations.length} container parents`)
+      // 20% threshold: only expose when ≥20% of usages override the value.
+      const THRESHOLD = 0.2
+      const total = scanResult.totalInstances || 1
+      const variable = scanResult.textSummaries.filter((s) => s.overrideCount / total >= THRESHOLD)
+      if (variable.length === 1) {
+        const v = variable[0]
+        detectedLabelProp = { name: v.descName, sample: v.samples[0] }
+        console.log(`[init] detected single-text override pattern (${v.overrideCount}/${total} = ${(v.overrideCount / total * 100).toFixed(0)}%) → exposing as 'label' prop (layer name: ${JSON.stringify(v.descName)})`)
+      } else if (variable.length > 1) {
+        console.log(`[init] ${variable.length} descendant texts cross 20% override threshold — ambiguous, no auto-prop`)
+      }
+    } catch (e) {
+      console.warn(`[init] instance scan failed: ${(e as Error).message}`)
+    }
+  }
+  // Auto-expose nested INSTANCE component properties whose ≥20% of usages
+  // override the master default. propsFromFigma reads them from
+  // `raw.nestedProps[layerName][propKey]`. Prop name = camelCase of
+  // `<layerName><PropKey>` (e.g. Icon's Type → `iconType`).
+  type DetectedNestedProp = {
+    /** TS prop name on the parent component. */
+    propName: string
+    /** figma layer name of the nested INSTANCE (e.g. "Icon"). */
+    layerName: string
+    /** Raw figma componentProperty key (e.g. "Type"). */
+    propKey: string
+    /** Distinct values seen across overrides. Used to emit a union TS type. */
+    samples: unknown[]
+  }
+  const detectedNestedProps: DetectedNestedProp[] = []
+  if (scanResult && scanResult.totalInstances > 0) {
+    const THRESHOLD = 0.2
+    // Skip nested-instance kinds already covered by the container pattern
+    // (e.g. Tab.tabItems already exposes Tab_Item state — exposing
+    // `tabItemStatus` on top is redundant). Container child layer names
+    // come from sample[0].name → grab from childComponentSetName.
+    const containerChildSetName = scanResult.childVariations.length > 0
+      ? scanResult.childVariations[0].childComponentSetName
+      : null
+    for (const ns of scanResult.nestedPropSummaries) {
+      // Threshold against this nested kind's own occurrences (e.g. 47
+      // Tabs × 3 Tab_Items = 141), not the parent count.
+      if (ns.instanceCount === 0 || ns.overrideCount / ns.instanceCount < THRESHOLD) continue
+      if (containerChildSetName && ns.layerName === containerChildSetName) continue
+      // camelCase: lowercase first of layer + camelCase of propKey.
+      // Strip figma key suffix (`#2137:0`) before camelCase — those are
+      // figma internal property ids, not part of the prop name.
+      const cleanPropKey = ns.propKey.replace(/#[^#]*$/, '')
+      const propName = (ns.layerName[0].toLowerCase() + ns.layerName.slice(1)).replace(/[^A-Za-z0-9]/g, '') +
+        cleanPropKey.replace(/[^A-Za-z0-9]+(.)/g, (_, c) => c.toUpperCase()).replace(/^(.)/, (m) => m.toUpperCase())
+      detectedNestedProps.push({ propName, layerName: ns.layerName, propKey: ns.propKey, samples: ns.samples })
+      console.log(`[init] detected nested override (${ns.overrideCount}/${ns.instanceCount} = ${(ns.overrideCount / ns.instanceCount * 100).toFixed(0)}%) → exposing '${propName}' (nested ${ns.layerName}.${ns.propKey})`)
+    }
+  }
+  // Splice the synthetic 'label' definition onto the propertyDefinitions so
+  // generateProps emits the prop alongside figma's own componentProperties.
+  // Defaults for synthetic props (`label`, nested-derived `iconType` etc.)
+  // come from the FIRST master variant's authored values — that's the
+  // canonical "what figma renders when you drop the master in" baseline.
+  // Falls back to samples[0] from the usage scan only if the master itself
+  // doesn't carry the layer/nested-instance (rare; means the variant has
+  // a different structure than the usages init was scanning).
+  const masterVariant = normalizedMeta.variants[0] as FigmaVariantMeta | undefined
+  const augmentedDefs: Record<string, FigmaPropertyDefinition> = { ...normalizedMeta.propertyDefinitions }
+  if (detectedLabelProp) {
+    const masterChars = masterVariant?.textLayers?.[detectedLabelProp.name]
+    augmentedDefs.label = {
+      type: 'TEXT',
+      defaultValue: masterChars ?? detectedLabelProp.sample,
+    }
+  }
+  for (const np of detectedNestedProps) {
+    const masterVal = masterVariant?.nestedProps?.[np.layerName]?.[np.propKey]
+    augmentedDefs[np.propName] = {
+      type: 'VARIANT',
+      defaultValue: (masterVal ?? np.samples[0]) as FigmaPropValue,
+      variantOptions: np.samples.filter((s): s is string => typeof s === 'string'),
+    }
+  }
+  // Master variant autolayout (padding/gap) → defaults so impl spreads
+  // them onto its root via `{ ...defaults, ...props }`. Stored as rem
+  // strings to match the supersample-aware case props.
+  if (masterVariant?.layout) {
+    const px2rem = (px: number) => `${+(px / 16).toFixed(6)}rem`
+    for (const k of ['paddingTop', 'paddingRight', 'paddingBottom', 'paddingLeft', 'gap'] as const) {
+      const val = masterVariant.layout[k]
+      if (val != null) {
+        augmentedDefs[k] = { type: 'TEXT', defaultValue: px2rem(val) }
+      }
+    }
+  }
+
+  // ---- Detect "container of N same-kind children with varying props" ----
+  // Scope (per user direction): only fire when ALL direct children of a
+  // parent instance are INSTANCEs of one componentSet, AND at least one
+  // componentProperty/text-override key varies across siblings within any
+  // scanned parent. The varying keys + child component name become an
+  // array prop on the parent (`<childName>s?: Array<{...}>`) plus a
+  // generated propsFromFigma that walks `node.children` in codegen.
+  // Container pattern is fully bottom-up: the child component must
+  // already be init'd (its `defineComponent` exists with a propsFromFigma
+  // that knows how to map its own raw → typed Props). Init dynamically
+  // imports the child, hydrates each scanned sibling with the child's
+  // OWN propsFromFigma, then diffs the resulting typed objects to find
+  // which child props vary across usages. That set becomes the parent's
+  // `Pick<ChildProps, ...>` — derived from real hydrated values, not from
+  // figma raw keys, so child-only knowledge (label layer name, nested
+  // Icon→iconType remap, etc.) flows up correctly.
+  let detectedItemsProp: undefined | {
+    propName: string
+    childComponentName: string
+    childComponentSetKey: string
+    /** Hydrated TS-prop keys whose values differ across at least one
+     * sibling pair within a parent. These are the keys that go into
+     * the parent's `Pick<ChildProps, ...>`. */
+    varyingHydratedKeys: string[]
+  }
+  // Captured so the post-detect case generator can reuse the same child
+  // hydrator (no need to re-import) when building usage-based cases.
+  let childPropsFromFigma: ((raw: FigmaInstanceRaw, node?: IRComponent) => Record<string, unknown>) | undefined
+  if (normalizedMeta.key && scanResult) {
+    try {
+      const samples = scanResult.childVariations
+      const childKeys = new Set(samples.map((s) => s.childComponentSetKey).filter(Boolean) as string[])
+      if (samples.length > 0 && childKeys.size === 1) {
+        const childKey = [...childKeys][0]
+        const childRawName = samples[0].childComponentSetName ?? samples[0].childComponentName ?? 'Child'
+        const childComponentName = pascalize(childRawName)
+        // Locate the already-init'd child dir and import its defineComponent.
+        const childDir = join(componentsDir, childComponentName)
+        const childIndex = join(childDir, 'index.ts')
+        let childMod: { [k: string]: unknown }
+        try {
+          const { pathToFileURL } = await import('node:url')
+          childMod = await import(pathToFileURL(childIndex).href) as { [k: string]: unknown }
+        } catch (e) {
+          throw new Error(
+            `child component '${childComponentName}' must be init'd first ` +
+            `(expected '${childIndex}'). Run \`pixpec init <fileKey>:${childKey}\` ` +
+            `before initing this container. Underlying error: ${(e as Error).message}`,
+          )
+        }
+        const childExport = childMod[childComponentName] as
+          | { figma?: { propsFromFigma?: (raw: FigmaInstanceRaw, node?: IRComponent) => Record<string, unknown> } }
+          | undefined
+        const propsFromFigma = childExport?.figma?.propsFromFigma
+        if (typeof propsFromFigma !== 'function') {
+          throw new Error(`child '${childComponentName}' has no figma.propsFromFigma — re-init it`)
+        }
+        // Hydrate every scanned child via the child's own propsFromFigma,
+        // then diff per-parent. Aggregate varying keys across all parents.
+        const varyingHydrated = new Set<string>()
+        const dummyRect = { x: 0, y: 0, width: 0, height: 0 }
+        for (const s of samples) {
+          if (s.children.length < 2) continue
+          const hydrated = s.children.map((c) => {
+            const raw: FigmaInstanceRaw = {
+              id: '', name: '', mainComponentName: '', componentSetKey: childKey,
+              props: normalizeRawProps(c.componentProperties) as Record<string, string | boolean>,
+              exposed: [],
+              textOverrides: c.textOverrides,
+              nestedProps: c.nestedProps,
+            }
+            const node: IRComponent = {
+              kind: 'component', componentSetKey: childKey, props: {},
+              children: [], rect: dummyRect,
+            } as unknown as IRComponent
+            try { return propsFromFigma(raw, node) } catch { return {} }
+          })
+          const allKeys = new Set<string>()
+          for (const h of hydrated) for (const k of Object.keys(h)) allKeys.add(k)
+          for (const k of allKeys) {
+            const vals = new Set(hydrated.map((h) => JSON.stringify(h[k] ?? null)))
+            if (vals.size > 1) varyingHydrated.add(k)
+          }
+        }
+        if (varyingHydrated.size > 0) {
+          childPropsFromFigma = propsFromFigma
+          const propName = (childComponentName[0].toLowerCase() + childComponentName.slice(1) + 's').replace(/[^A-Za-z0-9]/g, '')
+          detectedItemsProp = {
+            propName,
+            childComponentName,
+            childComponentSetKey: childKey,
+            varyingHydratedKeys: [...varyingHydrated],
+          }
+          console.log(
+            `[init] detected container pattern: ${samples.length} parent instance(s), ` +
+            `all children are ${childComponentName} → exposing as ` +
+            `'${propName}: Array<Pick<${childComponentName}Props, ${[...varyingHydrated].join(' | ')}>>' ` +
+            `(hydrated via ${childComponentName}.propsFromFigma)`,
+          )
+        }
+      }
+    } catch (e) {
+      console.warn(`[init] container-pattern scan failed: ${(e as Error).message}`)
+    }
+  }
   // impl.tsx + noise.ts are stubs (or preserved from a prior run via
   // skipExisting + preservedImpl/preservedNoise above).
   await writeStub(
@@ -467,21 +976,166 @@ export async function init(opts: {
   )
   await writeStub(join(componentDir, 'noise.ts'), generateNoise(componentName), preservedNoise)
   // props.ts / cases.ts / defaults.ts / index.ts always rewritten — mirrors figma.
+  // Format every emit with prettier so the output stays human-reviewable.
+  const prettier = await import('prettier')
+  const fmt = (src: string) =>
+    prettier.format(src, { parser: 'typescript', semi: false, singleQuote: true, printWidth: 100 })
   await writeFile(
     join(componentDir, 'props.ts'),
-    generateProps(componentName, normalizedMeta.propertyDefinitions, nestedSchemas),
+    await fmt(generateProps(componentName, augmentedDefs, nestedSchemas, detectedItemsProp)),
   )
+  // Usage-based cases — one row per real INSTANCE of this component
+  // anywhere across the configured tabs. We replicate the same logic
+  // init wrote into propsFromFigma (own componentProperties → camelCase,
+  // auto-detected `label` from textOverrides[layerName], detected
+  // nested-INSTANCE props from nestedProps[layer][propKey], and — when
+  // the component is a container — `Pick<ChildProps>` items hydrated
+  // via the child's own propsFromFigma). Master variants + usages then
+  // share a single dedup pass keyed by {props, width, height}.
+  const usageRows: CaseRow[] = []
+  if (scanResult) {
+    const dummyRect = { x: 0, y: 0, width: 0, height: 0 }
+    const ownPropKeys = Object.keys(normalizedMeta.propertyDefinitions)
+    // Index containerVariations by parent id so non-container usages
+    // skip the children walk (they have no container array prop).
+    const containerByParentId = new Map<string, ChildVariationSample>()
+    if (detectedItemsProp) {
+      for (const s of scanResult.childVariations) {
+        if (s.childComponentSetKey === detectedItemsProp.childComponentSetKey) {
+          containerByParentId.set(s.parentId, s)
+        }
+      }
+    }
+    for (const u of scanResult.usages) {
+      const rawProps = normalizeRawProps(u.componentProperties)
+      const fullProps: Record<string, unknown> = {}
+      for (const name of ownPropKeys) {
+        const k = propsKey(name)
+        // Auto-detected `label` reads from textOverrides keyed by layer
+        // name, mirroring the propsFromFigma generator.
+        if (k === 'label' && detectedLabelProp) {
+          const v = u.textOverrides[detectedLabelProp.name]
+          if (v !== undefined) fullProps[k] = v
+          continue
+        }
+        // figma componentProperties — accept any of the key forms
+        // normalizeRawProps populated.
+        if (k in rawProps) fullProps[k] = rawProps[k]
+        else if (name in rawProps) fullProps[k] = rawProps[name]
+      }
+      // Auto-detected nested INSTANCE props (e.g. iconType ← Icon.Type).
+      for (const np of detectedNestedProps) {
+        const v = u.nestedProps[np.layerName]?.[np.propKey]
+        if (v !== undefined) fullProps[np.propName] = v
+      }
+      // Container array prop — only for parents whose children matched
+      // the container shape during scan. Non-container components and
+      // container parents missing from the scan leave the field unset.
+      if (detectedItemsProp && childPropsFromFigma) {
+        const cv = containerByParentId.get(u.id)
+        if (cv) {
+          const items = cv.children.map((c) => {
+            const raw: FigmaInstanceRaw = {
+              id: '', name: '', mainComponentName: '',
+              componentSetKey: detectedItemsProp!.childComponentSetKey,
+              props: normalizeRawProps(c.componentProperties) as Record<string, string | boolean>,
+              exposed: [],
+              textOverrides: c.textOverrides,
+              nestedProps: c.nestedProps,
+            }
+            const node: IRComponent = {
+              kind: 'component', componentSetKey: detectedItemsProp!.childComponentSetKey,
+              props: {}, children: [], rect: dummyRect,
+            } as unknown as IRComponent
+            let hydrated: Record<string, unknown> = {}
+            try { hydrated = childPropsFromFigma!(raw, node) } catch { /* skip */ }
+            const picked: Record<string, unknown> = {}
+            for (const k of detectedItemsProp!.varyingHydratedKeys) picked[k] = hydrated[k]
+            return picked
+          })
+          fullProps[detectedItemsProp.propName] = items
+        }
+      }
+      // Layout overrides: figma instances can override paddingTop/Right/
+      // Bottom/Left/itemSpacing on the root frame WITHOUT detaching. Diff
+      // each value vs the master variant; emit only the keys that differ
+      // so impl can spread them onto the styled root for visual parity.
+      // Keys map to Panda's flat props: padding* + `gap`.
+      // Emit the usage's full layout (not diff vs master). impl is
+      // parametric and has no implicit per-variant defaults, so missing
+      // fields would render as 0/none. Once per-variant codegen bakes
+      // master defaults into impl, this can drop to diff-only.
+      const layoutKeys = ['paddingTop', 'paddingRight', 'paddingBottom', 'paddingLeft', 'gap'] as const
+      for (const k of layoutKeys) {
+        const inst = u.layout[k]
+        if (inst != null) fullProps[k] = `${+(inst / 16).toFixed(6)}rem`
+      }
+      // Width/height override: figma `overrides` reports width/height/
+      // sizingMode when designer resized the instance. Emit when actual
+      // dim diverges from master so impl can lock the root box. Goes
+      // through the same diff-vs-defaults pass below.
+      if (u.mainWidth != null && Math.abs(u.width - u.mainWidth) > 0.5) {
+        fullProps.width = `${+(u.width / 16).toFixed(6)}rem`
+      }
+      if (u.mainHeight != null && Math.abs(u.height - u.mainHeight) > 0.5) {
+        fullProps.height = `${+(u.height / 16).toFixed(6)}rem`
+      }
+      // Diff against defaults — drop fields whose value matches the
+      // default that defaults.ts emits + impl spreads via `{...defaults,
+      // ...props}`. Keeps the per-usecase prop set minimal (the typical
+      // usecase only changes label / iconType / a stretched dim).
+      const slimProps: Record<string, unknown> = {}
+      for (const [k, v] of Object.entries(fullProps)) {
+        const defVal = augmentedDefs[k]?.defaultValue as unknown
+        if (defVal === undefined || JSON.stringify(defVal) !== JSON.stringify(v)) {
+          slimProps[k] = v
+        }
+      }
+      const lit = JSON.stringify(slimProps, null, 2).split('\n').map((l, i) => i === 0 ? l : '    ' + l).join('\n')
+      // Dim-locking wrapper only for usages whose root sizing diverges
+      // from the master — i.e. designer expanded/shrank the instance
+      // beyond hug-content. Skipping when dim matches master keeps the
+      // emitted file slim (most cases) and lets impl's natural layout drive.
+      const dimOverridden =
+        u.mainWidth != null && u.mainHeight != null &&
+        (Math.abs(u.width - u.mainWidth) > 0.5 || Math.abs(u.height - u.mainHeight) > 0.5)
+      // Use the spec's boxWrapper helper instead of inlining a raw-px div.
+      // boxWrapper emits px→rem so the chromium harness's html font-size
+      // supersample scales the wrapper alongside the codegen'd impl —
+      // raw px would render at 1× and mismatch figma's `cfg.scale` export.
+      const wrapperLiteral = dimOverridden
+        ? `boxWrapper({ width: ${u.width}, height: ${u.height} })`
+        : undefined
+      usageRows.push({
+        figmaId: `${u.fileKey ?? explicitFileKey}:${u.id}`,
+        // Master variant key (cross-file durable). All Variant lookups
+        // happen on this — no per-file id translation needed.
+        variantKey: u.mainKey ?? undefined,
+        propsLiteral: lit,
+        signature: stableSignature(fullProps, u.width, u.height),
+        wrapperLiteral,
+      })
+    }
+    console.log(`[init] usage-based cases: ${usageRows.length} usage(s) hydrated (pre-dedup)`)
+  }
   await writeFile(
     join(componentDir, 'cases.ts'),
-    generateCases(componentName, cfg.figmaFileId, normalizedMeta),
+    await fmt(generateCases(
+      componentName, explicitFileKey, normalizedMeta, usageRows,
+      detectedLabelProp, detectedNestedProps,
+      // Map for diff-vs-default trimming. Pulled from augmentedDefs so
+      // variant + usecase emit both reference the same baseline that
+      // defaults.ts itself emits.
+      Object.fromEntries(Object.entries(augmentedDefs).map(([k, d]) => [k, d.defaultValue])),
+    )),
   )
   await writeFile(
     join(componentDir, 'defaults.ts'),
-    generateDefaults(componentName, normalizedMeta.propertyDefinitions),
+    await fmt(generateDefaults(componentName, augmentedDefs)),
   )
   await writeFile(
     join(componentDir, 'index.ts'),
-    generateIndex(componentName, normalizedMeta.key, normalizedMeta.propertyDefinitions),
+    await fmt(generateIndex(componentName, normalizedMeta.key, normalizedMeta.id, augmentedDefs, detectedLabelProp?.name, detectedItemsProp, detectedNestedProps)),
   )
   return {
     componentDir,
