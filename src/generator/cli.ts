@@ -31,11 +31,7 @@ import { API } from '@typescript/native-preview/sync'
 import type * as ast from '@typescript/native-preview/ast'
 
 const isComponent = (v: unknown): v is Component<unknown> =>
-  // Accept both new (`variants`) and legacy (`cases`) component shapes
-  // — registration only needs name + figma binding to bridge IR walking,
-  // not the test-case data. Components mid-migration can keep their old
-  // exports while still getting walked.
-  !!v && typeof v === 'object' && 'name' in v && 'noise' in v && ('variants' in v || 'cases' in v)
+  !!v && typeof v === 'object' && 'name' in v && 'variants' in v
 
 export interface FigmaPayload {
   ir: IRNode
@@ -321,16 +317,15 @@ export const variants: Variant<GeneratedProps>[] = [
 ]
 `
   await writeFile(resolve(componentDir, 'cases.ts'), await fmt(casesRaw, 'typescript'))
-  // index.ts: skip if it already exists. Once written, it's user-owned —
-  // typically holds a calibrated `noise` threshold that pins this generated
-  // node as a regression case. Re-running `generate` should refresh impl.tsx
-  // / cases.ts (figma-derived) without clobbering that contract.
+  // index.ts: skip if it already exists. Once written, it's user-owned.
+  // Re-running `generate` refreshes impl.tsx / cases.ts (figma-derived)
+  // without clobbering it.
   const indexPath = resolve(componentDir, 'index.ts')
   const { existsSync } = await import('node:fs')
   if (!existsSync(indexPath)) {
     await writeFile(indexPath,
 `// AUTO-GENERATED.
-import { defineComponent, dE00 } from 'pixpec/spec'
+import { defineComponent } from 'pixpec/spec'
 import { variants } from './cases.ts'
 import type { GeneratedProps } from './impl.tsx'
 
@@ -339,11 +334,10 @@ export type { GeneratedProps }
 export const ${componentName} = defineComponent<GeneratedProps>({
   name: ${JSON.stringify(componentName)},
   variants,
-  noise: () => dE00(1e6), // generator output: pass-through, dE checked manually
 })
 `)
   } else {
-    console.log(`[generate] index.ts exists, kept user copy (noise threshold preserved)`)
+    console.log(`[generate] index.ts exists, kept user copy`)
   }
   console.log(`[generate] wrote → ${componentDir}`)
   console.log(`\nNext steps:`)

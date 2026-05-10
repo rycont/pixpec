@@ -15,6 +15,9 @@ import { runDumpFigma } from './dump-figma.ts'
 import { runDumpChromium } from './dump-chromium.ts'
 import { runAnalyze } from './analyze.ts'
 import { runGenerate } from './generator/cli.ts'
+import { runVerify } from './verify.ts'
+import { runVerifyGenerated } from './verify-generated.ts'
+import { runGenerateV2 } from './generate-v2.ts'
 
 const [, , cmd, ...rest] = process.argv
 
@@ -23,7 +26,7 @@ async function main() {
     case 'init': {
       const componentId = rest[0]
       if (!componentId) {
-        console.error('usage: pixpec init <componentId>')
+        console.error('usage: pixpec init <fileKey>:<nodeId>  (or just <nodeId>; init scans configured tabs in order)')
         process.exit(2)
       }
       const r = await init({ componentId })
@@ -31,7 +34,7 @@ async function main() {
         `scaffolded ${r.componentName} (${r.variantCount} variants) → ${r.componentDir}`,
       )
       console.log(`  files: props.ts, cases.ts, defaults.ts, index.ts (always rewritten)`)
-      console.log(`         impl.tsx, noise.ts (stub — preserved on re-init)`)
+      console.log(`         impl.tsx (stub — preserved on re-init)`)
       console.log(`         generated/ (empty — populated by breakdown)`)
       console.log(``)
       console.log(`Next: run breakdown for each variant so generated/<id>.tsx exists,`)
@@ -81,6 +84,51 @@ async function main() {
       })
       break
     }
+    case 'generate-v2': {
+      const componentId = rest[0]
+      if (!componentId || !componentId.includes(':')) {
+        console.error('usage: pixpec generate-v2 <fileKey>:<nodeId> [--emitter NAME] [--name Comp]')
+        process.exit(2)
+      }
+      const emIdx = rest.indexOf('--emitter')
+      const nameIdx = rest.indexOf('--name')
+      const r = await runGenerateV2(componentId, {
+        emitter: emIdx >= 0 ? rest[emIdx + 1] : undefined,
+        componentName: nameIdx >= 0 ? rest[nameIdx + 1] : undefined,
+      })
+      console.log(`[generate-v2] ${r.componentName} → ${r.outPath}`)
+      break
+    }
+    case 'verify': {
+      const componentName = rest[0]
+      if (!componentName) {
+        console.error('usage: pixpec verify <Component> [--blob-threshold X] [--max-blob N]')
+        process.exit(2)
+      }
+      const btIdx = rest.indexOf('--blob-threshold')
+      const mbIdx = rest.indexOf('--max-blob')
+      const r = await runVerify(componentName, {
+        blobThreshold: btIdx >= 0 ? rest[btIdx + 1] : undefined,
+        maxBlob: mbIdx >= 0 ? rest[mbIdx + 1] : undefined,
+      })
+      if (r.fail > 0) process.exit(1)
+      break
+    }
+    case 'verify-generated': {
+      const componentName = rest[0]
+      if (!componentName) {
+        console.error('usage: pixpec verify-generated <Component> [--blob-threshold X] [--max-blob N]')
+        process.exit(2)
+      }
+      const btIdx = rest.indexOf('--blob-threshold')
+      const mbIdx = rest.indexOf('--max-blob')
+      const r = await runVerifyGenerated(componentName, {
+        blobThreshold: btIdx >= 0 ? rest[btIdx + 1] : undefined,
+        maxBlob: mbIdx >= 0 ? rest[mbIdx + 1] : undefined,
+      })
+      if (r.fail > 0) process.exit(1)
+      break
+    }
     case 'analyze': {
       const componentName = rest[0]
       const caseName = rest[1]
@@ -98,6 +146,8 @@ async function main() {
       console.log('pixpec — visual regression frame for design systems\n')
       console.log('commands:')
       console.log('  init <componentId>             scaffold a component dir from Figma')
+      console.log('  verify <Component>             prepare+verify every entry in cases.ts (bails on first ✗)')
+      console.log('  verify-generated <Component>   verify generated/<safeId>.tsx ↔ figma main case per variant')
       console.log('  dump-figma <Component> [tab]   export Figma frames to .pixpec-out/<C>/figma/')
       console.log('  dump-chromium <Component>      render + screenshot to .pixpec-out/<C>/chromium/')
       console.log('  analyze <Component> <case>     per-blob shift+shape diagnosis [--crop]')

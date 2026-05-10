@@ -92,6 +92,11 @@ export interface FigmaVariantMeta {
   textNodes?: Array<{ id: string; name: string; chars: string }>
   /** Per-node-id nested INSTANCE rows — same purpose as textNodes. */
   nestedNodes?: Array<{ id: string; name: string; props: Record<string, unknown> }>
+  /** Per-node-id visibility-binding rows — each node whose `visible` field
+   *  is bound to an owner-component boolean property. init maps the raw
+   *  figma key (`Left Icon#2137:0`) to a TS prop name and records it in
+   *  `Variant.bindings[nodeId].attr.visible`. */
+  visibilityNodes?: Array<{ id: string; propRef: string }>
   /** Master variant's intrinsic figma dim. Used by init to emit a
    * boxWrapper on master variant cases — impl's CSS-flex hug may differ
    * from figma's layout-engine hug by a sub-pixel, so locking the wrapper
@@ -178,6 +183,7 @@ function extractVariant(v) {
   // ref names (e.g. an inner TextButton's leftIcon prop) onto the variant
   // root. Stop recursion at INSTANCE boundaries — those are handled by
   // Step 2 (exposedInstances) instead.
+  const visibilityNodes = [];
   const visit = (n) => {
     const refs = n.componentPropertyReferences;
     if (refs) {
@@ -186,6 +192,7 @@ function extractVariant(v) {
       }
       if (refs.visible) {
         propValues[stripHashKey(refs.visible)] = n.visible !== false;
+        visibilityNodes.push({ id: n.id, propRef: refs.visible });
       }
       if (refs.mainComponent && n.type === 'INSTANCE') {
         const mc = n.mainComponent;
@@ -248,7 +255,7 @@ function extractVariant(v) {
     paddingLeft: typeof v.paddingLeft === 'number' ? v.paddingLeft : null,
     gap: typeof v.itemSpacing === 'number' ? v.itemSpacing : null,
   };
-  return { id: v.id, name: v.name, key: v.key, propValues, exposedSchemas, textLayers, nestedProps, textNodes, nestedNodes, width: v.width, height: v.height, layout };
+  return { id: v.id, name: v.name, key: v.key, propValues, exposedSchemas, textLayers, nestedProps, textNodes, nestedNodes, visibilityNodes, width: v.width, height: v.height, layout };
 }
 
 function stripHash(defs) {
@@ -380,6 +387,11 @@ export interface UsageInstance {
   /** Per-text-layer override `{ <layerName>: characters }`, only for
    * descendants whose `characters` differ from master default. */
   textOverrides: Record<string, string>
+  /** Raw figma `inst.overrides` — list of { id, fields } per overridden
+   *  descendant. init checks each instance's overrides against the
+   *  detected props; any field not covered by an exposed prop drops the
+   *  whole instance from cases.ts (the "20% rule" extended to filtering). */
+  overrides?: Array<{ id: string; fields: string[] }>
   /** Per-nested-INSTANCE override `{ <layerName>: { <propKey>: value } }`,
    * only entries that diverge from the nested master's default. */
   nestedProps: Record<string, Record<string, unknown>>
@@ -517,10 +529,16 @@ for (const inst of matches) {
     if (!perDesc[groupKey]) perDesc[groupKey] = { descId, descName: t.name, hasOverride: false, overrideCount: 0, samples: [], instanceCount: 0, descIds: [] };
     perDesc[groupKey].instanceCount++;
     if (perDesc[groupKey].descIds.indexOf(descId) === -1) perDesc[groupKey].descIds.push(descId);
+    // Always record the rendered characters. inst.overrides only flags
+    // 'characters' when the LOCAL instance overrode it; nested instances
+    // baked into a parent component master (e.g. Tabbar_legacy authoring
+    // each inner TabItem with a real label) DON'T appear in inst.overrides
+    // even though t.characters still reflects the parent-baked value.
+    // init.ts diffs against defaults later — any trivial match is dropped.
+    instTextOverrides[t.name] = t.characters;
     if (overriddenIds.has(t.id)) {
       perDesc[groupKey].hasOverride = true;
       perDesc[groupKey].overrideCount++;
-      instTextOverrides[t.name] = t.characters;
     }
     if (perDesc[groupKey].samples.indexOf(t.characters) === -1) perDesc[groupKey].samples.push(t.characters);
   }
@@ -588,6 +606,14 @@ for (const inst of matches) {
     componentProperties: ipprops,
     textOverrides: instTextOverrides,
     nestedProps: instNested,
+    // Per-instance override field list — init filters out instances whose
+    // overrides aren't covered by the detected component props (the
+    // "uncovered overrides → detach" rule). Each entry is a node id plus
+    // the figma overriddenFields that diverge from master.
+    overrides: (inst.overrides || []).map(o => ({
+      id: o.id,
+      fields: (o.overriddenFields || []).slice(),
+    })),
     width: inst.width,
     height: inst.height,
     mainNodeId: (mc && mc.id) || null,
@@ -740,235 +766,6 @@ export async function scanAllOpenTabsForInit(opts: {
   }
 }
 
-/** @deprecated — kept only for callers we haven't migrated to the
- *  combined `scanAllOpenTabsForInit`. Will be removed. */
-export async function scanInstanceTextOverrides(opts: {
-  tabPattern: string
-  componentSetKey: string
-  cfigmaBin?: string
-}): Promise<InstanceTextSummary[]> {
-  const bin = opts.cfigmaBin ?? 'cfigma'
-  const code = `
-const targetKey = ${JSON.stringify(opts.componentSetKey)};
-// Walk every page; figma instances live everywhere. Async await for off-page
-// component refs (figma's lazy load).
-await figma.loadAllPagesAsync();
-const matches = [];
-for (const page of figma.root.children) {
-  for (const inst of page.findAllWithCriteria({ types: ['INSTANCE'] })) {
-    const main = inst.mainComponent;
-    if (!main) continue;
-    let p = main; while (p && p.type !== 'COMPONENT_SET') p = p.parent;
-    const key = (p && p.key) || (main && main.key);
-    if (key !== targetKey) continue;
-    matches.push(inst);
-  }
-}
-// For each instance, collect descendant TEXT id+characters relative to its
-// master (descId stripped of the I<inst>; prefix so identical descendant
-// ids across instances aggregate together).
-// Nested instances produce ids like  I<root>;<inst2>;<inst3>;<descId>.
-// Master TEXT id is the last segment after the final semicolon.
-const stripPrefix = (id) => id.includes(';') ? id.substring(id.lastIndexOf(';') + 1) : id;
-// Variant masters have different per-variant TEXT ids for the same logical
-// text node (figma assigns separate ids when designer copies/edits across
-// variants). Key the aggregate by the TEXT node NAME instead so the same
-// logical text across variants collapses into one entry. descId is kept
-// for propsFromFigma to look up walker output (any variant's id works as
-// the key — walker writes textOverrides keyed by the same per-variant id).
-const perDesc = {};
-for (const inst of matches) {
-  const texts = inst.findAllWithCriteria({ types: ['TEXT'] });
-  const overriddenIds = new Set();
-  for (const ov of (inst.overrides || [])) {
-    if ((ov.overriddenFields || []).includes('characters')) overriddenIds.add(ov.id);
-  }
-  for (const t of texts) {
-    const descId = stripPrefix(t.id);
-    const groupKey = t.name;
-    if (!perDesc[groupKey]) perDesc[groupKey] = { descId, descName: t.name, hasOverride: false, samples: [], instanceCount: 0, descIds: [] };
-    perDesc[groupKey].instanceCount++;
-    if (perDesc[groupKey].descIds.indexOf(descId) === -1) perDesc[groupKey].descIds.push(descId);
-    if (overriddenIds.has(t.id)) perDesc[groupKey].hasOverride = true;
-    if (perDesc[groupKey].samples.indexOf(t.characters) === -1) perDesc[groupKey].samples.push(t.characters);
-  }
-}
-return Object.values(perDesc);
-`
-  const { stdout } = await execFileAsync(
-    bin,
-    ['--tab', opts.tabPattern, 'exec', code],
-    { encoding: 'utf8', maxBuffer: 16 * 1024 * 1024 },
-  )
-  return cleanControlValue(JSON.parse(stdout)) as InstanceTextSummary[]
-}
-
-/**
- * Per-parent-instance summary: lists DIRECT child instances when they all
- * share one componentSetKey, plus each child's component properties +
- * text overrides keyed by master-relative descendant id. init compares
- * sibling values to find props that vary across children.
- */
-export interface ChildVariationSample {
-  /** All direct children share this componentSet (else `null` and ignored). */
-  childComponentSetKey: string | null
-  childComponentSetName: string | null
-  childComponentName: string | null
-  /** Per-child snapshot. Indices are sibling order. Captures the figma
-   * facts a child's `propsFromFigma` consumes (own componentProperties,
-   * own text overrides keyed by layer name, and grandchild INSTANCE
-   * componentProperties keyed by `<layerName>` → `<propKey>`). Init
-   * feeds these to the child's `propsFromFigma` to derive the typed
-   * props the parent would actually pass at runtime. */
-  children: Array<{
-    componentProperties: Record<string, unknown>
-    textOverrides: Record<string, string>
-    nestedProps: Record<string, Record<string, unknown>>
-  }>
-  /** Parent (the outer container) metadata — needed so init can emit a
-   * case per real usage: nodeId reference, name for case naming, the
-   * parent's own componentProperties (Tab.count/size etc.) and resolved
-   * dim. fileKey isn't here because the per-tab scan attaches it. */
-  parentId: string
-  parentName: string
-  parentProps: Record<string, unknown>
-  parentWidth: number
-  parentHeight: number
-  parentFileKey?: string
-}
-
-/**
- * Scan a tab for instances of `componentSetKey` and, for each that is a
- * "container" (all DIRECT children are same-componentSet INSTANCEs),
- * return the per-child prop snapshots. init aggregates across parents
- * to find which child props consistently vary → array prop on parent.
- */
-export async function scanInstanceChildVariations(opts: {
-  tabPattern: string
-  componentSetKey: string
-  cfigmaBin?: string
-}): Promise<ChildVariationSample[]> {
-  const bin = opts.cfigmaBin ?? 'cfigma'
-  const code = `
-const targetKey = ${JSON.stringify(opts.componentSetKey)};
-await figma.loadAllPagesAsync();
-const stripPrefix = (id) => id.includes(';') ? id.substring(id.lastIndexOf(';') + 1) : id;
-const out = [];
-for (const page of figma.root.children) {
-  for (const inst of page.findAllWithCriteria({ types: ['INSTANCE'] })) {
-    const main = inst.mainComponent;
-    if (!main) continue;
-    let p = main; while (p && p.type !== 'COMPONENT_SET') p = p.parent;
-    const key = (p && p.key) || (main && main.key);
-    if (key !== targetKey) continue;
-    // Direct children must all be INSTANCEs of one componentSet to qualify.
-    const kids = (inst.children || []).filter((c) => c.visible !== false);
-    if (kids.length < 2) continue;
-    if (kids.some((c) => c.type !== 'INSTANCE')) continue;
-    let childKey = null, childSetName = null, childCompName = null;
-    let consistent = true;
-    for (const c of kids) {
-      const cm = c.mainComponent;
-      let cp = cm; while (cp && cp.type !== 'COMPONENT_SET') cp = cp.parent;
-      const ck = (cp && cp.key) || (cm && cm.key);
-      if (childKey === null) { childKey = ck; childSetName = cp ? cp.name : (cm && cm.name); childCompName = cm && cm.name; }
-      else if (ck !== childKey) { consistent = false; break; }
-    }
-    if (!consistent || !childKey) continue;
-    // Per-child: componentProperties + descendant text overrides (descendant
-    // characters keyed by master-relative id; same shape walker emits).
-    const childSnaps = [];
-    for (const c of kids) {
-      const cprops = {};
-      for (const [k, v] of Object.entries(c.componentProperties || {})) cprops[k] = v.value;
-      const tov = {};
-      for (const ov of (c.overrides || [])) {
-        if (!(ov.overriddenFields || []).includes('characters')) continue;
-        const t = await figma.getNodeByIdAsync(ov.id);
-        if (!t || t.type !== 'TEXT') continue;
-        tov[stripPrefix(t.id)] = t.characters;
-      }
-      childSnaps.push({ componentProperties: cprops, textOverrides: tov });
-    }
-    out.push({
-      childComponentSetKey: childKey,
-      childComponentSetName: childSetName,
-      childComponentName: childCompName,
-      children: childSnaps,
-    });
-  }
-}
-return out;
-`
-  const { stdout } = await execFileAsync(
-    bin,
-    ['--tab', opts.tabPattern, 'exec', code],
-    { encoding: 'utf8', maxBuffer: 16 * 1024 * 1024 },
-  )
-  return cleanControlValue(JSON.parse(stdout)) as ChildVariationSample[]
-}
-
-/**
- * Convenience wrapper: scan EVERY currently-open figma tab for child
- * variations and concat the per-parent summaries.
- */
-export async function scanAllOpenTabsForChildVariations(opts: {
-  componentSetKey: string
-  cfigmaBin?: string
-}): Promise<ChildVariationSample[]> {
-  const tabs = await listFigmaTabs({ cfigmaBin: opts.cfigmaBin })
-  const out: ChildVariationSample[] = []
-  for (const tab of tabs) {
-    try {
-      const rows = await scanInstanceChildVariations({
-        tabPattern: tab.key,
-        componentSetKey: opts.componentSetKey,
-        cfigmaBin: opts.cfigmaBin,
-      })
-      out.push(...rows)
-    } catch { /* tab transient */ }
-  }
-  return out
-}
-
-/**
- * Convenience wrapper: scan EVERY currently-open figma tab and merge the
- * per-descendant aggregates. Init calls this so detection covers usages in
- * any open file (consuming app + library), without the user passing a tab.
- */
-export async function scanAllOpenTabsForOverrides(opts: {
-  componentSetKey: string
-  cfigmaBin?: string
-}): Promise<InstanceTextSummary[]> {
-  const tabs = await listFigmaTabs({ cfigmaBin: opts.cfigmaBin })
-  const merged: Record<string, InstanceTextSummary> = {}
-  for (const tab of tabs) {
-    let rows: InstanceTextSummary[]
-    try {
-      rows = await scanInstanceTextOverrides({
-        tabPattern: tab.key,  // use file key as the (unambiguous) tab pattern
-        componentSetKey: opts.componentSetKey,
-        cfigmaBin: opts.cfigmaBin,
-      })
-    } catch {
-      continue  // tab may have closed mid-scan, or another transient error
-    }
-    for (const row of rows) {
-      // Group by name across tabs (variant id may differ per file fork).
-      const key = row.descName
-      if (!merged[key]) {
-        merged[key] = { ...row, samples: [...row.samples], descIds: [...(row.descIds ?? [row.descId])] }
-        continue
-      }
-      const dst = merged[key]
-      dst.instanceCount += row.instanceCount
-      if (row.hasOverride) dst.hasOverride = true
-      for (const s of row.samples) if (dst.samples.indexOf(s) === -1) dst.samples.push(s)
-      for (const id of (row.descIds ?? [row.descId])) if (dst.descIds.indexOf(id) === -1) dst.descIds.push(id)
-    }
-  }
-  return Object.values(merged)
-}
 
 /**
  * Walk up from a node to its containing PAGE and set `figma.currentPage` there.

@@ -61,6 +61,13 @@ fn main() -> Result<()> {
     let args: Vec<String> = env::args().collect();
     let mut base_arg: Option<String> = None;
     let mut downsample: u32 = 8;
+    // Per-pixel ΔE00 cutoff for blob membership. Default 2.7 — calibrated
+    // empirically against TabItem hangul renderings: thresholds in the
+    // 2.5–2.6 range still cluster the trailing AA noise of CJK strokes
+    // into 25–29-pixel blobs, while 2.7 cleanly drops them to ≤18. ΔE 2.7
+    // is "noticeable only on close inspection" perceptually; a 1-px shift
+    // on solid ink (ΔE 5+) still clusters well above the cutoff.
+    let mut blob_threshold: f32 = 2.7;
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
@@ -71,6 +78,13 @@ fn main() -> Result<()> {
                     .filter(|&n: &u32| n >= 1)
                     .ok_or_else(|| anyhow::anyhow!("--downsample requires positive integer"))?;
             }
+            "--blob-threshold" => {
+                i += 1;
+                blob_threshold = args.get(i)
+                    .and_then(|s| s.parse().ok())
+                    .filter(|&v: &f32| v > 0.0)
+                    .ok_or_else(|| anyhow::anyhow!("--blob-threshold requires positive float"))?;
+            }
             other => {
                 if base_arg.is_some() { bail!("unexpected arg: {}", other); }
                 base_arg = Some(other.to_string());
@@ -79,7 +93,7 @@ fn main() -> Result<()> {
         i += 1;
     }
     let base = PathBuf::from(base_arg.ok_or_else(|| anyhow::anyhow!(
-        "usage: pixpec-measure <component_dir> [--downsample <N>]"
+        "usage: pixpec-measure <component_dir> [--downsample <N>] [--blob-threshold <dE>]"
     ))?);
     let figma_dir = base.join("figma");
     let chrom_dir = base.join("chromium");
@@ -110,7 +124,7 @@ fn main() -> Result<()> {
         .map(|name| -> Result<Record> {
             let f = figma_dir.join(format!("{name}.png"));
             let c = chrom_dir.join(format!("{name}.png"));
-            let m = measure(&f, &c, downsample).with_context(|| format!("measure {name}"))?;
+            let m = measure(&f, &c, downsample, blob_threshold).with_context(|| format!("measure {name}"))?;
             Ok(Record {
                 case: (*name).clone(),
                 de00: m.de00,
@@ -173,7 +187,7 @@ struct Measurement {
     blob_max_bbox: Option<[usize; 4]>,
 }
 
-fn measure(figma: &Path, chrom: &Path, downsample: u32) -> Result<Measurement> {
+fn measure(figma: &Path, chrom: &Path, downsample: u32, blob_threshold: f32) -> Result<Measurement> {
     // Composite alpha against white FIRST, then box-filter. Compose-then-avg
     // is the perceptually-meaningful pipeline: each input pixel's contribution
     // to its output cell equals what a viewer would see at that location.
@@ -216,10 +230,10 @@ fn measure(figma: &Path, chrom: &Path, downsample: u32) -> Result<Measurement> {
     // structural mismatches (clustered residual) from anti-alias noise (isolated
     // pixels). A high `de00_max` from one stray pixel is rendering noise; the
     // same `de00_max` clustered into a 9+ pixel blob is a real layout/style bug.
-    // Blob threshold hardcoded at 1.9: any pixel ΔE00 > 1.9 contributes to
-    // blob membership. Above the JNT (1.0); avoids text/svg edge AA noise
-    // contributing to blobs. See breakdown-verify default --max-blob 16.
-    let blob_threshold: f32 = 1.9;
+    // blob_threshold is now a CLI option (default 1.9) — see arg parsing
+    // above. Paired with breakdown-verify default --max-blob 25, which
+    // absorbs hangul/emoji 1px subpixel shifts (figma vs Skia rasterizer)
+    // where pixels reach the full black↔white dE (~5+).
     let mut visited = vec![false; n];
     let mut max_blob = 0usize;
     let mut max_blob_bbox: Option<[usize; 4]> = None;

@@ -69,7 +69,9 @@ export async function exportFigmaNodes(
   const bin = opts.cfigmaBin ?? 'cfigma'
   const format: FigmaExportFormat = opts.format ?? 'PNG'
   const ext = EXT_FOR[format]
-  await rm(opts.outDir, { recursive: true, force: true })
+  // Caller owns outDir lifecycle — exportFigmaNodes is called once per
+  // (tab, page) batch by dump-figma, and wiping here would erase prior
+  // batches' files (this dropped 34/37 cases on multi-page TabItem dumps).
   await mkdir(opts.outDir, { recursive: true })
 
   // Step 1: query node names + sanitize to predict filenames.
@@ -95,10 +97,15 @@ export async function exportFigmaNodes(
   console.error(`    [exportFigmaNodes] query names ${t1 - t0}ms`)
   const nameRows = JSON.parse(nameJson) as Array<{ id: string; name: string | null }>
 
-  // Step 2: single export call.
+  // Step 2: single export call. `--by-id` makes cfigma name each output
+  // file by the sanitized node id (1:1 with input ids), eliminating the
+  // figma-layer-name collision dance — different nodes labeled "Tab_Item"
+  // each land at their own `<sanitize(id)>.png` instead of fighting for
+  // the bare-name slot.
   const args = [
     '--tab', opts.tabPattern, 'export',
     '--ids', opts.nodeIds.join(','),
+    '--by-id',
     '--out', opts.outDir,
     '--format', format,
   ]
@@ -135,29 +142,20 @@ export async function exportFigmaNodes(
     arr.push({ id: r.id })
     byName.set(sk, arr)
   }
+  // With --by-id, cfigma names each export `<sanitize(id)>.<ext>` — the
+  // mapping is 1:1 with no collision logic on either side. We only need
+  // to confirm each requested id has its file on disk.
   for (const r of nameRows) {
-    if (!r.name) {
-      throw new Error(`exportFigmaNodes: node not found for id ${r.id}`)
-    }
-    const sk = sanitize(r.name)
-    // Try exact match first, then collision-suffixed (cfigma uses __0, __1 …).
-    let file = filesOnDisk.find((f) => f === sk + '.' + ext)
-    if (!file) {
-      const collisions = filesOnDisk.filter((f) =>
-        f.startsWith(sk + '__') && f.endsWith('.' + ext),
-      )
-      if (collisions.length > 0) {
-        const idx = (byName.get(sk) ?? []).findIndex((x) => x.id === r.id)
-        file = collisions[idx]
-      }
-    }
-    if (!file) {
+    if (!r.name) throw new Error(`exportFigmaNodes: node not found for id ${r.id}`)
+    const expected = sanitize(r.id) + '.' + ext
+    if (!filesOnDisk.includes(expected)) {
       throw new Error(
-        `exportFigmaNodes: no output file for nodeId=${r.id} name="${r.name}" (expected ${sk}.${ext})`,
+        `exportFigmaNodes: no output file for nodeId=${r.id} (expected ${expected})`,
       )
     }
-    map.set(r.id, join(opts.outDir, file))
+    map.set(r.id, join(opts.outDir, expected))
   }
+  void byName
   return map
 }
 

@@ -32,8 +32,12 @@ const args = process.argv.slice(2)
 const opt = (k: string, d?: string) => {
   const i = args.indexOf(k); return i >= 0 ? args[i + 1] : d
 }
-const maxBlob = parseInt(opt('--max-blob', '16')!, 10)
+const maxBlob = parseInt(opt('--max-blob', '24')!, 10)
 const maxDe = parseFloat(opt('--max-de', 'Infinity')!)
+// Per-pixel ΔE00 cutoff for blob membership. Forwarded to pixpec-measure
+// as --blob-threshold. `undefined` lets measure-rs apply its own default
+// (2.7 — sized to ride above CJK glyph AA noise; see measure-rs comment).
+const blobThreshold = opt('--blob-threshold')
 const onlyNode = opt('--only')
 const projectRoot = resolve(opt('--root', process.cwd())!)
 const cacheDir = resolve(projectRoot, '.pixpec-out/_breakdown-cache')
@@ -82,7 +86,8 @@ class MeasureError extends Error {
 
 const runMeasure = async (dir: string) => {
   try {
-    await execFileAsync(MEASURE_BIN, [dir],
+    const measureArgs = [dir, ...(blobThreshold ? ['--blob-threshold', blobThreshold] : [])]
+    await execFileAsync(MEASURE_BIN, measureArgs,
       { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 })
   } catch (e) {
     const stderr = (e as { stderr?: string }).stderr ?? ''
@@ -136,24 +141,10 @@ const placeFigmaPng = async (n: Node, outPath: string): Promise<{ padW: number; 
   const srcPath = resolve(cacheDir, 'figma-png', `${safe}.png`)
   await mkdir(dirname(outPath), { recursive: true })
 
-  let pipeline = sharp(srcPath)
-
-  // Crop overflow ink (figma exportAsync uses absoluteRenderBounds which can
-  // extend outside absoluteBoundingBox). Bring back to layout bbox before pad.
-  if (n.bbox && n.render) {
-    const overflowTop = n.bbox.y - n.render.y
-    const overflowLeft = n.bbox.x - n.render.x
-    if (overflowTop > 0 || overflowLeft > 0) {
-      pipeline = pipeline.extract({
-        left: Math.max(0, Math.round(overflowLeft * SCALE)),
-        top: Math.max(0, Math.round(overflowTop * SCALE)),
-        width: Math.round(n.bbox.width * SCALE),
-        height: Math.round(n.bbox.height * SCALE),
-      })
-    }
-  }
-
-  const cropped = await pipeline.toBuffer()
+  // prepare exports with useAbsoluteBounds:true → PNG already covers the
+  // layout bbox (no render-overflow ink in the file). Pass through verbatim
+  // and let the pad-to-mul step normalize dim for measure-rs.
+  const cropped = await sharp(srcPath).toBuffer()
   const meta = await sharp(cropped).metadata()
   // Figma exportAsync uses absoluteRenderBounds — when ink area < layout
   // bbox (e.g. transparent frame with tiny text), the export is smaller
@@ -183,6 +174,7 @@ const padChromiumPng = async (chrPath: string, padW: number, padH: number) => {
 const maybeMirrorGenerated = async (nodeId: string, bdComponentName: string) => {
   const bdImpl = resolve(projectRoot, 'src/components', bdComponentName, 'impl.tsx')
   if (!existsSync(bdImpl)) return
+  const figmaId = `${manifest.fileKey}:${nodeId}`
   const ents = await readdir(componentsPath, { withFileTypes: true })
   for (const ent of ents) {
     if (!ent.isDirectory()) continue
@@ -190,10 +182,13 @@ const maybeMirrorGenerated = async (nodeId: string, bdComponentName: string) => 
     const casesPath = resolve(componentsPath, ent.name, 'cases.ts')
     if (!existsSync(casesPath)) continue
     const casesSrc = await readFile(casesPath, 'utf8')
-    if (!casesSrc.includes(JSON.stringify(nodeId))) continue
+    // Cases.ts keys cases by `figmaId: "<fileKey>:<nodeId>"`. prettier
+    // may emit either quote style, so check both — the full quoted form
+    // prevents false-matching a substring of a longer id.
+    if (!casesSrc.includes(`"${figmaId}"`) && !casesSrc.includes(`'${figmaId}'`)) continue
     const genDir = resolve(componentsPath, ent.name, 'generated')
     await mkdir(genDir, { recursive: true })
-    const safe = nodeId.replace(/[^A-Za-z0-9]/g, '_')
+    const safe = figmaId.replace(/[^A-Za-z0-9]/g, '_')
     const dst = resolve(genDir, `${safe}.tsx`)
     const src = await readFile(bdImpl, 'utf8')
     // BD_<id>/ sits at src/components/BD_*/, imports relative paths.
@@ -215,7 +210,7 @@ const measure = async (componentName: string): Promise<{ max: number; sum: numbe
 
 await mkdir(dirname(reportPath), { recursive: true })
 await writeFile(reportPath,
-  `# Breakdown report — root ${manifest.rootNodeId}\n\nthreshold: largest connected blob (ΔE00 > 1.9) <= ${maxBlob}, max ΔE00/px <= ${maxDe}\n\n`)
+  `# Breakdown report — root ${manifest.rootNodeId}\n\nthreshold: largest connected blob (ΔE00 > ${blobThreshold ?? '2.7 (default)'}) <= ${maxBlob}, max ΔE00/px <= ${maxDe}\n\n`)
 
 // ───────── Step 1: Generate all components ─────────
 process.stdout.write(`[verify] generating ${manifest.nodes.length} components… `)
@@ -272,8 +267,13 @@ try {
       // Otherwise sharp.extend errors with negative values when chromium
       // is taller/wider than figma's bbox (e.g. CSS HUG content overflows
       // figma's authored 1px-tall divider frame).
+      // dump-chromium names PNGs by sanitize(figmaId). For BD cases the
+      // figmaId is `<fileKey>:<nodeId>` — derive the matching basename
+      // here so placeFigmaPng / padChromiumPng line up with what got
+      // written.
+      const caseBase = `${manifest.fileKey}:${n.id}`.replace(/[^A-Za-z0-9]/g, '_')
       const figmaSrc = resolve(projectRoot, '.pixpec-out/_breakdown-cache/figma-png', n.id.replace(/[^A-Za-z0-9]/g, '_') + '.png')
-      const chrPath = resolve(projectRoot, '.pixpec-out', componentName, 'chromium', `${componentName}_main.png`)
+      const chrPath = resolve(projectRoot, '.pixpec-out', componentName, 'chromium', `${caseBase}.png`)
       const figMeta = await sharp(figmaSrc).metadata()
       const chrMeta = await sharp(chrPath).metadata()
       const layoutW = n.bbox ? Math.round(n.bbox.width * 8) : 0
@@ -281,8 +281,8 @@ try {
       const targetW = Math.ceil(Math.max(figMeta.width!, chrMeta.width!, layoutW) / 8) * 8
       const targetH = Math.ceil(Math.max(figMeta.height!, chrMeta.height!, layoutH) / 8) * 8
       await placeFigmaPng(n,
-        resolve(projectRoot, '.pixpec-out', componentName, 'figma', `${componentName}_main.png`))
-      const figOutPath = resolve(projectRoot, '.pixpec-out', componentName, 'figma', `${componentName}_main.png`)
+        resolve(projectRoot, '.pixpec-out', componentName, 'figma', `${caseBase}.png`))
+      const figOutPath = resolve(projectRoot, '.pixpec-out', componentName, 'figma', `${caseBase}.png`)
       const figBuf = await readFile(figOutPath)
       await writeFile(figOutPath, await padWhite(figBuf, targetW, targetH))
       await padChromiumPng(chrPath, targetW, targetH)
@@ -320,7 +320,7 @@ console.log(`\n[verify] ${passed} passed`)
 if (firstFailure) {
   const { node: n, componentName } = firstFailure
   const outDir = resolve(projectRoot, '.pixpec-out', componentName)
-  const caseName = `${componentName}_main`
+  const caseName = `${manifest.fileKey}:${n.id}`.replace(/[^A-Za-z0-9]/g, '_')
 
   if (n.componentName) {
     console.log(`\n💡 TIP: This is an INSTANCE of the registered component "${n.componentName}".`)

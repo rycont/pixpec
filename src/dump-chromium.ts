@@ -14,7 +14,7 @@
  *
  * Lib function + CLI entrypoint.
  */
-import { mkdir } from 'node:fs/promises'
+import { mkdir, rm } from 'node:fs/promises'
 import { join, resolve } from 'node:path'
 import type { Component } from './types.ts'
 import { Renderer } from './render.ts'
@@ -31,10 +31,19 @@ export interface DumpChromiumOptions {
   verbose?: boolean
   /** Reuse an existing Chromium instance across repeated dump calls. */
   renderer?: Renderer
+  /** Render source. 'impl' (default) imports impl.tsx; 'generated' resolves
+   *  each usecase to its variant's main-case generated/<safeId>.tsx — for
+   *  verifying codegen output before impl synthesis. The harness reads the
+   *  same flag via URL query. */
+  source?: 'impl' | 'generated'
+  /** Empty outDir before writing. Prevents stale PNGs from a prior mode
+   *  (e.g. impl stub) leaking into the next measure pass. */
+  clearOutDir?: boolean
 }
 
 export async function dumpChromium(opts: DumpChromiumOptions): Promise<void> {
-  const { component: comp, outDir, devUrl, scale, remBase, verbose } = opts
+  const { component: comp, outDir, devUrl, scale, remBase, verbose, source, clearOutDir } = opts
+  if (clearOutDir) await rm(outDir, { recursive: true, force: true })
   await mkdir(outDir, { recursive: true })
 
   // Probe the dev server up-front so the failure mode is a clear message
@@ -55,7 +64,12 @@ export async function dumpChromium(opts: DumpChromiumOptions): Promise<void> {
   const ownsRenderer = !opts.renderer
   try {
     const CHUNK = comp.batchChunk ?? 500
-    const N = comp.cases.length
+    // Flatten every variant's usecases — each is one chromium screenshot.
+    // Variants themselves are pure ID buckets; usecases carry the props
+    // and wrapper a screenshot needs.
+    const flatUsecases = (comp.variants as Array<{ usecases: Array<{ figmaId: string; props: unknown; wrapper?: unknown }> }>)
+      .flatMap((v) => v.usecases ?? [])
+    const N = flatUsecases.length
     const PARALLEL = comp.batchParallel ?? 2
 
     // Build chunk descriptors.
@@ -65,7 +79,8 @@ export async function dumpChromium(opts: DumpChromiumOptions): Promise<void> {
     // Use a shared session if we can.
     let sharedSession: import('./render.ts').BatchSession | null = (renderer as any).__pixpec_session
     const runChunk = async ({ s, e }: { s: number; e: number }) => {
-      const url = `${baseUrl}/?component=${encodeURIComponent(comp.name)}&batch=1&from=${s}&to=${e}`
+      const extra = source ? `&source=${source}` : ''
+      const url = `${baseUrl}/?component=${encodeURIComponent(comp.name)}&batch=1&from=${s}&to=${e}${extra}`
       const t0 = Date.now()
       let session: import('./render.ts').BatchSession
       if (sharedSession) {
@@ -112,14 +127,12 @@ export async function dumpChromium(opts: DumpChromiumOptions): Promise<void> {
         // If case has explicit `wrapper`, the wrapper IS the screenshot target
         // (its dim must match figma frame exactly). Otherwise, the wrapper is
         // just harness padding and we screenshot the inner impl element.
-        const hasWrapper = !!(comp.cases[i] as { wrapper?: unknown }).wrapper
-        const sel = hasWrapper
-          ? `[data-case="${comp.cases[i].name.replace(/"/g, '\\"')}"]`
-          : `[data-case="${comp.cases[i].name.replace(/"/g, '\\"')}"] > *`
-        items.push({
-          selector: sel,
-          outPath: join(outDir, `${comp.cases[i].name}.png`),
-        })
+        const c = flatUsecases[i] as { figmaId: string; wrapper?: unknown }
+        const safe = c.figmaId.replace(/[^A-Za-z0-9]/g, '_')
+        const sel = c.wrapper
+          ? `[data-case="${safe}"]`
+          : `[data-case="${safe}"] > *`
+        items.push({ selector: sel, outPath: join(outDir, `${safe}.png`) })
       }
       await session.screenshotMany(items)
       const tShots = Date.now()
@@ -147,20 +160,20 @@ export async function dumpChromium(opts: DumpChromiumOptions): Promise<void> {
 
 export async function runDumpChromium(
   componentName: string,
-  opts: { renderer?: Renderer } = {},
+  opts: { renderer?: Renderer; source?: 'impl' | 'generated'; clearOutDir?: boolean } = {},
 ): Promise<void> {
   const { cfg, root } = await loadConfig()
   const componentsDir = cfg.componentsDir ?? 'src/components'
   const componentMod = (await import(resolve(root, componentsDir, componentName, 'index.ts'))) as Record<string, unknown>
   const comp = componentMod[componentName] as Component<unknown> | undefined
-  if (!comp || !Array.isArray(comp.cases)) {
+  if (!comp || !Array.isArray(comp.variants)) {
     throw new Error(`Component '${componentName}' not exported from ${componentsDir}/${componentName}/index.ts`)
   }
   const outDir = resolve(root, `.pixpec-out/${comp.name}/chromium`)
   const devUrl = process.env.PIXPEC_DEV_URL
     ?? (cfg as { devServerUrl?: string }).devServerUrl
     ?? 'http://localhost:5180'
-  console.log(`[dump-chromium] ${comp.name}: ${comp.cases.length} cases → ${outDir} (vite=${devUrl})`)
+  console.log(`[dump-chromium] ${comp.name}: ${comp.variants.length} cases → ${outDir} (vite=${devUrl})`)
   const t0 = Date.now()
   await dumpChromium({
     component: comp,
@@ -170,6 +183,8 @@ export async function runDumpChromium(
     remBase: cfg.remBase,
     verbose: true,
     renderer: opts.renderer,
+    source: opts.source,
+    clearOutDir: opts.clearOutDir,
   })
   console.log(`[dump-chromium] done in ${Date.now() - t0}ms`)
 }

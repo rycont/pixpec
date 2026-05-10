@@ -93,6 +93,15 @@ async function ir(node) {
 async function __pixpecIr(node) {
   if (!node) return null;
   const base = { figmaId: node.id, figmaName: node.name };
+  // Visibility binding: stamps the IR with the owner-prop key whose value
+  // gates this node. Bindings spec is keyed by the master variant node ids
+  // so strip any nested-instance prefix to match.
+  {
+    const bareId = node.id.includes(';') ? node.id.substring(node.id.lastIndexOf(';') + 1) : node.id;
+    const __binding = BINDINGS[bareId] || BINDINGS[node.id];
+    const __boundVisible = __binding && __binding.attr && __binding.attr.visible;
+    if (__boundVisible) base.boundVisible = __boundVisible;
+  }
   if (node.type === 'INSTANCE') {
     let p = node.mainComponent;
     while (p && p.type !== 'COMPONENT_SET') p = p.parent;
@@ -386,6 +395,22 @@ async function __pixpecIr(node) {
         child.absolute = true;
         child.absX = c.x;
         child.absY = c.y;
+        // Pre-compute right/bottom insets so codegen can emit them when the
+        // figma constraint asks the child to stretch with the parent (e.g.
+        // a tab underline pinned LEFT+RIGHT). Without these, codegen would
+        // only know left/top and the wrapper couldn't grow with parent.
+        if (typeof node.width === 'number' && typeof c.width === 'number') {
+          child.absRight = node.width - c.x - c.width;
+        }
+        if (typeof node.height === 'number' && typeof c.height === 'number') {
+          child.absBottom = node.height - c.y - c.height;
+        }
+        if (c.constraints) {
+          child.constraints = {
+            horizontal: c.constraints.horizontal,
+            vertical: c.constraints.vertical,
+          };
+        }
       }
       children.push(child);
     }

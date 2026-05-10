@@ -7,7 +7,6 @@
  *
  * Files generated under `<componentsDir>/<Name>/`:
  *   impl.ts    — props interface + render stub (TODO body)
- *   noise.ts   — NoiseFn stub returning 0 (TODO compose)
  *   cases.ts   — auto-filled from variants
  *   index.ts   — defineComponent
  *   figma/     — exported variant PNGs (one per case)
@@ -379,20 +378,6 @@ ${lines.join('\n')}
 `
 }
 
-function generateNoise(componentName: string): string {
-  return `import { dE00, type NoiseFn } from 'pixpec/spec'
-import type { ${componentName}Props } from './props.ts'
-
-/**
- * TODO: compose from leaves.
- *
- * Example shape (depends on the component):
- *   noise: (p) => textLeaf(p.label) + iconLeaf(p.icon, p.size) + base(p.radius, p.stroke)
- */
-export const noise: NoiseFn<${componentName}Props> = () => dE00(0)
-`
-}
-
 /** A generated case row — used both for master variants (dim unknown,
  * fileKey = library file) and for real usage instances (with figma dim
  * and the consuming file's fileKey). `signature` is the dedup key. */
@@ -412,7 +397,7 @@ interface CaseRow {
   /** For variant rows only: per-node bindings spec emitted as
    * `Variant.bindings` in cases.ts. generate threads this through the
    * walker so IR nodes get parametric annotations. */
-  bindings?: Record<string, { attr?: { text?: string }; instanceProps?: Record<string, string> }>
+  bindings?: Record<string, { attr?: { text?: string; visible?: string }; instanceProps?: Record<string, string> }>
   /** Pre-rendered TS object literal (already-formatted prop entries
    * with `literalForValue`-friendly value forms). */
   propsLiteral: string
@@ -496,7 +481,7 @@ function generateCases(
     // and each nested INSTANCE matching detectedNestedProps, record the
     // figma node id with its owner-prop key. generate uses these to
     // annotate IR nodes during walk → codegen emits {props.<key>}.
-    const bindings: Record<string, { attr?: { text?: string }; instanceProps?: Record<string, string> }> = {}
+    const bindings: Record<string, { attr?: { text?: string; visible?: string }; instanceProps?: Record<string, string> }> = {}
     if (detectedLabelProp && v.textNodes) {
       for (const tn of v.textNodes) {
         if (tn.name === detectedLabelProp.name) {
@@ -516,6 +501,16 @@ function generateCases(
             [np.propKey]: np.propName,
           }
         }
+      }
+    }
+    // Visibility bindings — each node whose `visible` is bound to an owner
+    // boolean prop (e.g. an Icon hidden when leftIcon=false). codegen wraps
+    // the JSX with `{<propKey> !== false && ...}`.
+    if (v.visibilityNodes) {
+      for (const vn of v.visibilityNodes) {
+        const propKey = propName(vn.propRef)
+        bindings[vn.id] = bindings[vn.id] ?? {}
+        bindings[vn.id].attr = { ...(bindings[vn.id].attr ?? {}), visible: propKey }
       }
     }
     return {
@@ -664,7 +659,6 @@ ${propMappings}${containerMapping}
   }`
     : ''
   return `import { defineComponent } from 'pixpec/spec'
-import { noise } from './noise.ts'
 import { variants } from './cases.ts'
 import { defaults } from './defaults.ts'
 import type { ${componentName}Props } from './props.ts'
@@ -675,7 +669,6 @@ export { defaults }
 export const ${componentName} = defineComponent<${componentName}Props>({
   name: ${JSON.stringify(componentName)},
   variants,
-  noise,
   defaults${figmaBlock},
 })
 `
@@ -692,9 +685,8 @@ export async function init(opts: {
   componentId: string
   /** Override config root (otherwise walked up from cwd). */
   cwd?: string
-  /** Skip overwriting impl.tsx + noise.ts when they exist (preserves user
-   * code). cases.ts / defaults.ts / index.ts are always rewritten — they
-   * mirror figma. */
+  /** Skip overwriting impl.tsx when it exists (preserves user code).
+   * cases.ts / defaults.ts / index.ts are always rewritten — they mirror figma. */
   skipExisting?: boolean
 }): Promise<InitResult> {
   const { cfg, root } = await loadConfig(opts.cwd)
@@ -719,26 +711,19 @@ export async function init(opts: {
   const componentsDir = resolve(root, cfg.componentsDir ?? 'src/components')
   const componentDir = join(componentsDir, componentName)
   // Wipe any prior scaffolding so figma is the only source of truth on
-  // re-init. impl.tsx / noise.ts can be opted-in to preservation by
-  // passing skipExisting (we re-create them after wipe in that case).
+  // re-init. impl.tsx is opt-in preserved via skipExisting; everything else
+  // is regenerated.
   let preservedImpl: string | undefined
-  let preservedNoise: string | undefined
   if (existsSync(componentDir)) {
     if (opts.skipExisting) {
       const implP = join(componentDir, 'impl.tsx')
-      const noiseP = join(componentDir, 'noise.ts')
       if (existsSync(implP)) preservedImpl = await readFile(implP, 'utf8')
-      if (existsSync(noiseP)) preservedNoise = await readFile(noiseP, 'utf8')
     }
     await rm(componentDir, { recursive: true, force: true })
   }
   await mkdir(componentDir, { recursive: true })
-  // Pre-create generated/ — breakdown's per-variant outputs land here for
-  // the compose step to read.
   await mkdir(join(componentDir, 'generated'), { recursive: true })
 
-  // Stub writers honor preservedImpl/preservedNoise (only set when caller
-  // requested skipExisting); otherwise emit a fresh stub.
   const writeStub = async (p: string, body: string, preserved: string | undefined) => {
     await writeFile(p, preserved ?? body)
   }
@@ -967,14 +952,12 @@ export async function init(opts: {
       console.warn(`[init] container-pattern scan failed: ${(e as Error).message}`)
     }
   }
-  // impl.tsx + noise.ts are stubs (or preserved from a prior run via
-  // skipExisting + preservedImpl/preservedNoise above).
+  // impl.tsx is a stub (or preserved from a prior run via skipExisting).
   await writeStub(
     join(componentDir, 'impl.tsx'),
     generateImpl(componentName),
     preservedImpl,
   )
-  await writeStub(join(componentDir, 'noise.ts'), generateNoise(componentName), preservedNoise)
   // props.ts / cases.ts / defaults.ts / index.ts always rewritten — mirrors figma.
   // Format every emit with prettier so the output stays human-reviewable.
   const prettier = await import('prettier')
@@ -992,6 +975,71 @@ export async function init(opts: {
   // the component is a container — `Pick<ChildProps>` items hydrated
   // via the child's own propsFromFigma). Master variants + usages then
   // share a single dedup pass keyed by {props, width, height}.
+  // Collect per-property unique values that arrive at runtime via prop
+  // spread on Generated trees. panda's static extractor doesn't recognize
+  // bare object literals in cases.ts, so without help it never emits CSS
+  // rules for instance-only widths/paddings/etc. Init writes these into
+  // tokens/panda-runtime-values.json keyed by component, and panda.config
+  // re-feeds them into staticCss to force rule generation.
+  const runtimeDims: Record<string, Set<string>> = {
+    width: new Set(), height: new Set(),
+    paddingTop: new Set(), paddingRight: new Set(),
+    paddingBottom: new Set(), paddingLeft: new Set(),
+    gap: new Set(),
+  }
+  // "Uncovered override → detach" rule: drop instances whose figma overrides
+  // include any field that no exposed prop can carry. Two sources of cover:
+  //
+  //   1. Per-node bindings (built below from variantRows). Each binding
+  //      maps a master node id + figma field (characters/componentProperties
+  //      /visible) to a prop key. Instance overrides on those (node, field)
+  //      pairs flow through the prop and get re-rendered correctly.
+  //
+  //   2. Root-spread layout/dim fields. Generated trees forward width/
+  //      height/padding/gap via `{...rest}` panda spread, so any override
+  //      on the root frame's layout (including figma's primaryAxisSizingMode/
+  //      counterAxisSizingMode/layoutGrow flags that toggle FIXED↔HUG) is
+  //      captured by the resulting css width/height.
+  //
+  // NON_VISUAL fields are figma bookkeeping (exportSettings, layer renames)
+  // that don't affect rendered pixels — always ignored.
+  const NON_VISUAL = new Set(['exportSettings', 'autoRename', 'name', 'styledTextSegments'])
+  const ROOT_LAYOUT_COVERED = new Set([
+    'width', 'height', 'primaryAxisSizingMode', 'counterAxisSizingMode', 'layoutGrow',
+    // Root inst's own componentProperties (Status, leftIcon, etc.) flow
+    // through propsFromFigma → raw.props mapping; always covered.
+    'componentProperties',
+  ])
+  // (nodeId → set of figma fields covered by this node's bindings).
+  // Derived directly from the same FigmaVariantMeta + detected props that
+  // generateCases uses to emit Variant.bindings. Keeping the derivation
+  // here (instead of reading variantRows) avoids reaching into a function-
+  // local computed later in the pipeline.
+  const boundFieldsByNode = new Map<string, Set<string>>()
+  const addField = (nodeId: string, field: string) => {
+    let s = boundFieldsByNode.get(nodeId)
+    if (!s) { s = new Set(); boundFieldsByNode.set(nodeId, s) }
+    s.add(field)
+  }
+  for (const v of normalizedMeta.variants) {
+    if (detectedLabelProp && v.textNodes) {
+      for (const tn of v.textNodes) {
+        if (tn.name === detectedLabelProp.name) addField(tn.id, 'characters')
+      }
+    }
+    if (v.nestedNodes) {
+      for (const nn of v.nestedNodes) {
+        for (const np of detectedNestedProps) {
+          if (nn.name === np.layerName && (np.propKey in nn.props)) addField(nn.id, 'componentProperties')
+        }
+      }
+    }
+    if (v.visibilityNodes) {
+      for (const vn of v.visibilityNodes) addField(vn.id, 'visible')
+    }
+  }
+  const stripPrefix = (id: string) => id.includes(';') ? id.substring(id.lastIndexOf(';') + 1) : id
+  let droppedUncovered = 0
   const usageRows: CaseRow[] = []
   if (scanResult) {
     const dummyRect = { x: 0, y: 0, width: 0, height: 0 }
@@ -1006,22 +1054,48 @@ export async function init(opts: {
         }
       }
     }
+    const droppedReasons: Record<string, number> = {}
     for (const u of scanResult.usages) {
+      // Drop instances with overrides on (node, field) pairs no exposed
+      // prop can carry. Per-node bindings cover specific descendants;
+      // root layout fields are always covered (panda spread on Generated).
+      const uncoveredFields: string[] = []
+      for (const ov of (u.overrides ?? [])) {
+        const bareNodeId = stripPrefix(ov.id)
+        // Override on the inst itself → root-level (width/height/sizing
+        // mode flags). Otherwise → descendant override; cover via per-node
+        // binding map keyed by the master node id (= bareNodeId).
+        const isRoot = ov.id === u.id
+        const nodeBound = boundFieldsByNode.get(bareNodeId)
+        for (const f of ov.fields) {
+          if (NON_VISUAL.has(f)) continue
+          if (isRoot && ROOT_LAYOUT_COVERED.has(f)) continue
+          if (nodeBound?.has(f)) continue
+          uncoveredFields.push(f)
+        }
+      }
+      if (uncoveredFields.length > 0) {
+        droppedUncovered++
+        for (const f of uncoveredFields) droppedReasons[f] = (droppedReasons[f] ?? 0) + 1
+        // TEMP: filter disabled for false-positive diagnostic
+        // continue
+      }
       const rawProps = normalizeRawProps(u.componentProperties)
       const fullProps: Record<string, unknown> = {}
       for (const name of ownPropKeys) {
         const k = propsKey(name)
-        // Auto-detected `label` reads from textOverrides keyed by layer
-        // name, mirroring the propsFromFigma generator.
-        if (k === 'label' && detectedLabelProp) {
-          const v = u.textOverrides[detectedLabelProp.name]
-          if (v !== undefined) fullProps[k] = v
-          continue
-        }
         // figma componentProperties — accept any of the key forms
         // normalizeRawProps populated.
         if (k in rawProps) fullProps[k] = rawProps[k]
         else if (name in rawProps) fullProps[k] = rawProps[name]
+      }
+      // Synthetic `label` prop: mirrors detectedNestedProps below — must
+      // live OUTSIDE the ownPropKeys loop because the synthetic key is on
+      // `augmentedDefs`, not on `normalizedMeta.propertyDefinitions`.
+      // Reads u.textOverrides keyed by layer name to match propsFromFigma.
+      if (detectedLabelProp) {
+        const v = u.textOverrides[detectedLabelProp.name]
+        if (v !== undefined) fullProps.label = v
       }
       // Auto-detected nested INSTANCE props (e.g. iconType ← Icon.Type).
       for (const np of detectedNestedProps) {
@@ -1106,6 +1180,11 @@ export async function init(opts: {
       const wrapperLiteral = dimOverridden
         ? `boxWrapper({ width: ${u.width}, height: ${u.height} })`
         : undefined
+      // Stash any rem/px values for panda staticCss (see runtimeDims init above).
+      for (const k of Object.keys(runtimeDims)) {
+        const v = fullProps[k]
+        if (typeof v === 'string' && /[0-9]/.test(v)) runtimeDims[k].add(v)
+      }
       usageRows.push({
         figmaId: `${u.fileKey ?? explicitFileKey}:${u.id}`,
         // Master variant key (cross-file durable). All Variant lookups
@@ -1117,6 +1196,11 @@ export async function init(opts: {
       })
     }
     console.log(`[init] usage-based cases: ${usageRows.length} usage(s) hydrated (pre-dedup)`)
+    if (droppedUncovered > 0) {
+      const breakdown = Object.entries(droppedReasons).sort((a, b) => b[1] - a[1])
+        .map(([f, n]) => `${f}=${n}`).join(', ')
+      console.log(`[init] dropped ${droppedUncovered} usage(s) with overrides on unexposed props (${breakdown})`)
+    }
   }
   await writeFile(
     join(componentDir, 'cases.ts'),
@@ -1129,6 +1213,19 @@ export async function init(opts: {
       Object.fromEntries(Object.entries(augmentedDefs).map(([k, d]) => [k, d.defaultValue])),
     )),
   )
+  // panda staticCss feeder — one file per component, co-located so re-init
+  // replaces just this component's slice. panda.config globs every
+  // `static-tokens.json` under componentsDir and merges. Without this,
+  // runtime spreads (`<Flex {...rest}>`) hit panda's static extractor as
+  // bare object literals → no CSS rule emitted → Flex collapses to its
+  // hardcoded master width.
+  {
+    const tokensPath = join(componentDir, 'static-tokens.json')
+    const payload = Object.fromEntries(
+      Object.entries(runtimeDims).map(([k, s]) => [k, [...s].sort()]),
+    )
+    await writeFile(tokensPath, JSON.stringify(payload, null, 2) + '\n')
+  }
   await writeFile(
     join(componentDir, 'defaults.ts'),
     await fmt(generateDefaults(componentName, augmentedDefs)),
@@ -1137,6 +1234,26 @@ export async function init(opts: {
     join(componentDir, 'index.ts'),
     await fmt(generateIndex(componentName, normalizedMeta.key, normalizedMeta.id, augmentedDefs, detectedLabelProp?.name, detectedItemsProp, detectedNestedProps)),
   )
+  // master-snapshot.json — raw figma dump of each master variant. The
+  // compiler reads this off disk to (a) compare instance overrides for
+  // detach decisions and (b) supply variant context to the emitter
+  // without going back to figma. Keyed by variant.key (cross-file
+  // durable id). Skipped silently when the dumper isn't available
+  // (offline scenarios — registry just falls back to empty snapshots).
+  try {
+    const { dump } = await import('./dumper/index.ts')
+    const snapshot: Record<string, unknown> = {}
+    for (const v of normalizedMeta.variants) {
+      try {
+        snapshot[v.key] = await dump({ cfigmaBin: cfg.cfigmaBin ?? 'cfigma', tab: tab.key, nodeId: v.id })
+      } catch (e) {
+        console.warn(`[init] master-snapshot dump failed for variant ${v.id} (${v.name}): ${(e as Error).message}`)
+      }
+    }
+    await writeFile(join(componentDir, 'master-snapshot.json'), JSON.stringify(snapshot, null, 2) + '\n')
+  } catch (e) {
+    console.warn(`[init] master-snapshot disabled: ${(e as Error).message}`)
+  }
   return {
     componentDir,
     componentName,

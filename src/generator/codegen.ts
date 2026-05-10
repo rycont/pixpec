@@ -1099,13 +1099,26 @@ function emitShape(n: IRShape, ctx: CodegenCtx, parent: ParentCtx = { dir: 'none
     if (h === 0) { viewH = sw; strokeOffsetY = sw / 2 }
     if (w === 0) { viewW = sw; strokeOffsetX = sw / 2 }
   }
+  // A shape stretches with its parent when figma sizing is FILL on that
+  // axis OR when the shape is absolutely positioned with constraint=STRETCH
+  // on that axis (the tab-underline pattern: pinned LEFT+RIGHT). Emit
+  // width/height as '100%' so panda routes it through CSS rather than baking
+  // the main-case px value into the SVG dim.
+  const hStretch = n.sizingH === 'fill' || (n.absolute && n.constraints?.horizontal === 'STRETCH')
+  const vStretch = n.sizingV === 'fill' || (n.absolute && n.constraints?.vertical === 'STRETCH')
   const svgAttrs: ast.JsxAttribute[] = [
     f.createJsxAttribute(f.createIdentifier('viewBox'), stringLiteral(`0 0 ${viewW} ${viewH}`)),
     f.createJsxAttribute(f.createIdentifier('display'), stringLiteral('block')),
     f.createJsxAttribute(f.createIdentifier('flexShrink'), f.createJsxExpression(undefined, valueToExpr(0))),
-    f.createJsxAttribute(f.createIdentifier('width'), stringLiteral(px2remPanda(viewW, ctx.remBase))),
-    f.createJsxAttribute(f.createIdentifier('height'), stringLiteral(px2remPanda(viewH, ctx.remBase))),
+    f.createJsxAttribute(f.createIdentifier('width'), stringLiteral(hStretch ? '100%' : px2remPanda(viewW, ctx.remBase))),
+    f.createJsxAttribute(f.createIdentifier('height'), stringLiteral(vStretch ? '100%' : px2remPanda(viewH, ctx.remBase))),
   ]
+  // For LINE shapes that stretch on either axis, allow the viewBox to scale
+  // independently per axis so the line spans whatever its container becomes.
+  // The default `xMidYMid meet` would maintain aspect, defeating the stretch.
+  if (n.shape === 'line' && (hStretch || vStretch)) {
+    svgAttrs.push(f.createJsxAttribute(f.createIdentifier('preserveAspectRatio'), stringLiteral('none')))
+  }
   // Apply line-offset transform on the inner element so the stroke sits at
   // the original bbox origin (not at strokeWidth/2 inset).
   void strokeOffsetX; void strokeOffsetY
@@ -1204,19 +1217,12 @@ interface CodegenCtx {
   usedPropBindings: Set<string>
 }
 
-/** Build `{props.<key>}` JSX expression. Used to swap a literal prop
- * value for a typed prop reference based on IR binding annotations. */
+/** Build `{<key>}` JSX expression. The Generated FC destructures bound
+ * props into local bindings (and an `...rest` for root spread) — see the
+ * end of `generate()`. So a binding reference is just the bare local name,
+ * not a `props.<key>` member access. */
 function propExpression(key: string): ast.JsxExpression {
-  return f.createJsxExpression(
-    undefined,
-    // factory signature: (expression, questionDotToken, name, flags)
-    f.createPropertyAccessExpression(
-      f.createIdentifier('props'),
-      undefined,
-      f.createIdentifier(key),
-      noNodeFlags,
-    ),
-  )
+  return f.createJsxExpression(undefined, f.createIdentifier(key))
 }
 
 /** Wrap a JSX child in a `<span style={...}>`. Exposed to plugins via EmitContext. */
@@ -1328,7 +1334,7 @@ const px2rem = (v: number, base: number): string =>
  * (3dp) does. Use this when emitting Panda style props (atomic class).
  * Inline `style={{...}}` callers should keep `px2rem` (full precision). */
 const px2remPanda = (v: number, base: number): string =>
-  `${+(v / base).toFixed(3)}rem`
+  `${+(v / base).toFixed(6)}rem`
 
 /**
  * Numeric → 'rem' string for properties that panda interprets as token
@@ -1499,11 +1505,45 @@ function emitNode(n: IRNode, ctx: CodegenCtx, parent: ParentCtx = { dir: 'none',
       if (n.height === 0) absY -= sw
       if (n.width === 0) absX -= sw
     }
-    jsx = wrapWithStyle(jsx, {
+    const wrapStyle: Record<string, unknown> = {
       position: 'absolute',
       left: px2remPanda(absX, ctx.remBase),
       top: px2remPanda(absY, ctx.remBase),
-    }, ctx)
+    }
+    // STRETCH constraint = pin both edges to parent so the wrapper grows
+    // with the parent. Without right/bottom the wrapper auto-sizes to its
+    // child (the main-case px width) and any in-svg `width: 100%` collapses.
+    if (n.constraints?.horizontal === 'STRETCH' && typeof n.absRight === 'number') {
+      wrapStyle.right = px2remPanda(n.absRight, ctx.remBase)
+    }
+    if (n.constraints?.vertical === 'STRETCH' && typeof n.absBottom === 'number') {
+      wrapStyle.bottom = px2remPanda(n.absBottom, ctx.remBase)
+    }
+    jsx = wrapWithStyle(jsx, wrapStyle, ctx)
+  }
+  // Visibility binding: skip rendering when bound owner-prop is false.
+  // Only apply on non-root nodes — at root the FC IS the rendered output;
+  // gating is the caller's job. (Also avoids tsgo printer panic when the
+  // body of the generated function is a JsxExpression rather than a real
+  // JSX element.) Cached IR may carry boundVisible stamped during a
+  // parent's walk; this guard makes standalone-of-the-same-node a no-op.
+  if (n.boundVisible && parent.dir !== 'none') {
+    ctx.usedPropBindings.add(n.boundVisible)
+    const cond = f.createBinaryExpression(
+      undefined,
+      f.createIdentifier(n.boundVisible),
+      undefined,
+      f.createToken(ast.SyntaxKind.ExclamationEqualsEqualsToken),
+      keywordExpression(ast.SyntaxKind.FalseKeyword),
+    )
+    const conditional = f.createConditionalExpression(
+      cond,
+      f.createToken(ast.SyntaxKind.QuestionToken),
+      f.createParenthesizedExpression(jsx as unknown as ast.Expression),
+      f.createToken(ast.SyntaxKind.ColonToken),
+      keywordExpression(ast.SyntaxKind.NullKeyword),
+    )
+    jsx = f.createJsxExpression(undefined, conditional)
   }
   return jsx
 }
@@ -1552,7 +1592,7 @@ export function generate(
     ),
   )
   // Pre-emit body so usedTypography is populated.
-  const body = emitNode(root, ctx) as ast.Expression
+  let body = emitNode(root, ctx) as ast.Expression
   const typographyImports = ctx.usedTypography.size > 0
     ? [f.createImportDeclaration(undefined,
         f.createImportClause(undefined, undefined,
@@ -1599,6 +1639,59 @@ export function generate(
   const fnParams = boundKeys.length === 0
     ? []
     : [f.createParameterDeclaration(undefined, undefined, f.createIdentifier('props'), undefined, undefined, undefined)]
+  // Bound props (from IR bindings — e.g. `label`, `iconType`) are pulled
+  // out as locals; everything else flows into `rest` and is spread onto
+  // the root JSX element. This makes the generated tree absorb instance
+  // overrides for FIXED variants (figma allows resizing instances of a
+  // FIXED master without detaching — those overrides arrive as `width`/
+  // `height`/`paddingX`/`gap` props that panda's styled root accepts).
+  let generatedBody: ast.ConciseBody
+  if (boundKeys.length === 0) {
+    generatedBody = f.createParenthesizedExpression(body)
+  } else {
+    if (ast.isJsxElement(body)) {
+      const op = body.openingElement
+      const newOpening = f.createJsxOpeningElement(
+        op.tagName,
+        op.typeArguments,
+        f.createJsxAttributes([
+          ...op.attributes.properties,
+          f.createJsxSpreadAttribute(f.createIdentifier('rest')),
+        ]),
+      )
+      body = f.createJsxElement(newOpening, body.children, body.closingElement) as ast.Expression
+    }
+    const destructure = f.createVariableStatement(undefined,
+      f.createVariableDeclarationList([
+        f.createVariableDeclaration(
+          f.createObjectBindingPattern([
+            ...boundKeys.map((k) =>
+              f.createBindingElement(undefined, undefined, f.createIdentifier(k), undefined),
+            ),
+            f.createBindingElement(
+              f.createToken(ast.SyntaxKind.DotDotDotToken),
+              undefined,
+              f.createIdentifier('rest'),
+              undefined,
+            ),
+          ]),
+          undefined,
+          undefined,
+          f.createAsExpression(
+            f.createIdentifier('props'),
+            f.createTypeReferenceNode(f.createIdentifier('Record'), [
+              f.createKeywordTypeNode(ast.SyntaxKind.StringKeyword),
+              f.createKeywordTypeNode(ast.SyntaxKind.UnknownKeyword),
+            ]),
+          ),
+        ),
+      ], nodeFlagsConst),
+    )
+    generatedBody = f.createBlock(
+      [destructure, f.createReturnStatement(f.createParenthesizedExpression(body))],
+      true,
+    )
+  }
   const generatedFn = f.createVariableStatement(
     [exportModifier()],
     f.createVariableDeclarationList([
@@ -1608,7 +1701,7 @@ export function generate(
         fcType,
         f.createArrowFunction(undefined, undefined, fnParams, undefined,
           f.createToken(ast.SyntaxKind.EqualsGreaterThanToken),
-          f.createParenthesizedExpression(body),
+          generatedBody,
         ),
       ),
     ], nodeFlagsConst),

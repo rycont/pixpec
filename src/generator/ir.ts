@@ -37,8 +37,25 @@ export interface IRBase {
   absolute?: boolean
   absX?: number
   absY?: number
+  /** Distance from parent's right/bottom edge in px. Walker pre-computes
+   *  for absolute children so codegen can emit `right`/`bottom` when the
+   *  constraint says STRETCH (= pin both edges). */
+  absRight?: number
+  absBottom?: number
+  /** figma plugin API `node.constraints` — only meaningful for absolute
+   *  children. STRETCH on a given axis = pin both edges to parent (the
+   *  underline-spans-tab-width pattern). */
+  constraints?: {
+    horizontal?: 'MIN' | 'CENTER' | 'MAX' | 'STRETCH' | 'SCALE'
+    vertical?: 'MIN' | 'CENTER' | 'MAX' | 'STRETCH' | 'SCALE'
+  }
   /** Node-level "Layer opacity" (figma slider). Captured only when < 1. */
   opacity?: number
+  /** Owner-component prop key whose boolean value gates this node's
+   *  rendering (figma `componentPropertyReferences.visible`). Walker
+   *  stamps this from the variant's bindings spec; codegen wraps the
+   *  emitted JSX with `{<propKey> !== false && ...}`. */
+  boundVisible?: string
 }
 
 /** Recognized as a registered component (defineComponent.figma binding). */

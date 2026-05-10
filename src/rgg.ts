@@ -70,18 +70,25 @@ export interface WriteRggOptions {
   shiftY?: number
 }
 
-/** Bilinear sample of the impl image at fractional (sx, sy). */
+/** Bilinear sample of the impl image at fractional (sx, sy). Edge handling
+ * clamps the +1 neighbor to the last in-bounds index instead of bailing to
+ * white — without this, an integer sample at the last row/column (very
+ * common when shift is 0) lost the actual pixel and rgg painted a spurious
+ * full-width stripe along the bottom/right edge. Fully out-of-bounds
+ * samples (sx < 0 etc.) still return white since there's no real pixel. */
 function sampleRgb(buf: Buffer, w: number, h: number, sx: number, sy: number): [number, number, number] {
-  if (sx < 0 || sy < 0 || sx >= w - 1 || sy >= h - 1) return [255, 255, 255]
+  if (sx < 0 || sy < 0 || sx > w - 1 || sy > h - 1) return [255, 255, 255]
   const x0 = Math.floor(sx)
   const y0 = Math.floor(sy)
+  const x1 = Math.min(x0 + 1, w - 1)
+  const y1 = Math.min(y0 + 1, h - 1)
   const fx = sx - x0
   const fy = sy - y0
   const idx = (yy: number, xx: number) => (yy * w + xx) * 3
   const a = idx(y0, x0)
-  const b = idx(y0, x0 + 1)
-  const c = idx(y0 + 1, x0)
-  const d = idx(y0 + 1, x0 + 1)
+  const b = idx(y0, x1)
+  const c = idx(y1, x0)
+  const d = idx(y1, x1)
   const blend = (i: number) =>
     buf[a + i] * (1 - fx) * (1 - fy) +
     buf[b + i] * fx * (1 - fy) +

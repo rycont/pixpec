@@ -1,48 +1,19 @@
 /**
- * Branded numeric type for CIEDE2000 ΔE values. The `__dE00` brand makes
- * `DE00` and `number` non-interchangeable at the type level — author can't
- * accidentally return a raw number from a noise function or compare a
- * dE_lab/dE_hsb scalar against a dE00 threshold.
- *
- *   const t = dE00(15.5)              // OK
- *   const t: DE00 = 15.5              // type error
- *   noise: () => 15.5                 // type error (must return DE00)
- *   noise: () => dE00(15.5)           // OK
- *
- * Runtime: zero overhead — `dE00(x)` is just an identity cast. The brand is
- * compile-time only.
- */
-declare const dE00Brand: unique symbol
-export type DE00 = number & { readonly [dE00Brand]: never }
-
-/** Constructor — narrows a raw number into a branded DE00. */
-export function dE00(x: number): DE00 {
-  return x as DE00
-}
-
-/**
  * pixpec types — the contract between framework and DS packages.
  *
- * A Component is metadata only: `{ name, cases, noise }`. Nothing more.
+ * A Component is metadata only: `{ name, variants, defaults }`. Nothing more.
  *
  * The React implementation (`impl.tsx`) lives on disk at
  * `<componentsDir>/<name>/impl.tsx` — by convention. The Vite harness loads
  * it dynamically when rendering. Node never imports it (so Vite-only features
  * like `import.meta.glob` work without leaking into Node verify scripts).
  *
- * The runner uses {name, cases, noise} to:
+ * The runner uses {name, variants} to:
  *   - drive iteration
  *   - hand a render URL `?component=<name>&case=<caseName>` to Playwright
  *   - cfigma-export the matching Figma node by `case.nodeId`
  *   - measure HSB dE on the two PNGs
- *   - compare to noise(props): pass iff actualDE <= noise(props)
- *
- * `noise(props)` returns the per-case PASS threshold directly. No external
- * multiplier — the component author bakes their own safety margin in.
- * Conceptually: "what's the largest dE this case can produce while still
- * being a faithful render?"
  */
-export type NoiseFn<P> = (props: P) => DE00
 
 /**
  * One verifiable instance of a component: a props value paired with the
@@ -121,10 +92,9 @@ export interface Variant<P> {
 }
 
 /**
- * Component definition. Four slots:
+ * Component definition. Three slots:
  *   impl  — produces HTML for given props (DS package handles React→HTML).
- *   noise — predicts dE (DS package implements via leaf-composition).
- *   cases — props ↔ Figma node mappings to verify.
+ *   variants — master variants + per-variant usecases ↔ Figma node mappings.
  *   render config (optional) — viewport + clipSelector for screenshot.
  *
  * Scale (deviceScaleFactor) is set at runner level so Chromium and Figma
@@ -138,7 +108,6 @@ interface ComponentBase<P> {
    *  occurrences that map to it; composition consumes the variant level
    *  only, while usecases feed runtime data + optional regression. */
   variants: Variant<P>[]
-  noise: NoiseFn<P>
   /** CSS selector clipped on screenshot. Default: `#pixpec-target`. */
   clipSelector?: string
   /** Page viewport. Generous default; the clipSelector trims to content. */
@@ -332,24 +301,3 @@ export interface EmitContext {
   ) => import('@typescript/native-preview/ast').JsxChild
 }
 
-/** Result for one (component, case) verification. */
-export interface CaseResult {
-  component: string
-  case: string
-  /** Measured ΔE00 (sum per case). */
-  actualDE: DE00
-  /** PASS threshold = noise(props). actualDE <= threshold → pass. */
-  threshold: DE00
-  pass: boolean
-  /** Paths to the rendered PNGs, for debug visualization if FAIL. */
-  artifacts: { figma: string; impl: string }
-}
-
-/**
- * Pluggable metric. Receives RGB buffers (HxWx3 uint8) for both sides;
- * returns a ΔE00 scalar.
- */
-export type Metric = (
-  figma: { width: number; height: number; data: Buffer },
-  impl: { width: number; height: number; data: Buffer },
-) => Promise<DE00> | DE00

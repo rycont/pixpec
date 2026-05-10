@@ -1,0 +1,6 @@
+export { compile } from './compile.ts'
+export type { CompileOptions } from './compile.ts'
+export { loadRegistry } from './registry.ts'
+export type { Registry, RegistryEntry, NodeBindings, NodeBindingValue } from './registry.ts'
+export { shouldDetach } from './detach.ts'
+export * from './design-ast.ts'

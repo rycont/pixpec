@@ -2,20 +2,13 @@
  * Browser-safe pixpec entry — only the `defineComponent` factory and types.
  *
  * The DS imports from here in everything that ends up in browser code paths
- * (component `index.ts`, `noise.ts`, `cases.ts`). The main `pixpec` entry
- * pulls in Node-only deps (Playwright, opencv-js, cfigma subprocess) and
- * must NOT be imported from any module Vite serves to the browser.
+ * (component `index.ts`, `cases.ts`). The main `pixpec` entry pulls in
+ * Node-only deps (Playwright, opencv-js, cfigma subprocess) and must NOT be
+ * imported from any module Vite serves to the browser.
  */
 import { createElement, type ComponentType, type ReactNode } from 'react'
-export { defineComponent, dE00 } from './types.ts'
-export type {
-  Component,
-  Case,
-  CaseResult,
-  NoiseFn,
-  Metric,
-  DE00,
-} from './types.ts'
+export { defineComponent } from './types.ts'
+export type { Component, Case } from './types.ts'
 
 /**
  * Helper: build a fixed-size box wrapper FC for a Case. Common pattern for

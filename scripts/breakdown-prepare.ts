@@ -149,7 +149,19 @@ console.log(`[prepare] ${targets.length} candidate nodes (${instanceCount} regis
 // ───── single root walk → full IR tree (with image SVGs resolved) ─────
 console.log(`[prepare] walking IR + resolving image SVGs…`)
 const t0 = Date.now()
-const { ir: rootIr, fileKey } = await buildRootPayload(rootNodeId, tab)
+// expandRootInstance: prepare's purpose is standalone-render parity for the
+// root node. If the root happens to be an instance of a registered DS
+// component, walking it as a frame here lets verify render straight from IR
+// — bypassing the registered React impl (which may be a stub during early
+// development). Nested instances stay collapsed so component composition
+// still flows through registered impls when those are present.
+// expandRootInstance: walk the root node as a frame so verify renders
+// from IR alone. Nested INSTANCEs of registered DS components stay
+// `kind: 'component'` and render via their React impl — that gives the
+// per-variant tree a parametric `<Icon Type={...} />` call instead of
+// inlining a hardcoded SVG, so the synthesized impl can swap content.
+// (For pre-impl Tab verify use --expand-all flag if/when added.)
+const { ir: rootIr, fileKey } = await buildRootPayload(rootNodeId, tab, { expandRootInstance: true })
 console.log(`[prepare] IR + images done in ${Date.now() - t0}ms (fileKey=${fileKey})`)
 
 // Index every subtree in the walked IR by figmaId so we can write per-node caches.
