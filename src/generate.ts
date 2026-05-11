@@ -1,5 +1,5 @@
 /**
- * `pixpec generate-v2 <fileKey>:<nodeId>` — new pipeline:
+ * `pixpec generate <fileKey>:<nodeId>` — new pipeline:
  *   dumper (raw figma) → compiler (Design AST) → emitter (target source).
  *
  * Sits alongside the legacy `pixpec generate` until the new pipeline reaches
@@ -11,13 +11,13 @@
 import { existsSync } from 'node:fs'
 import { mkdir, readFile, writeFile } from 'node:fs/promises'
 import { dirname, join, resolve } from 'node:path'
-import { dump } from './dumper/index.ts'
+import { dump, exportNodeSvg } from './dumper/index.ts'
 import { compile, loadRegistry } from './compiler/index.ts'
 import { getEmitter } from './emitter/index.ts'
 import { loadConfig } from './init.ts'
 import { listFigmaTabs } from './cfigma-meta.ts'
 
-export interface GenerateV2Options {
+export interface GenerateOptions {
   /** Override the emitter chosen via pixpec.toml. */
   emitter?: string
   /** Component the generated file slots into. Defaults to the figma node's
@@ -25,9 +25,11 @@ export interface GenerateV2Options {
   componentName?: string
   /** Output filename (without dir). Defaults to a sanitized figmaId. */
   outName?: string
+  /** Component-owned prop keys to strip before forwarding root props. */
+  propKeys?: string[]
 }
 
-export async function runGenerateV2(componentId: string, opts: GenerateV2Options = {}): Promise<{
+export async function runGenerate(componentId: string, opts: GenerateOptions = {}): Promise<{
   componentName: string
   outPath: string
   source: string
@@ -36,14 +38,14 @@ export async function runGenerateV2(componentId: string, opts: GenerateV2Options
   const componentsDir = resolve(root, cfg.componentsDir ?? 'src/components')
 
   const firstColon = componentId.indexOf(':')
-  if (firstColon < 0) throw new Error(`pixpec generate-v2: componentId must be <fileKey>:<nodeId>; got ${componentId}`)
+  if (firstColon < 0) throw new Error(`pixpec generate: componentId must be <fileKey>:<nodeId>; got ${componentId}`)
   const fileKey = componentId.slice(0, firstColon)
   const nodeId = componentId.slice(firstColon + 1)
 
   // Resolve tab from fileKey.
   const tabs = await listFigmaTabs({ cfigmaBin: cfg.cfigmaBin })
   const tab = tabs.find((t) => t.key === fileKey)
-  if (!tab) throw new Error(`pixpec generate-v2: no open figma tab matches fileKey ${fileKey}`)
+  if (!tab) throw new Error(`pixpec generate: no open figma tab matches fileKey ${fileKey}`)
 
   // Load token map (figma var id → semantic path) + intrinsic numeric values.
   const tokenMap: Record<string, string> = {}
@@ -63,6 +65,7 @@ export async function runGenerateV2(componentId: string, opts: GenerateV2Options
         if (typeof num === 'number') {
           tokenValueMap[v.id] = num
           if (v.key) tokenValueMap[v.key] = num
+          tokenValueMap[tokenPath] = num
         }
       }
     }
@@ -102,32 +105,52 @@ export async function runGenerateV2(componentId: string, opts: GenerateV2Options
 
   // Dump → compile → emit.
   const raw = await dump({ cfigmaBin: cfg.cfigmaBin ?? 'cfigma', tab: tab.key, nodeId })
-  const ast = compile(raw, { registry, bindings: bindingsForNode, tokenMap, tokenValueMap })
+  const ast = await compile(raw, {
+    registry, bindings: bindingsForNode, tokenMap, tokenValueMap,
+    exportSvg: (id) => exportNodeSvg({ cfigmaBin: cfg.cfigmaBin ?? 'cfigma', tab: tab.key, nodeId: id }),
+  })
   const emitterName = opts.emitter ?? (cfg as { emitter?: string }).emitter ?? 'react-panda'
   const emitter = getEmitter(emitterName)
+  // Land in <componentsDir>/<componentName>/generated/<safeId>.<ext>.
+  const safeId = (fileKey + '_' + nodeId).replace(/[^A-Za-z0-9]/g, '_')
+  const outDir = resolve(componentsDir, componentName, 'generated')
   const result = await emitter.emit(ast, {
     componentName,
-    designSystem: { tokens: tokenMap, typography: typographyMap },
+    designSystem: { tokens: tokenMap, tokenValues: tokenValueMap, typography: typographyMap },
     registry: new Map(
       [...registry].map(([, v]) => [v.componentName, { componentName: v.componentName, dir: v.dir, hasProps: true }]),
     ),
     plugins: plugins as never,
     remBase: cfg.remBase,
+    propKeys: opts.propKeys,
+    outputDir: outDir,
+    rootDir: root,
+    componentsDir,
+    propsFile: resolve(componentsDir, componentName, 'props.ts'),
   })
 
-  // Land in <componentsDir>/<componentName>/generated/<safeId>.<ext>
-  const safeId = (fileKey + '_' + nodeId).replace(/[^A-Za-z0-9]/g, '_')
   const outName = opts.outName ?? `${safeId}.${result.fileExtension}`
-  const outDir = resolve(componentsDir, componentName, 'generated')
   await mkdir(outDir, { recursive: true })
   const outPath = join(outDir, outName)
-  await writeFile(outPath, result.source)
+  let source = result.source
+  if (result.fileExtension === 'ts' || result.fileExtension === 'tsx') {
+    const prettier = await import('prettier')
+    source = await prettier.format(source, {
+      parser: 'typescript',
+      tabWidth: 4,
+      semi: false,
+      singleQuote: true,
+      trailingComma: 'all',
+      printWidth: 100,
+    })
+  }
+  await writeFile(outPath, source)
   for (const sc of result.sidecars ?? []) {
     const scPath = resolve(outDir, sc.relativePath)
     await mkdir(dirname(scPath), { recursive: true })
     await writeFile(scPath, sc.content)
   }
-  return { componentName, outPath, source: result.source }
+  return { componentName, outPath, source }
 }
 
 function hasDescId(root: import('./dumper/raw-node.ts').RawNode, id: string): boolean {

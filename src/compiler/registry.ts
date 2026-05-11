@@ -21,7 +21,7 @@ import { pathToFileURL } from 'node:url'
 import type { RawNode } from '../dumper/raw-node.ts'
 
 export interface NodeBindingValue {
-  attr?: { text?: string; visible?: string; color?: string }
+  attr?: { text?: string; visible?: string; color?: string; fill?: string; textStyle?: string }
   instanceProps?: Record<string, string>
 }
 
@@ -35,7 +35,7 @@ export interface RegistryEntry {
    *  redundant prop emissions on instance call sites. */
   defaults?: Record<string, unknown>
   /** Caller-side prop hydrator: figma raw → typed props record. */
-  propsFromFigma?: (raw: unknown, node?: unknown) => Record<string, unknown>
+  propsFromFigma?: (raw: unknown, children?: unknown) => Record<string, unknown>
   /** Aggregated bindings across all variants (master node id → bindings). */
   bindings: NodeBindings
   /** Per-variant raw master snapshot, keyed by variant key (cross-file

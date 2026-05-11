@@ -7,36 +7,70 @@
  * sole consumer.
  */
 
-import { execFile } from 'node:child_process'
-import { promisify } from 'node:util'
-import type { RawNode } from './raw-node.ts'
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
+import type { RawNode } from "./raw-node.ts";
 
-const execFileAsync = promisify(execFile)
+const execFileAsync = promisify(execFile);
 
 export interface DumpOptions {
-  cfigmaBin: string
+  cfigmaBin: string;
   /** Figma file key (or human-readable tab pattern). */
-  tab: string
+  tab: string;
   /** Root node id to walk. */
-  nodeId: string
+  nodeId: string;
   /** Optional CDP port override for cfigma's bridge. */
-  cdpPort?: string
+  cdpPort?: string;
 }
 
 export async function dump(opts: DumpOptions): Promise<RawNode> {
-  const code = pluginScript(opts.nodeId)
+  const code = pluginScript(opts.nodeId);
   const { stdout } = await execFileAsync(
     opts.cfigmaBin,
-    ['--tab', opts.tab, 'exec', code],
+    ["--tab", opts.tab, "exec", code],
     {
-      encoding: 'utf8',
+      encoding: "utf8",
       maxBuffer: 64 * 1024 * 1024,
-      env: { ...process.env, CFIGMA_CDP_PORT: opts.cdpPort ?? process.env.CFIGMA_CDP_PORT ?? '9222' },
+      env: {
+        ...process.env,
+        CFIGMA_CDP_PORT: opts.cdpPort ?? process.env.CFIGMA_CDP_PORT ?? "9222",
+      },
     },
-  )
-  const parsed = JSON.parse(stdout) as RawNode | { error: string }
-  if ('error' in parsed) throw new Error(`pixpec dump: ${parsed.error}`)
-  return parsed
+  );
+  const parsed = JSON.parse(stdout) as RawNode | { error: string };
+  if ("error" in parsed) throw new Error(`pixpec dump: ${parsed.error}`);
+  return parsed;
+}
+
+/** Export a single figma node as an SVG string. Used by the compiler to
+ *  fold pure-visual subtrees into a single DVector. */
+export async function exportNodeSvg(opts: DumpOptions): Promise<string> {
+  const code = `
+    const node = await figma.getNodeByIdAsync(${JSON.stringify(opts.nodeId)});
+    if (!node) return { error: 'node_not_found: ' + ${JSON.stringify(opts.nodeId)} };
+    try {
+      const bytes = await node.exportAsync({ format: 'SVG_STRING' });
+      return { svg: bytes };
+    } catch (e) {
+      return { error: 'svg_export_failed: ' + (e && e.message || String(e)) };
+    }
+  `;
+  const { stdout } = await execFileAsync(
+    opts.cfigmaBin,
+    ["--tab", opts.tab, "exec", code],
+    {
+      encoding: "utf8",
+      maxBuffer: 64 * 1024 * 1024,
+      env: {
+        ...process.env,
+        CFIGMA_CDP_PORT: opts.cdpPort ?? process.env.CFIGMA_CDP_PORT ?? "9222",
+      },
+    },
+  );
+  const parsed = JSON.parse(stdout) as { svg: string } | { error: string };
+  if ("error" in parsed)
+    throw new Error(`pixpec exportNodeSvg: ${parsed.error}`);
+  return parsed.svg;
 }
 
 /** Plugin script body — runs inside figma. Walks the node tree from
@@ -59,6 +93,94 @@ function clean(value) {
 }
 function safe(fn, fallback) {
   try { return fn(); } catch (_) { return fallback; }
+}
+function bytesToBase64(bytes) {
+  let binary = '';
+  const chunk = 0x8000;
+  for (let i = 0; i < bytes.length; i += chunk) {
+    binary += String.fromCharCode.apply(null, bytes.slice(i, i + chunk));
+  }
+  return btoa(binary);
+}
+function imageMime(bytes) {
+  if (bytes && bytes[0] === 0x89 && bytes[1] === 0x50 && bytes[2] === 0x4e && bytes[3] === 0x47) return 'image/png';
+  if (bytes && bytes[0] === 0xff && bytes[1] === 0xd8) return 'image/jpeg';
+  if (bytes && bytes[0] === 0x47 && bytes[1] === 0x49 && bytes[2] === 0x46) return 'image/gif';
+  return 'image/png';
+}
+async function cleanPaints(paints) {
+  const out = [];
+  for (const paint of paints) {
+    const p = clean(paint);
+    if (p && p.type === 'IMAGE' && p.imageHash) {
+      try {
+        const img = figma.getImageByHash(p.imageHash);
+        const bytes = img ? await img.getBytesAsync() : null;
+        if (bytes) p.dataUrl = 'data:' + imageMime(bytes) + ';base64,' + bytesToBase64(bytes);
+      } catch (e) {
+        throw new Error('image_fill_read_failed: ' + p.imageHash + ': ' + (e && e.message ? String(e.message) : String(e)));
+      }
+    }
+    out.push(p);
+  }
+  return out;
+}
+function readOrError(out, key, fn) {
+  try {
+    return fn();
+  } catch (e) {
+    const message = e && e.message ? String(e.message) : String(e);
+    throw new Error('dump_read_failed: ' + out.type + ' ' + out.id + ' (' + out.name + ') .' + key + ': ' + message);
+  }
+}
+function normalizeComponentProperties(componentProperties) {
+  if (!componentProperties) return undefined;
+  const cp = {};
+  for (const k of Object.keys(componentProperties)) {
+    const v = componentProperties[k];
+    cp[k] = { type: v.type, value: v.value, boundVariables: v.boundVariables };
+  }
+  return clean(cp);
+}
+async function readComponentProperties(out, node, mainComponent) {
+  try {
+    return normalizeComponentProperties(node.componentProperties);
+  } catch (e) {
+    const message = e && e.message ? String(e.message) : String(e);
+    let imported;
+    try {
+      if (mainComponent && mainComponent.key) imported = await figma.importComponentByKeyAsync(mainComponent.key);
+    } catch (_) {
+      imported = undefined;
+    }
+    if (imported) {
+      let variantProperties;
+      try {
+        variantProperties = imported.variantProperties;
+      } catch (_) {
+        variantProperties = undefined;
+      }
+      if (variantProperties && Object.keys(variantProperties).length > 0) {
+        let definitions = {};
+        try {
+          const parent = imported.parent;
+          if (parent && parent.type === 'COMPONENT_SET') definitions = parent.componentPropertyDefinitions || {};
+        } catch (_) {
+          definitions = {};
+        }
+        const cp = {};
+        for (const k of Object.keys(variantProperties)) {
+          cp[k] = {
+            type: definitions[k] && definitions[k].type || 'VARIANT',
+            value: variantProperties[k],
+            boundVariables: undefined,
+          };
+        }
+        return clean(cp);
+      }
+    }
+    throw new Error('dump_read_failed: ' + out.type + ' ' + out.id + ' (' + out.name + ') .componentProperties: ' + message);
+  }
 }
 async function dumpNode(node) {
   if (!node) return null;
@@ -96,8 +218,9 @@ async function dumpNode(node) {
     out.counterAxisAlignItems = node.counterAxisAlignItems;
     out.primaryAxisAlignItems = node.primaryAxisAlignItems;
     if (node.layoutWrap) out.layoutWrap = node.layoutWrap;
-    if (Array.isArray(node.fills)) out.fills = clean(node.fills);
+    if (Array.isArray(node.fills)) out.fills = await cleanPaints(node.fills);
     if (Array.isArray(node.strokes) && node.strokes.length) out.strokes = clean(node.strokes);
+    if (Array.isArray(node.effects) && node.effects.length) out.effects = clean(node.effects);
     if (typeof node.strokeWeight === 'number') out.strokeWeight = node.strokeWeight;
     else if (node.strokeWeight === figma.mixed) {
       out.strokeWeight = 'mixed';
@@ -124,7 +247,7 @@ async function dumpNode(node) {
   }
 
   if (node.type === 'INSTANCE') {
-    const mc = node.mainComponent;
+    const mc = readOrError(out, 'mainComponent', () => node.mainComponent);
     if (mc) {
       let parent = mc.parent;
       while (parent && parent.type !== 'COMPONENT_SET') parent = parent.parent;
@@ -136,19 +259,17 @@ async function dumpNode(node) {
         parentName: parent && parent.name || undefined,
       };
     }
-    if (node.componentProperties) {
-      const cp = {};
-      for (const k of Object.keys(node.componentProperties)) {
-        const v = node.componentProperties[k];
-        cp[k] = { type: v.type, value: v.value, boundVariables: v.boundVariables };
-      }
-      out.componentProperties = clean(cp);
+    const componentProperties = await readComponentProperties(out, node, mc);
+    if (componentProperties) {
+      out.componentProperties = componentProperties;
     }
-    if (Array.isArray(node.overrides)) {
-      out.overrides = node.overrides.map(o => ({ id: o.id, overriddenFields: (o.overriddenFields || []).slice() }));
+    const overrides = readOrError(out, 'overrides', () => node.overrides);
+    if (Array.isArray(overrides)) {
+      out.overrides = overrides.map(o => ({ id: o.id, overriddenFields: (o.overriddenFields || []).slice() }));
     }
-    if (Array.isArray(node.exposedInstances) && node.exposedInstances.length) {
-      out.exposedInstances = node.exposedInstances.map(i => ({ id: i.id, name: i.name }));
+    const exposedInstances = readOrError(out, 'exposedInstances', () => node.exposedInstances);
+    if (Array.isArray(exposedInstances) && exposedInstances.length) {
+      out.exposedInstances = exposedInstances.map(i => ({ id: i.id, name: i.name }));
     }
   }
 
@@ -166,7 +287,7 @@ async function dumpNode(node) {
     if (typeof node.textCase === 'string') out.textCase = node.textCase;
     if (typeof node.textDecoration === 'string') out.textDecoration = node.textDecoration;
     if (typeof node.textStyleId === 'string') out.textStyleId = node.textStyleId;
-    if (Array.isArray(node.fills)) out.fills = clean(node.fills);
+    if (Array.isArray(node.fills)) out.fills = await cleanPaints(node.fills);
     const segs = safe(() => node.getStyledTextSegments(['fills', 'fontName', 'fontSize', 'fontWeight', 'lineHeight', 'textDecoration', 'letterSpacing', 'textCase']), null);
     if (segs && segs.length > 1) out.styledTextSegments = clean(segs.map(s => ({
       characters: s.characters,
@@ -182,7 +303,7 @@ async function dumpNode(node) {
   }
 
   if (SHAPELIKE.has(node.type)) {
-    if (Array.isArray(node.fills)) out.fills = clean(node.fills);
+    if (Array.isArray(node.fills)) out.fills = await cleanPaints(node.fills);
     if (Array.isArray(node.strokes) && node.strokes.length) out.strokes = clean(node.strokes);
     if (typeof node.strokeWeight === 'number') out.strokeWeight = node.strokeWeight;
     if (node.strokeAlign) out.strokeAlign = node.strokeAlign;
@@ -209,7 +330,7 @@ async function dumpNode(node) {
     // forwarded as a parent CSS color. GROUPs themselves don't paint, but
     // we recurse into them via the children walk below so inner VECTORs
     // are reachable.
-    if (Array.isArray(node.fills)) out.fills = clean(node.fills);
+    if (Array.isArray(node.fills)) out.fills = await cleanPaints(node.fills);
     if (Array.isArray(node.strokes) && node.strokes.length) out.strokes = clean(node.strokes);
   }
 
@@ -228,5 +349,5 @@ async function dumpNode(node) {
 const root = await figma.getNodeByIdAsync(${JSON.stringify(rootId)});
 if (!root) return { error: 'node_not_found: ' + ${JSON.stringify(rootId)} };
 return await dumpNode(root);
-`
+`;
 }

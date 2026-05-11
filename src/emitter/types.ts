@@ -27,6 +27,7 @@ export interface EmitContext {
    *  Each emitter ignores the slots it doesn't care about. */
   designSystem: {
     tokens?: Record<string, string>
+    tokenValues?: Record<string, number>
     typography?: Record<string, string>
     fonts?: unknown
   }
@@ -39,6 +40,19 @@ export interface EmitContext {
   plugins?: unknown[]
   /** Design-unit → physical-unit base. Default 16 (CSS rem base). */
   remBase?: number
+  /** Component-owned prop keys that must not be forwarded to the rendered root. */
+  propKeys?: string[]
+  /** Source figma node id for emitter-specific comments or sidecar ids. */
+  sourceId?: string
+  /** Directory where the emitted source file will be written. Import paths are
+   *  computed relative to this directory when present. */
+  outputDir?: string
+  /** Project root. Defaults to process.cwd(); used to resolve styled-system. */
+  rootDir?: string
+  /** Components directory. Defaults to <rootDir>/src/components. */
+  componentsDir?: string
+  /** Optional props file for component output. Omit for prop-less view output. */
+  propsFile?: string
 }
 
 /** Minimal component metadata an emitter needs about a registered DInstance

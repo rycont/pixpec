@@ -35,6 +35,16 @@ export interface Case<P> {
    * variant should carry this flag. Composition picks the main case's
    * generated tree and parametrises it for the bucket's other usecases. */
   isMainCase?: boolean
+  /** Skip pixel verify for this usecase. Reason string is logged in the
+   * verify report (use to document why parity isn't achievable, e.g.
+   * known figma↔Skia rasterizer divergence on sub-pixel curve sampling). */
+  skipVerify?: string
+  /**
+   * Optional React component that wraps this individual usecase during
+   * render. Used when a Figma instance has an explicit screenshot box
+   * such as resized fixed dimensions.
+   */
+  wrapper?: import('react').ComponentType<{ children: import('react').ReactNode }>
 }
 
 /** Per-figma-node binding map — generate consumes this to annotate IR
@@ -47,6 +57,8 @@ export interface NodeBinding<P> {
   attr?: {
     text?: keyof P & string
     color?: keyof P & string
+    fill?: keyof P & string
+    textStyle?: keyof P & string
     visible?: keyof P & string
   }
   /** componentProperty key (figma's prop name on this INSTANCE) →
@@ -214,11 +226,15 @@ export interface FigmaBinding<P> {
    * master is moved/duplicated to a new file). */
   componentSetId?: string
   /** Pure function: serialized instance → React props. The second arg is
-   * the IR node for this instance (with `children` populated through
-   * nested instances) for cases that the flat `raw` shape can't cover —
-   * e.g. a Tab whose `labels: string[]` prop is collected from N nested
-   * Tab_Item children. Most components ignore it. */
-  propsFromFigma: (raw: FigmaInstanceRaw, node?: import('./generator/ir.ts').IRComponent) => P
+   * the compiled child Design AST nodes for this instance — present when
+   * the parent contains nested INSTANCEs whose props the parent needs to
+   * aggregate (e.g. a Tab whose `tabItems: TabItemProps[]` is collected
+   * from N nested Tab_Item children). Most components ignore it. Filter
+   * by `c.kind === NodeKind.Instance` to pick out the component children. */
+  propsFromFigma: (
+    raw: FigmaInstanceRaw,
+    children?: import('./compiler/design-ast.ts').DNode[],
+  ) => P
 }
 
 /** Split a `<fileKey>:<nodeId>` figmaId into its parts. Splits on the
@@ -268,7 +284,7 @@ export interface CodegenPlugin {
    * direct prop edits on JSX self-closing elements.
    */
   emitWrap?: (
-    n: import('./generator/ir.ts').IRNode,
+    n: import('./compiler/design-ast.ts').DNode,
     jsx: import('@typescript/native-preview/ast').JsxChild,
     ctx: EmitContext,
   ) => import('@typescript/native-preview/ast').JsxChild
@@ -300,4 +316,3 @@ export interface EmitContext {
     attr: import('@typescript/native-preview/ast').JsxAttribute,
   ) => import('@typescript/native-preview/ast').JsxChild
 }
-

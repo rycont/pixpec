@@ -9,62 +9,61 @@
  * The same primitive `cfigma --tab <p> exec <code>` from figma.ts; we just
  * send a different code body.
  */
-import { execFile } from 'node:child_process'
-import { promisify } from 'node:util'
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
 
-const execFileAsync = promisify(execFile)
+const execFileAsync = promisify(execFile);
 
 function cleanControlValue<T>(value: T): T {
-  if (typeof value === 'string') {
-    return value.replace(/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g, '') as T
+  if (typeof value === "string") {
+    return value.replace(/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g, "") as T;
   }
-  if (Array.isArray(value)) return value.map(cleanControlValue) as T
-  if (value && typeof value === 'object') {
+  if (Array.isArray(value)) return value.map(cleanControlValue) as T;
+  if (value && typeof value === "object") {
     return Object.fromEntries(
-      Object.entries(value as Record<string, unknown>).map(([k, v]) => [k, cleanControlValue(v)]),
-    ) as T
+      Object.entries(value as Record<string, unknown>).map(([k, v]) => [
+        k,
+        cleanControlValue(v),
+      ]),
+    ) as T;
   }
-  return value
+  return value;
 }
 
-export type FigmaPropType = 'VARIANT' | 'TEXT' | 'BOOLEAN' | 'INSTANCE_SWAP'
+export type FigmaPropType = "VARIANT" | "TEXT" | "BOOLEAN" | "INSTANCE_SWAP";
 
 export interface FigmaPropertyDefinition {
-  type: FigmaPropType
-  defaultValue: unknown
-  variantOptions?: string[]
+  type: FigmaPropType;
+  defaultValue: unknown;
+  variantOptions?: string[];
 }
 
 export interface FigmaInstanceSwapValue {
-  kind: 'instance'
-  mainComponentId: string | null
-  mainComponentName: string | null
+  kind: "instance";
+  mainComponentId: string | null;
+  mainComponentName: string | null;
 }
 
-export type FigmaPropValue =
-  | string
-  | boolean
-  | FigmaInstanceSwapValue
-  | null
+export type FigmaPropValue = string | boolean | FigmaInstanceSwapValue | null;
 
 /** Per-variant schema for an exposed nested instance slot — used by init
  * to emit a properly-typed sub-interface instead of `Record<string, unknown>`. */
 export interface FigmaExposedInstanceSchema {
   /** componentSet key (preferred) or component key for figma binding. */
-  mainKey: string | null
+  mainKey: string | null;
   /** componentSet name (e.g. "Icon", "Button"). */
-  mainName: string | null
+  mainName: string | null;
   /** Property definitions of the slot's componentSet — same shape as the
    * top-level componentPropertyDefinitions. Drives TS type emission. */
-  propertyDefinitions: Record<string, FigmaPropertyDefinition>
+  propertyDefinitions: Record<string, FigmaPropertyDefinition>;
 }
 
 export interface FigmaVariantMeta {
-  id: string
+  id: string;
   /** Cross-file durable key (figma's stable variant identifier). Library
    * instances inside other files reference variants by key, not by id. */
-  key?: string
-  name: string
+  key?: string;
+  name: string;
   /**
    * Prop name → resolved value for this variant. Combines:
    *   - VARIANT / TEXT / BOOLEAN / INSTANCE_SWAP props from the variant itself
@@ -72,61 +71,79 @@ export interface FigmaVariantMeta {
    *     in figma — keyed by the layer name (duplicate names get `_2`, `_3`
    *     suffixes), values are the slot's own resolved componentProperties.
    */
-  propValues: Record<string, FigmaPropValue>
+  propValues: Record<string, FigmaPropValue>;
   /** Schema for each exposed nested-instance slot (same keys as propValues
    * for slots that came from exposedInstances). init aggregates these
    * across variants and emits a typed sub-interface per slot. */
-  exposedSchemas?: Record<string, FigmaExposedInstanceSchema>
+  exposedSchemas?: Record<string, FigmaExposedInstanceSchema>;
   /** Every TEXT descendant in this variant keyed by layer name → chars.
    * init pulls master values for usage-detected synthetic props (e.g.
    * `label` derived from a TEXT layer named "Label") so the master
    * variant's case props match what figma's master node renders. */
-  textLayers?: Record<string, string>
+  textLayers?: Record<string, string>;
   /** Every nested INSTANCE descendant in this variant keyed by layer name
    * → propKey → resolved value. Same purpose as textLayers but for the
    * usage-detected nested-prop pattern (e.g. `iconType` ← Icon.Type). */
-  nestedProps?: Record<string, Record<string, unknown>>
+  nestedProps?: Record<string, Record<string, unknown>>;
   /** Per-node-id text descendant rows — used to build Variant.bindings
    * (node id → owner-prop). textLayers groups by name; this preserves
    * the underlying nodeIds so init can emit a per-id binding map. */
-  textNodes?: Array<{ id: string; name: string; chars: string }>
+  textNodes?: Array<{
+    id: string;
+    name: string;
+    chars: string;
+    propRef?: string;
+  }>;
   /** Per-node-id nested INSTANCE rows — same purpose as textNodes. */
-  nestedNodes?: Array<{ id: string; name: string; props: Record<string, unknown> }>
+  nestedNodes?: Array<{
+    id: string;
+    name: string;
+    props: Record<string, unknown>;
+  }>;
   /** Per-node-id visibility-binding rows — each node whose `visible` field
    *  is bound to an owner-component boolean property. init maps the raw
    *  figma key (`Left Icon#2137:0`) to a TS prop name and records it in
    *  `Variant.bindings[nodeId].attr.visible`. */
-  visibilityNodes?: Array<{ id: string; propRef: string }>
+  visibilityNodes?: Array<{ id: string; propRef: string }>;
   /** Master variant's intrinsic figma dim. Used by init to emit a
    * boxWrapper on master variant cases — impl's CSS-flex hug may differ
    * from figma's layout-engine hug by a sub-pixel, so locking the wrapper
    * to the figma dim keeps pixel parity. */
-  width?: number
-  height?: number
+  width?: number;
+  height?: number;
+  renderWidth?: number;
+  renderHeight?: number;
+  renderOffsetX?: number;
+  renderOffsetY?: number;
   /** Master variant's autolayout values — paddings + itemSpacing (gap).
    * Forwarded as explicit case props so impl can render variants whose
    * size-difference is encoded as padding/gap rather than a `Size`
    * componentProperty (figma sometimes ships sub-variants differing only
    * in autolayout values, with no exposed prop to switch them). */
+  /** figma's layoutMode on this variant — `'HORIZONTAL'`, `'VERTICAL'`,
+   *  or `'NONE'`. Init only emits padding/gap as case props for autolayout
+   *  variants, since on a non-autolayout frame they're meaningless visual
+   *  noise (no engine consumes them). */
+  layoutMode?: "HORIZONTAL" | "VERTICAL" | "NONE";
   layout?: {
-    paddingTop: number | null
-    paddingRight: number | null
-    paddingBottom: number | null
-    paddingLeft: number | null
-    gap: number | null
-  }
+    paddingTop: number | null;
+    paddingRight: number | null;
+    paddingBottom: number | null;
+    paddingLeft: number | null;
+    gap: number | null;
+  };
 }
 
 export interface FigmaComponentMeta {
   /** 'set' for ComponentSet (with variants), 'single' for standalone Component. */
-  kind: 'set' | 'single'
-  id: string
-  name: string
+  kind: "set" | "single";
+  id: string;
+  name: string;
   /** Stable component-set key for figma binding (used by registered DS
    * components to declare which figma master they implement). */
-  key?: string
-  propertyDefinitions: Record<string, FigmaPropertyDefinition>
-  variants: FigmaVariantMeta[]
+  key?: string;
+  propertyDefinitions: Record<string, FigmaPropertyDefinition>;
+  variants: FigmaVariantMeta[];
 }
 
 const PLUGIN_TEMPLATE = (componentId: string) => `
@@ -135,8 +152,21 @@ const targetId = ${JSON.stringify(componentId)};
 // loaded — works regardless of which page is currently active.
 const node = await figma.getNodeByIdAsync(targetId);
 if (!node) throw new Error('component not found: ' + targetId);
+if ((node.type === 'COMPONENT' || node.type === 'COMPONENT_SET') && node.remote) {
+  let set = node.type === 'COMPONENT_SET' ? node : node.parent;
+  while (set && set.type !== 'COMPONENT_SET') set = set.parent;
+  throw new Error(
+    'remote component proxy is not a valid init target: ' + targetId +
+    ' (' + node.name + '). Open the source library file and run init with the original ' +
+    (node.type === 'COMPONENT_SET' ? 'COMPONENT_SET' : 'COMPONENT') +
+    ' node id. componentSetKey=' + (set && set.key || '<unknown>')
+  );
+}
 
 function stripHashKey(k) { return String(k).replace(/#[^#]*$/, ''); }
+function safe(fn, fallback) {
+  try { return fn(); } catch (_) { return fallback; }
+}
 
 function extractVariant(v) {
   const propValues = Object.assign({}, v.variantProperties || {});
@@ -159,10 +189,14 @@ function extractVariant(v) {
   const visitExtra = (n) => {
     if (n.type === 'TEXT') {
       textLayers[n.name] = n.characters;
-      textNodes.push({ id: n.id, name: n.name, chars: n.characters });
+      // propRef captures the figma component-property binding (e.g.
+      // 'Label#516:44' from refs.characters). init uses it to emit a
+      // props.label expression in JSX instead of the literal master string.
+      const propRef = n.componentPropertyReferences?.characters;
+      textNodes.push({ id: n.id, name: n.name, chars: n.characters, propRef });
     }
     if (n.type === 'INSTANCE') {
-      const cp = n.componentProperties || {};
+      const cp = safe(() => n.componentProperties || {}, {});
       const layer = nestedProps[n.name] = nestedProps[n.name] || {};
       const flat = {};
       for (const k of Object.keys(cp)) {
@@ -195,7 +229,7 @@ function extractVariant(v) {
         visibilityNodes.push({ id: n.id, propRef: refs.visible });
       }
       if (refs.mainComponent && n.type === 'INSTANCE') {
-        const mc = n.mainComponent;
+        const mc = safe(() => n.mainComponent, null);
         propValues[stripHashKey(refs.mainComponent)] = {
           kind: 'instance',
           mainComponentId: mc ? mc.id : null,
@@ -223,7 +257,7 @@ function extractVariant(v) {
     taken.add(key);
 
     const innerProps = {};
-    const cp = inst.componentProperties || {};
+    const cp = safe(() => inst.componentProperties || {}, {});
     for (const k of Object.keys(cp)) {
       innerProps[stripHashKey(k)] = cp[k] && 'value' in cp[k] ? cp[k].value : cp[k];
     }
@@ -232,7 +266,7 @@ function extractVariant(v) {
     // Capture the slot's componentSet schema so init can emit a proper TS
     // type for its props. Walk up to COMPONENT_SET (so all variants of the
     // referenced component share one definition).
-    let main = inst.mainComponent;
+    let main = safe(() => inst.mainComponent, null);
     let set = main;
     while (set && set.type !== 'COMPONENT_SET') set = set.parent;
     const root = set || main;
@@ -255,7 +289,19 @@ function extractVariant(v) {
     paddingLeft: typeof v.paddingLeft === 'number' ? v.paddingLeft : null,
     gap: typeof v.itemSpacing === 'number' ? v.itemSpacing : null,
   };
-  return { id: v.id, name: v.name, key: v.key, propValues, exposedSchemas, textLayers, nestedProps, textNodes, nestedNodes, visibilityNodes, width: v.width, height: v.height, layout };
+  const layoutMode = typeof v.layoutMode === 'string' ? v.layoutMode : 'NONE';
+  const rb = safe(() => v.absoluteRenderBounds, null);
+  const bb = safe(() => v.absoluteBoundingBox, null);
+  const render =
+    rb && bb
+      ? {
+          renderWidth: rb.width,
+          renderHeight: rb.height,
+          renderOffsetX: bb.x - rb.x,
+          renderOffsetY: bb.y - rb.y,
+        }
+      : {};
+  return { id: v.id, name: v.name, key: v.key, propValues, exposedSchemas, textLayers, nestedProps, textNodes, nestedNodes, visibilityNodes, width: v.width, height: v.height, ...render, layout, layoutMode };
 }
 
 function stripHash(defs) {
@@ -292,21 +338,21 @@ if (node.type === 'COMPONENT') {
   };
 }
 throw new Error('node ' + targetId + ' is ' + node.type + ', not a COMPONENT or COMPONENT_SET');
-`
+`;
 
 export async function fetchComponentMeta(opts: {
-  tabPattern: string
-  componentId: string
-  cfigmaBin?: string
+  tabPattern: string;
+  componentId: string;
+  cfigmaBin?: string;
 }): Promise<FigmaComponentMeta> {
-  const bin = opts.cfigmaBin ?? 'cfigma'
-  const code = PLUGIN_TEMPLATE(opts.componentId)
+  const bin = opts.cfigmaBin ?? "cfigma";
+  const code = PLUGIN_TEMPLATE(opts.componentId);
   const { stdout } = await execFileAsync(
     bin,
-    ['--tab', opts.tabPattern, 'exec', code],
-    { encoding: 'utf8', maxBuffer: 16 * 1024 * 1024 },
-  )
-  return cleanControlValue(JSON.parse(stdout)) as FigmaComponentMeta
+    ["--tab", opts.tabPattern, "exec", code],
+    { encoding: "utf8", maxBuffer: 16 * 1024 * 1024 },
+  );
+  return cleanControlValue(JSON.parse(stdout)) as FigmaComponentMeta;
 }
 
 /**
@@ -320,18 +366,18 @@ export interface InstanceTextSummary {
   /** Sample descId (any one) — used as a propsFromFigma lookup key when
    * the variant tree is single. `descIds` carries the full set so binding
    * code can OR-fallback across variants. */
-  descId: string
-  descIds: string[]
-  descName: string
+  descId: string;
+  descIds: string[];
+  descName: string;
   /** True when at least one instance overrides `characters` away from the
    * master's value (figma marks 'characters' in `instance.overrides`). */
-  hasOverride: boolean
+  hasOverride: boolean;
   /** How many of `instanceCount` actually override `characters`. init
    * applies a 20% threshold (overrideCount / totalInstances) to decide
    * whether the prop is exposed. */
-  overrideCount: number
-  samples: string[]
-  instanceCount: number
+  overrideCount: number;
+  samples: string[];
+  instanceCount: number;
 }
 
 /** Per-(nested-instance-name, propKey) summary — same role as
@@ -341,17 +387,17 @@ export interface InstanceTextSummary {
  * exceeds the 20% threshold. */
 export interface NestedPropSummary {
   /** Layer name of the nested INSTANCE (e.g. "Icon"). */
-  layerName: string
+  layerName: string;
   /** componentSetKey of the nested instance — for type emission. */
-  componentSetKey: string | null
+  componentSetKey: string | null;
   /** Raw figma prop key (e.g. "Type"). camelCased by init. */
-  propKey: string
+  propKey: string;
   /** Distinct values seen across instance overrides. */
-  samples: unknown[]
+  samples: unknown[];
   /** Number of usages where this nested instance EXISTED. */
-  instanceCount: number
+  instanceCount: number;
   /** Number where the prop was OVERRIDDEN (value != master default). */
-  overrideCount: number
+  overrideCount: number;
 }
 
 /**
@@ -359,15 +405,17 @@ export interface NestedPropSummary {
  * `[{ title, key }]` parsed from `cfigma tabs` (no `--json` flag, so parse
  * the line format: leading spaces, title, run of spaces, `key=<hex>`).
  */
-export async function listFigmaTabs(opts: { cfigmaBin?: string }): Promise<Array<{ title: string; key: string }>> {
-  const bin = opts.cfigmaBin ?? 'cfigma'
-  const { stdout } = await execFileAsync(bin, ['tabs'], { encoding: 'utf8' })
-  const tabs: Array<{ title: string; key: string }> = []
-  for (const line of stdout.split('\n')) {
-    const m = line.match(/^\s+(.+?)\s+key=(\S+)\s*$/)
-    if (m) tabs.push({ title: m[1].trim(), key: m[2] })
+export async function listFigmaTabs(opts: {
+  cfigmaBin?: string;
+}): Promise<Array<{ title: string; key: string }>> {
+  const bin = opts.cfigmaBin ?? "cfigma";
+  const { stdout } = await execFileAsync(bin, ["tabs"], { encoding: "utf8" });
+  const tabs: Array<{ title: string; key: string }> = [];
+  for (const line of stdout.split("\n")) {
+    const m = line.match(/^\s+(.+?)\s+key=(\S+)\s*$/);
+    if (m) tabs.push({ title: m[1].trim(), key: m[2] });
   }
-  return tabs
+  return tabs;
 }
 
 /**
@@ -379,76 +427,111 @@ export async function listFigmaTabs(opts: { cfigmaBin?: string }): Promise<Array
  */
 export interface UsageInstance {
   /** Stripped instance node id (no `I<...>;` prefix). */
-  id: string
-  name: string
+  id: string;
+  name: string;
   /** Raw figma `instance.componentProperties` map (key#hash → resolved
    * value). init `normalizeRawProps` to add short + camelCase aliases. */
-  componentProperties: Record<string, unknown>
+  componentProperties: Record<string, unknown>;
   /** Per-text-layer override `{ <layerName>: characters }`, only for
    * descendants whose `characters` differ from master default. */
-  textOverrides: Record<string, string>
+  textOverrides: Record<string, string>;
   /** Raw figma `inst.overrides` — list of { id, fields } per overridden
    *  descendant. init checks each instance's overrides against the
    *  detected props; any field not covered by an exposed prop drops the
    *  whole instance from cases.ts (the "20% rule" extended to filtering). */
-  overrides?: Array<{ id: string; fields: string[] }>
+  overrides?: Array<{ id: string; fields: string[] }>;
   /** Per-nested-INSTANCE override `{ <layerName>: { <propKey>: value } }`,
    * only entries that diverge from the nested master's default. */
-  nestedProps: Record<string, Record<string, unknown>>
-  width: number
-  height: number
+  nestedProps: Record<string, Record<string, unknown>>;
+  /** Resolved fill colors per overridden descendant — keyed by stripped
+   *  master-relative descendant id. init checks if all entries share a
+   *  single hex; if so the usage is a fill-prop candidate. When the
+   *  overridden node lives inside a nested INSTANCE, owner* points at the
+   *  nearest such INSTANCE so a parent can propagate `_fill` to a child
+   *  component that declared support for it during its own init. */
+  fillOverrides?: Record<
+    string,
+    {
+      hex: string;
+      opacity: number;
+      ownerInstanceId?: string | null;
+      ownerComponentSetKey?: string | null;
+    }
+  >;
+  /** Resolved textStyleId per overridden TEXT descendant, keyed by stripped
+   *  master-relative descendant id. */
+  textStyleOverrides?: Record<string, string>;
+  width: number;
+  height: number;
   /** instance.mainComponent.id — which master variant this usage maps
    * to. init nests the usecase under that variant (figmaId-matched) in
    * cases.ts. `null` if the master can't be resolved (rare detached). */
-  mainNodeId: string | null
+  mainNodeId: string | null;
   /** instance.mainComponent.key — durable cross-file id of the master
    * variant. Required for v2-client instances whose mc.id is a local
    * proxy distinct from the library variant's own id; bucketing by key
    * lands them on the right library variant. */
-  mainKey: string | null
+  mainKey: string | null;
   /** Master variant's intrinsic dim (instance.mainComponent.width/height).
    * `null` if the master couldn't be resolved. init compares this to
    * width/height to decide whether the usage overrode the root sizing
    * and therefore needs a dim-locking wrapper in its emitted case. */
-  mainWidth: number | null
-  mainHeight: number | null
+  mainWidth: number | null;
+  mainHeight: number | null;
   /** Instance autolayout values (paddings + gap). init compares to
    * `mainLayout` to find the keys that were overridden vs the master
    * and emits ONLY those as case props — most usages inherit the master
    * defaults so the emitted case prop set stays minimal. */
   layout: {
-    paddingTop: number | null
-    paddingRight: number | null
-    paddingBottom: number | null
-    paddingLeft: number | null
-    gap: number | null
-  }
+    paddingTop: number | null;
+    paddingRight: number | null;
+    paddingBottom: number | null;
+    paddingLeft: number | null;
+    gap: number | null;
+  };
   /** Master variant's autolayout values, captured at scan time so init
    * can diff against `layout` without a second cfigma round trip. */
   mainLayout: {
-    paddingTop: number | null
-    paddingRight: number | null
-    paddingBottom: number | null
-    paddingLeft: number | null
-    gap: number | null
-  } | null
+    paddingTop: number | null;
+    paddingRight: number | null;
+    paddingBottom: number | null;
+    paddingLeft: number | null;
+    gap: number | null;
+  } | null;
   /** Stamped by `scanAllOpenTabsForInit` from the tab key — the figma
    * file that contains this usage (typically the consuming app, not
    * the library where the master lives). */
-  fileKey?: string
+  fileKey?: string;
+}
+
+export interface ChildVariationSample {
+  parentId: string;
+  parentName: string;
+  parentProps: Record<string, unknown>;
+  parentWidth: number;
+  parentHeight: number;
+  childComponentSetKey: string | null;
+  childComponentSetName: string | null;
+  childComponentName: string | null;
+  children: Array<{
+    componentProperties: Record<string, unknown>;
+    textOverrides: Record<string, string>;
+    nestedProps: Record<string, Record<string, unknown>>;
+  }>;
+  parentFileKey?: string;
 }
 
 export interface InitScanResult {
-  textSummaries: InstanceTextSummary[]
-  nestedPropSummaries: NestedPropSummary[]
-  childVariations: ChildVariationSample[]
+  textSummaries: InstanceTextSummary[];
+  nestedPropSummaries: NestedPropSummary[];
+  childVariations: ChildVariationSample[];
   /** One entry per matched INSTANCE — full per-usage raw dump that init
    * hydrates inline to emit a case row per real usage. */
-  usages: UsageInstance[]
+  usages: UsageInstance[];
   /** Total number of INSTANCE usages of the scanned componentSetKey.
    * init divides per-summary `overrideCount` by this to apply the
    * 20% threshold. */
-  totalInstances: number
+  totalInstances: number;
 }
 
 /**
@@ -457,11 +540,11 @@ export interface InitScanResult {
  * `figma.skipInvisibleInstanceChildren = true` to halve traversal cost.
  */
 export async function scanInstancesForInit(opts: {
-  tabPattern: string
-  componentSetKey: string
-  cfigmaBin?: string
+  tabPattern: string;
+  componentSetKey: string;
+  cfigmaBin?: string;
 }): Promise<InitScanResult> {
-  const bin = opts.cfigmaBin ?? 'cfigma'
+  const bin = opts.cfigmaBin ?? "cfigma";
   const code = `
 const targetKey = ${JSON.stringify(opts.componentSetKey)};
 // Skips traversal into hidden instance children — measured ~50% faster on
@@ -596,6 +679,44 @@ for (const inst of matches) {
     paddingLeft: typeof mc.paddingLeft === 'number' ? mc.paddingLeft : null,
     gap: typeof mc.itemSpacing === 'number' ? mc.itemSpacing : null,
   } : null;
+  // Resolved fill colors per overridden descendant. init checks if all
+  // entries share one hex; if so the usage can flow through the fill prop.
+  const fillOverrides = {};
+  for (const ov of (inst.overrides || [])) {
+    if (!Array.isArray(ov.overriddenFields) || ov.overriddenFields.indexOf('fills') < 0) continue;
+    try {
+      const node = await figma.getNodeByIdAsync(ov.id);
+      if (!node || !Array.isArray(node.fills)) continue;
+      const fill = node.fills.find(p => p && p.type === 'SOLID' && p.visible !== false);
+      if (!fill) continue;
+      const r = Math.round(fill.color.r * 255), g = Math.round(fill.color.g * 255), b = Math.round(fill.color.b * 255);
+      const hex = '#' + [r, g, b].map(v => v.toString(16).padStart(2, '0')).join('');
+      const opacity = typeof fill.opacity === 'number' ? fill.opacity : 1;
+      let ownerInstanceId = null;
+      let ownerComponentSetKey = null;
+      let p = node.parent;
+      while (p && p.id !== inst.id) {
+        if (p.type === 'INSTANCE') {
+          ownerInstanceId = stripPrefix(p.id);
+          const nm = p.mainComponent;
+          let np = nm; while (np && np.type !== 'COMPONENT_SET') np = np.parent;
+          ownerComponentSetKey = (np && np.key) || (nm && nm.key) || null;
+          break;
+        }
+        p = p.parent;
+      }
+      fillOverrides[stripPrefix(ov.id)] = { hex, opacity, ownerInstanceId, ownerComponentSetKey };
+    } catch (_) { /* best-effort */ }
+  }
+  const textStyleOverrides = {};
+  for (const ov of (inst.overrides || [])) {
+    if (!Array.isArray(ov.overriddenFields) || ov.overriddenFields.indexOf('textStyleId') < 0) continue;
+    try {
+      const node = await figma.getNodeByIdAsync(ov.id);
+      if (!node || node.type !== 'TEXT' || !node.textStyleId) continue;
+      textStyleOverrides[stripPrefix(ov.id)] = node.textStyleId;
+    } catch (_) { /* best-effort */ }
+  }
   usages.push({
     // Keep the full figma node id verbatim. For nested instances this is
     // I<parentInst>;<descId>, the form figma plugin getNodeByIdAsync /
@@ -627,6 +748,8 @@ for (const inst of matches) {
     mainHeight: (mc && mc.height) || null,
     layout: instLayout,
     mainLayout: mainLayout,
+    fillOverrides: fillOverrides,
+    textStyleOverrides: textStyleOverrides,
   });
 }
 // ---- Container detection: parents whose direct children are all INSTANCEs of one set. ----
@@ -688,13 +811,13 @@ for (const inst of matches) {
   });
 }
 return { textSummaries: Object.values(perDesc), nestedPropSummaries: Object.values(perNested), childVariations, usages, totalInstances: matches.length };
-`
+`;
   const { stdout } = await execFileAsync(
     bin,
-    ['--tab', opts.tabPattern, 'exec', code],
-    { encoding: 'utf8', maxBuffer: 16 * 1024 * 1024 },
-  )
-  return cleanControlValue(JSON.parse(stdout)) as InitScanResult
+    ["--tab", opts.tabPattern, "exec", code],
+    { encoding: "utf8", maxBuffer: 16 * 1024 * 1024 },
+  );
+  return cleanControlValue(JSON.parse(stdout)) as InitScanResult;
 }
 
 /**
@@ -704,58 +827,65 @@ return { textSummaries: Object.values(perDesc), nestedPropSummaries: Object.valu
  * instead of the sum.
  */
 export async function scanAllOpenTabsForInit(opts: {
-  componentSetKey: string
-  cfigmaBin?: string
+  componentSetKey: string;
+  cfigmaBin?: string;
 }): Promise<InitScanResult> {
-  const tabs = await listFigmaTabs({ cfigmaBin: opts.cfigmaBin })
+  const tabs = await listFigmaTabs({ cfigmaBin: opts.cfigmaBin });
   const settled = await Promise.allSettled(
     tabs.map(async (tab) => {
       const r = await scanInstancesForInit({
         tabPattern: tab.key,
         componentSetKey: opts.componentSetKey,
         cfigmaBin: opts.cfigmaBin,
-      })
+      });
       // Stamp source-file key on every per-tab artifact so downstream
       // case-emit knows which figma file owns each usage.
-      for (const cv of r.childVariations) cv.parentFileKey = tab.key
-      for (const u of r.usages) u.fileKey = tab.key
-      return r
+      for (const cv of r.childVariations) cv.parentFileKey = tab.key;
+      for (const u of r.usages) u.fileKey = tab.key;
+      return r;
     }),
-  )
-  const mergedTexts: Record<string, InstanceTextSummary> = {}
-  const mergedNested: Record<string, NestedPropSummary> = {}
-  const childVariations: ChildVariationSample[] = []
-  const usages: UsageInstance[] = []
-  let totalInstances = 0
+  );
+  const mergedTexts: Record<string, InstanceTextSummary> = {};
+  const mergedNested: Record<string, NestedPropSummary> = {};
+  const childVariations: ChildVariationSample[] = [];
+  const usages: UsageInstance[] = [];
+  let totalInstances = 0;
   for (const s of settled) {
-    if (s.status !== 'fulfilled') continue
-    totalInstances += s.value.totalInstances
+    if (s.status !== "fulfilled") continue;
+    totalInstances += s.value.totalInstances;
     for (const row of s.value.textSummaries) {
-      const key = row.descName
+      const key = row.descName;
       if (!mergedTexts[key]) {
-        mergedTexts[key] = { ...row, samples: [...row.samples], descIds: [...(row.descIds ?? [row.descId])] }
-        continue
+        mergedTexts[key] = {
+          ...row,
+          samples: [...row.samples],
+          descIds: [...(row.descIds ?? [row.descId])],
+        };
+        continue;
       }
-      const dst = mergedTexts[key]
-      dst.instanceCount += row.instanceCount
-      dst.overrideCount += row.overrideCount
-      if (row.hasOverride) dst.hasOverride = true
-      for (const v of row.samples) if (dst.samples.indexOf(v) === -1) dst.samples.push(v)
-      for (const id of (row.descIds ?? [row.descId])) if (dst.descIds.indexOf(id) === -1) dst.descIds.push(id)
+      const dst = mergedTexts[key];
+      dst.instanceCount += row.instanceCount;
+      dst.overrideCount += row.overrideCount;
+      if (row.hasOverride) dst.hasOverride = true;
+      for (const v of row.samples)
+        if (dst.samples.indexOf(v) === -1) dst.samples.push(v);
+      for (const id of row.descIds ?? [row.descId])
+        if (dst.descIds.indexOf(id) === -1) dst.descIds.push(id);
     }
     for (const row of s.value.nestedPropSummaries) {
-      const key = row.layerName + '|' + row.propKey
+      const key = row.layerName + "|" + row.propKey;
       if (!mergedNested[key]) {
-        mergedNested[key] = { ...row, samples: [...row.samples] }
-        continue
+        mergedNested[key] = { ...row, samples: [...row.samples] };
+        continue;
       }
-      const dst = mergedNested[key]
-      dst.instanceCount += row.instanceCount
-      dst.overrideCount += row.overrideCount
-      for (const v of row.samples) if (dst.samples.indexOf(v) === -1) dst.samples.push(v)
+      const dst = mergedNested[key];
+      dst.instanceCount += row.instanceCount;
+      dst.overrideCount += row.overrideCount;
+      for (const v of row.samples)
+        if (dst.samples.indexOf(v) === -1) dst.samples.push(v);
     }
-    childVariations.push(...s.value.childVariations)
-    usages.push(...s.value.usages)
+    childVariations.push(...s.value.childVariations);
+    usages.push(...s.value.usages);
   }
   return {
     textSummaries: Object.values(mergedTexts),
@@ -763,9 +893,8 @@ export async function scanAllOpenTabsForInit(opts: {
     childVariations,
     usages,
     totalInstances,
-  }
+  };
 }
-
 
 /**
  * Walk up from a node to its containing PAGE and set `figma.currentPage` there.
@@ -773,25 +902,26 @@ export async function scanAllOpenTabsForInit(opts: {
  * exporting variant PNGs.
  */
 export async function switchToPageContaining(opts: {
-  tabPattern: string
-  nodeId: string
-  cfigmaBin?: string
+  tabPattern: string;
+  nodeId: string;
+  cfigmaBin?: string;
 }): Promise<{ pageId: string; pageName: string } | null> {
-  const bin = opts.cfigmaBin ?? 'cfigma'
+  const bin = opts.cfigmaBin ?? "cfigma";
   const code = `
 const target = ${JSON.stringify(opts.nodeId)};
-const node = figma.root.findOne((n) => n.id === target);
+await figma.loadAllPagesAsync();
+const node = await figma.getNodeByIdAsync(target);
 if (!node) return null;
 let p = node;
 while (p && p.type !== 'PAGE') p = p.parent;
 if (!p) return null;
 await figma.setCurrentPageAsync(p);
 return { pageId: p.id, pageName: p.name };
-`
+`;
   const { stdout } = await execFileAsync(
     bin,
-    ['--tab', opts.tabPattern, 'exec', code],
-    { encoding: 'utf8' },
-  )
-  return JSON.parse(stdout) as { pageId: string; pageName: string } | null
+    ["--tab", opts.tabPattern, "exec", code],
+    { encoding: "utf8" },
+  );
+  return JSON.parse(stdout) as { pageId: string; pageName: string } | null;
 }

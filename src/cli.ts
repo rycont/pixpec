@@ -2,7 +2,10 @@
 /**
  * pixpec CLI — dispatcher.
  *
- *   pixpec init <componentId>            scaffold a component dir from Figma
+ *   pixpec init <fileKey>:<nodeId>       scaffold/refresh a component dir from Figma
+ *   pixpec generate <fileKey>:<nodeId>   dump → compile → emit one node's source
+ *   pixpec breakdown <fileKey>:<nodeId>  emit a view plus DFS subtree artifacts
+ *   pixpec verify-generated <Component>  pixel-verify generated/ vs Figma
  *   pixpec dump-figma <Component> [tab]  export Figma frames → .pixpec-out/<C>/figma/
  *   pixpec dump-chromium <Component>     render + screenshot → .pixpec-out/<C>/chromium/
  *   pixpec analyze <Component> <case>    per-blob shift+shape diagnosis
@@ -14,10 +17,10 @@ import { init } from './init.ts'
 import { runDumpFigma } from './dump-figma.ts'
 import { runDumpChromium } from './dump-chromium.ts'
 import { runAnalyze } from './analyze.ts'
-import { runGenerate } from './generator/cli.ts'
 import { runVerify } from './verify.ts'
 import { runVerifyGenerated } from './verify-generated.ts'
-import { runGenerateV2 } from './generate-v2.ts'
+import { runGenerate } from './generate.ts'
+import { runBreakdown } from './breakdown.ts'
 
 const [, , cmd, ...rest] = process.argv
 
@@ -26,32 +29,46 @@ async function main() {
     case 'init': {
       const componentId = rest[0]
       if (!componentId) {
-        console.error('usage: pixpec init <fileKey>:<nodeId>  (or just <nodeId>; init scans configured tabs in order)')
+        console.error('usage: pixpec init <fileKey>:<nodeId>')
         process.exit(2)
       }
       const r = await init({ componentId })
       console.log(
         `scaffolded ${r.componentName} (${r.variantCount} variants) → ${r.componentDir}`,
       )
-      console.log(`  files: props.ts, cases.ts, defaults.ts, index.ts (always rewritten)`)
-      console.log(`         impl.tsx (stub — preserved on re-init)`)
-      console.log(`         generated/ (empty — populated by breakdown)`)
-      console.log(``)
-      console.log(`Next: run breakdown for each variant so generated/<id>.tsx exists,`)
-      console.log(`then synthesize impl.tsx by composing the per-variant trees.`)
-      console.log(``)
-      // Resolve the on-disk pixpec scripts dir relative to this cli.ts file.
-      const { fileURLToPath } = await import('node:url')
-      const { dirname: dn, resolve: rs } = await import('node:path')
-      const scriptsDir = rs(dn(fileURLToPath(import.meta.url)), '../scripts')
-      console.log(`  # prepare+verify each variant:`)
-      for (const id of r.variantIds) {
-        console.log(`  pnpm exec tsx ${scriptsDir}/breakdown-prepare.ts ${id} \\`)
-        console.log(`    && pnpm exec tsx ${scriptsDir}/breakdown-verify.ts`)
+      break
+    }
+    case 'generate': {
+      const componentId = rest[0]
+      if (!componentId || !componentId.includes(':')) {
+        console.error('usage: pixpec generate <fileKey>:<nodeId> [--emitter NAME] [--name Comp]')
+        process.exit(2)
       }
-      console.log(``)
-      console.log(`Once every variant passes verify, compose ${r.componentName}/impl.tsx`)
-      console.log(`from the per-variant outputs in ${r.componentDir}/generated/.`)
+      const emIdx = rest.indexOf('--emitter')
+      const nameIdx = rest.indexOf('--name')
+      const r = await runGenerate(componentId, {
+        emitter: emIdx >= 0 ? rest[emIdx + 1] : undefined,
+        componentName: nameIdx >= 0 ? rest[nameIdx + 1] : undefined,
+      })
+      console.log(`[generate] ${r.componentName} → ${r.outPath}`)
+      break
+    }
+    case 'breakdown': {
+      const figmaId = rest[0]
+      if (!figmaId || !figmaId.includes(':')) {
+        console.error('usage: pixpec breakdown <fileKey>:<nodeId> [--emitter NAME] [--name ViewName]')
+        process.exit(2)
+      }
+      const emIdx = rest.indexOf('--emitter')
+      const nameIdx = rest.indexOf('--name')
+      const r = await runBreakdown(figmaId, {
+        emitter: emIdx >= 0 ? rest[emIdx + 1] : undefined,
+        name: nameIdx >= 0 ? rest[nameIdx + 1] : undefined,
+      })
+      console.log(
+        `[breakdown] ${r.viewName} → ${r.viewDir} ` +
+        `(${r.entryCount} nodes, codegen ${r.failedCount} failed, verify ${r.verifyFailedCount}/${r.verifiedCount} failed)`,
+      )
       break
     }
     case 'dump-figma': {
@@ -71,32 +88,6 @@ async function main() {
         process.exit(2)
       }
       await runDumpChromium(componentName)
-      break
-    }
-    case 'generate': {
-      const nodeId = rest[0]
-      if (!nodeId) { console.error('usage: pixpec generate <nodeId> [--tab X] [--out path.tsx]'); process.exit(2) }
-      const tabIdx = rest.indexOf('--tab')
-      const nameIdx = rest.indexOf('--name')
-      await runGenerate(nodeId, {
-        tab: tabIdx >= 0 ? rest[tabIdx + 1] : undefined,
-        name: nameIdx >= 0 ? rest[nameIdx + 1] : undefined,
-      })
-      break
-    }
-    case 'generate-v2': {
-      const componentId = rest[0]
-      if (!componentId || !componentId.includes(':')) {
-        console.error('usage: pixpec generate-v2 <fileKey>:<nodeId> [--emitter NAME] [--name Comp]')
-        process.exit(2)
-      }
-      const emIdx = rest.indexOf('--emitter')
-      const nameIdx = rest.indexOf('--name')
-      const r = await runGenerateV2(componentId, {
-        emitter: emIdx >= 0 ? rest[emIdx + 1] : undefined,
-        componentName: nameIdx >= 0 ? rest[nameIdx + 1] : undefined,
-      })
-      console.log(`[generate-v2] ${r.componentName} → ${r.outPath}`)
       break
     }
     case 'verify': {
@@ -145,13 +136,15 @@ async function main() {
     case '-h':
       console.log('pixpec — visual regression frame for design systems\n')
       console.log('commands:')
-      console.log('  init <componentId>             scaffold a component dir from Figma')
-      console.log('  verify <Component>             prepare+verify every entry in cases.ts (bails on first ✗)')
-      console.log('  verify-generated <Component>   verify generated/<safeId>.tsx ↔ figma main case per variant')
-      console.log('  dump-figma <Component> [tab]   export Figma frames to .pixpec-out/<C>/figma/')
-      console.log('  dump-chromium <Component>      render + screenshot to .pixpec-out/<C>/chromium/')
+      console.log('  init <fileKey>:<nodeId>        scaffold/refresh a component dir from Figma')
+      console.log('  generate <fileKey>:<nodeId>    emit one node via dumper → compiler → emitter')
+      console.log('  breakdown <fileKey>:<nodeId>   emit src/view output plus DFS subtrees')
+      console.log('  verify-generated <Component>   pixel-verify generated/ vs Figma')
+      console.log('  verify <Component>             full verify pipeline (legacy)')
+      console.log('  dump-figma <Component> [tab]   export Figma frames')
+      console.log('  dump-chromium <Component>      render + screenshot')
       console.log('  analyze <Component> <case>     per-blob shift+shape diagnosis [--crop]')
-      console.log('\nseparate bins (not subcommands):')
+      console.log('\nseparate bins:')
       console.log('  pixpec-measure <dir>           Rust HSB-Euclidean dE → results.json')
       console.log('  pixpec-rgg <Component>         top-N worst RGG H/S/V diff maps')
       break
