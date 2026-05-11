@@ -62,8 +62,7 @@ export async function runVerify(
       const pw = padToMul(w), ph = padToMul(h)
       if (pw === w && ph === h) continue
       const buf = await sharp(p)
-        .flatten({ background: { r: 255, g: 255, b: 255 } })
-        .extend({ top: 0, left: 0, right: pw - w, bottom: ph - h, background: { r: 255, g: 255, b: 255 } })
+        .extend({ top: 0, left: 0, right: pw - w, bottom: ph - h, background: { r: 0, g: 0, b: 0, alpha: 0 } })
         .png()
         .toBuffer()
       await writeFile(p, buf)

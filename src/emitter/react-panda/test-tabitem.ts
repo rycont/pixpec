@@ -26,12 +26,12 @@ import type { CodegenPlugin } from '../../types.ts'
 const iconCurrentColor: CodegenPlugin = {
   name: 'icon-current-color',
   emitWrap: (n, jsx, ctx) => {
-    if (n.kind !== 'component') return jsx
-    const componentName = (n as { componentName?: string }).componentName
-    if (componentName !== 'Icon') return jsx
-    const fill = (n as { effectiveFill?: string }).effectiveFill
+    if (n.kind !== 'instance') return jsx
+    const inst = n as { componentName?: string; effectiveFill?: string; effectiveFillTokenId?: string }
+    if (inst.componentName !== 'Icon') return jsx
+    const fill = inst.effectiveFill
     if (!fill) return jsx
-    const tokenId = (n as { effectiveFillTokenId?: string }).effectiveFillTokenId
+    const tokenId = inst.effectiveFillTokenId
     const tokenPath = ctx.resolveTokenPath(tokenId)
     return ctx.appendJsxAttr(jsx, ctx.jsxAttr('color', tokenPath ?? fill))
   },

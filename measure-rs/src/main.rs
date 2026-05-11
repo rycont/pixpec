@@ -40,14 +40,30 @@ struct Record {
     de00_max: f64,
     #[serde(rename = "n_px")]
     n_px: usize,
-    /// Largest connected blob of pixels with ΔE00 > 1.9 (8-connectivity). Distinguishes
-    /// structural diff (a 30+ px blob from a misplaced icon) from anti-alias noise
-    /// (isolated pixels). Used by `breakdown` to pass small renderer differences
-    /// while catching layout/style regressions.
+    /// Largest connected blob of pixels with ΔE00 > the FIRST blob_threshold
+    /// (8-connectivity). Kept for back-compat with `verify-generated`; new
+    /// callers should read the `blobs` array, which carries one entry per
+    /// `--blob-threshold` value supplied.
     blob_max_size: usize,
     /// Bounding box of the largest blob in downsampled output pixels, [x0,y0,x1,y1).
     blob_max_bbox: Option<[usize; 4]>,
+    /// Per-threshold blob stats. Length matches the supplied `--blob-threshold`
+    /// flags (default `[2.7, 1.9]`). The first entry corresponds to the
+    /// scalar `blob_max_size`/`blob_max_bbox` fields above. A breakdown caller
+    /// pairs each threshold with its own max-blob ceiling — typically
+    /// 2.7→24 (catches structural mismatches above the AA noise floor) and
+    /// 1.9→40 (catches sub-perceptual residual that spreads over a region
+    /// — single-isolated-pixel noise stays well below 40, but a faint
+    /// systematic offset doesn't).
+    blobs: Vec<BlobReport>,
     artifacts: Artifacts,
+}
+
+#[derive(Serialize)]
+struct BlobReport {
+    threshold: f32,
+    max_size: usize,
+    max_bbox: Option<[usize; 4]>,
 }
 
 #[derive(Serialize)]
@@ -61,13 +77,12 @@ fn main() -> Result<()> {
     let args: Vec<String> = env::args().collect();
     let mut base_arg: Option<String> = None;
     let mut downsample: u32 = 8;
-    // Per-pixel ΔE00 cutoff for blob membership. Default 2.7 — calibrated
-    // empirically against TabItem hangul renderings: thresholds in the
-    // 2.5–2.6 range still cluster the trailing AA noise of CJK strokes
-    // into 25–29-pixel blobs, while 2.7 cleanly drops them to ≤18. ΔE 2.7
-    // is "noticeable only on close inspection" perceptually; a 1-px shift
-    // on solid ink (ΔE 5+) still clusters well above the cutoff.
-    let mut blob_threshold: f32 = 2.7;
+    // Per-pixel ΔE00 cutoffs for blob membership. Default `[2.7, 1.9]`
+    // (repeatable `--blob-threshold` flag accumulates; if none supplied,
+    // both defaults run). 2.7 is the AA-noise floor for CJK hangul (see
+    // BlobReport doc); 1.9 is JNT + headroom — catches large-area sub-
+    // perceptual drift that a single threshold misses.
+    let mut blob_thresholds: Vec<f32> = Vec::new();
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
@@ -80,10 +95,11 @@ fn main() -> Result<()> {
             }
             "--blob-threshold" => {
                 i += 1;
-                blob_threshold = args.get(i)
+                let v: f32 = args.get(i)
                     .and_then(|s| s.parse().ok())
                     .filter(|&v: &f32| v > 0.0)
                     .ok_or_else(|| anyhow::anyhow!("--blob-threshold requires positive float"))?;
+                blob_thresholds.push(v);
             }
             other => {
                 if base_arg.is_some() { bail!("unexpected arg: {}", other); }
@@ -93,8 +109,11 @@ fn main() -> Result<()> {
         i += 1;
     }
     let base = PathBuf::from(base_arg.ok_or_else(|| anyhow::anyhow!(
-        "usage: pixpec-measure <component_dir> [--downsample <N>] [--blob-threshold <dE>]"
+        "usage: pixpec-measure <component_dir> [--downsample <N>] [--blob-threshold <dE>]…"
     ))?);
+    if blob_thresholds.is_empty() {
+        blob_thresholds = vec![2.7, 1.9];
+    }
     let figma_dir = base.join("figma");
     let chrom_dir = base.join("chromium");
     if !figma_dir.is_dir() {
@@ -124,14 +143,22 @@ fn main() -> Result<()> {
         .map(|name| -> Result<Record> {
             let f = figma_dir.join(format!("{name}.png"));
             let c = chrom_dir.join(format!("{name}.png"));
-            let m = measure(&f, &c, downsample, blob_threshold).with_context(|| format!("measure {name}"))?;
+            let m = measure(&f, &c, downsample, &blob_thresholds).with_context(|| format!("measure {name}"))?;
+            // blob_max_size / blob_max_bbox shadow blobs[0] for back-compat
+            // with verify-generated.ts; new callers should consume `blobs`.
+            let first = m.blobs.first().cloned().unwrap_or(BlobReport {
+                threshold: 0.0,
+                max_size: 0,
+                max_bbox: None,
+            });
             Ok(Record {
                 case: (*name).clone(),
                 de00: m.de00,
                 de00_max: m.de00_max,
                 n_px: m.n_px,
-                blob_max_size: m.blob_max_size,
-                blob_max_bbox: m.blob_max_bbox,
+                blob_max_size: first.max_size,
+                blob_max_bbox: first.max_bbox,
+                blobs: m.blobs,
                 artifacts: Artifacts {
                     figma: f,
                     impl_: c,
@@ -183,11 +210,14 @@ struct Measurement {
     de00: f64,
     de00_max: f64,
     n_px: usize,
-    blob_max_size: usize,
-    blob_max_bbox: Option<[usize; 4]>,
+    blobs: Vec<BlobReport>,
 }
 
-fn measure(figma: &Path, chrom: &Path, downsample: u32, blob_threshold: f32) -> Result<Measurement> {
+impl Clone for BlobReport {
+    fn clone(&self) -> Self { BlobReport { threshold: self.threshold, max_size: self.max_size, max_bbox: self.max_bbox } }
+}
+
+fn measure(figma: &Path, chrom: &Path, downsample: u32, blob_thresholds: &[f32]) -> Result<Measurement> {
     // Composite alpha against white FIRST, then box-filter. Compose-then-avg
     // is the perceptually-meaningful pipeline: each input pixel's contribution
     // to its output cell equals what a viewer would see at that location.
@@ -225,21 +255,30 @@ fn measure(figma: &Path, chrom: &Path, downsample: u32, blob_threshold: f32) -> 
         if d > de00_max { de00_max = d; }
         de[i] = d as f32;
     }
-    // Largest connected blob of pixels with ΔE00 > BLOB_THRESHOLD. 8-connectivity
-    // (diagonal neighbors count). Used by the breakdown harness to distinguish
-    // structural mismatches (clustered residual) from anti-alias noise (isolated
-    // pixels). A high `de00_max` from one stray pixel is rendering noise; the
-    // same `de00_max` clustered into a 9+ pixel blob is a real layout/style bug.
-    // blob_threshold is now a CLI option (default 1.9) — see arg parsing
-    // above. Paired with breakdown-verify default --max-blob 25, which
-    // absorbs hangul/emoji 1px subpixel shifts (figma vs Skia rasterizer)
-    // where pixels reach the full black↔white dE (~5+).
+    // Largest connected blob (8-connectivity) of pixels above each given
+    // ΔE00 threshold. Multi-threshold lets a caller catch BOTH structural
+    // mismatches above the AA-noise floor (high threshold, small blob) AND
+    // sub-perceptual systematic drift over a region (low threshold, large
+    // blob) — patterns that any single threshold misses.
+    let blobs: Vec<BlobReport> = blob_thresholds
+        .iter()
+        .map(|&t| compute_blob(&de, w, h, t))
+        .collect();
+    Ok(Measurement { de00: de00_sum, de00_max, n_px: n, blobs })
+}
+
+/// Flood-fill the largest connected blob above `threshold` in the per-pixel
+/// dE map. 8-connectivity; iterative DFS with a reusable stack. Threshold-
+/// independent of the call site so multi-threshold callers reuse the same
+/// dE buffer.
+fn compute_blob(de: &[f32], w: usize, h: usize, threshold: f32) -> BlobReport {
+    let n = de.len();
     let mut visited = vec![false; n];
     let mut max_blob = 0usize;
     let mut max_blob_bbox: Option<[usize; 4]> = None;
-    let mut stack = Vec::with_capacity(n);
+    let mut stack: Vec<usize> = Vec::with_capacity(n);
     for start in 0..n {
-        if visited[start] || de[start] <= blob_threshold { continue; }
+        if visited[start] || de[start] <= threshold { continue; }
         stack.clear();
         stack.push(start);
         visited[start] = true;
@@ -264,7 +303,7 @@ fn measure(figma: &Path, chrom: &Path, downsample: u32, blob_threshold: f32) -> 
                     let nx = x + dx; let ny = y + dy;
                     if nx < 0 || ny < 0 || nx >= w as i32 || ny >= h as i32 { continue; }
                     let ni = ny as usize * w + nx as usize;
-                    if visited[ni] || de[ni] <= blob_threshold { continue; }
+                    if visited[ni] || de[ni] <= threshold { continue; }
                     visited[ni] = true;
                     stack.push(ni);
                 }
@@ -275,7 +314,7 @@ fn measure(figma: &Path, chrom: &Path, downsample: u32, blob_threshold: f32) -> 
             max_blob_bbox = Some([x0, y0, x1, y1]);
         }
     }
-    Ok(Measurement { de00: de00_sum, de00_max, n_px: n, blob_max_size: max_blob, blob_max_bbox: max_blob_bbox })
+    BlobReport { threshold, max_size: max_blob, max_bbox: max_blob_bbox }
 }
 
 /// CIEDE2000 (ΔE00) — Sharma 2005 implementation. Inputs in CIE Lab (D65).
