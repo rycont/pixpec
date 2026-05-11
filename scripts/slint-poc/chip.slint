@@ -1,0 +1,33 @@
+import "../../../danah/src/fonts/WantedSansVariable/WantedSansVariable.ttf";
+import { Tokens } from "work/tokens.slint";
+
+export component Chip inherits Window {
+    width: 56px;
+    height: 32px;
+    background: white;
+
+    Rectangle {
+        width: 100%;
+        height: 100%;
+        background: Tokens.components-translucent-primary;
+        border-radius: Tokens.radius-300;
+
+        HorizontalLayout {
+            padding-left: Tokens.spacing-300;
+            padding-right: Tokens.spacing-300;
+            padding-top: Tokens.spacing-150 - 0.1875px;
+            padding-bottom: Tokens.spacing-150 + 0.1875px;
+            alignment: center;
+
+            Text {
+                text: "뉴진스";
+                font-family: Tokens.footnote-regular.font-family;
+                font-size: Tokens.footnote-regular.font-size;
+                font-weight: Tokens.footnote-regular.font-weight;
+                color: Tokens.content-standard-secondary;
+                vertical-alignment: center;
+                horizontal-alignment: center;
+            }
+        }
+    }
+}

@@ -1,0 +1,19 @@
+[
+  {
+    "case": "chip",
+    "dE00": 1583.5307135889066,
+    "dE00_max": 3.8300997722365375,
+    "n_px": 1792,
+    "blob_max_size": 7,
+    "blob_max_bbox": [
+      31,
+      11,
+      32,
+      18
+    ],
+    "artifacts": {
+      "figma": "/home/rycont/dev/pixpec-workdir/pixpec/scripts/slint-poc/work/figma/chip.png",
+      "impl": "/home/rycont/dev/pixpec-workdir/pixpec/scripts/slint-poc/work/chromium/chip.png"
+    }
+  }
+]
