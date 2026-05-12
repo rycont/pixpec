@@ -2022,6 +2022,19 @@ export async function init(opts: {
     ),
     preservedImpl,
   );
+  {
+    const componentMod = (await import(resolve(componentDir, "index.ts"))) as Record<string, unknown>;
+    const component = componentMod[componentName];
+    if (component && typeof component === "object" && Array.isArray((component as { variants?: unknown }).variants)) {
+      const { writeComponentReport } = await import("./component-report.ts");
+      await writeComponentReport({
+        componentName,
+        componentDir,
+        component: component as never,
+        targets: cfg.targets,
+      });
+    }
+  }
   if (process.env.PIXPEC_SKIP_INIT_VERIFY === "1") {
     return {
       componentDir,

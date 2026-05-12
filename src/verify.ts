@@ -9,8 +9,13 @@ import { dirname, resolve } from 'node:path'
 import { existsSync } from 'node:fs'
 import { readFile } from 'node:fs/promises'
 import { loadConfig } from './init.ts'
-import { captureDir, runCapture, stageMeasureInput } from './capture/index.ts'
+import { captureDir, loadCaptureComponent, runCapture, stageMeasureInput } from './capture/index.ts'
 import { resolveConfiguredTargets } from './targets/index.ts'
+import {
+  writeComponentReport,
+  writeRggForFailedCases,
+  type VerifyTargetReport,
+} from './component-report.ts'
 
 const execFileAsync = promisify(execFile)
 const HERE = dirname(fileURLToPath(import.meta.url))
@@ -31,18 +36,28 @@ export async function runVerify(
   const componentDir = resolve(root, componentsDir, componentName)
   if (!existsSync(componentDir)) throw new Error(`pixpec verify: no component dir ${componentDir}`)
   const targets = opts.target ? [opts.target] : resolveConfiguredTargets(cfg)
+  const loaded = await loadCaptureComponent(componentName)
   await runCapture('src', componentName, { backend: 'figma', clearOutDir: true })
   let pass = 0
   let fail = 0
   let total = 0
   const failed: string[] = []
+  const verifyTargets: VerifyTargetReport[] = []
   for (const target of targets) {
     const r = await runVerifyTarget(componentName, componentDir, target, opts)
     pass += r.pass
     fail += r.fail
     total += r.total
     failed.push(...r.failed.map((caseId) => `${target}:${caseId}`))
+    verifyTargets.push(r.report)
   }
+  await writeComponentReport({
+    componentName,
+    componentDir,
+    component: loaded.component,
+    targets,
+    verifyTargets,
+  })
   return { pass, fail, total, failed }
 }
 
@@ -51,7 +66,7 @@ async function runVerifyTarget(
   componentDir: string,
   target: string,
   opts: VerifyOptions,
-): Promise<{ pass: number; fail: number; total: number; failed: string[] }> {
+): Promise<{ pass: number; fail: number; total: number; failed: string[]; report: VerifyTargetReport }> {
   console.log(`[verify:${target}] capturing ${componentName} destination artifacts…`)
   await runCapture('dst', componentName, { backend: target, clearOutDir: true })
   // Pad both sides to next multiple of 8 (measure-rs's downsample factor)
@@ -115,8 +130,7 @@ async function runVerifyTarget(
   ]
   console.log(`[verify:${target}] measuring…`)
   await execFileAsync(MEASURE_BIN, measureArgs, { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 })
-  const results = JSON.parse(await readFile(resolve(measureBase, 'results.json'), 'utf8')) as
-    Array<{ case: string; blob_max_size: number; dE00_max: number; dE00: number }>
+  const results = JSON.parse(await readFile(resolve(measureBase, 'results.json'), 'utf8')) as VerifyTargetReport['records']
   const maxBlob = opts.maxBlob ? parseInt(opts.maxBlob, 10) : 24
   // results.case is the on-disk basename = sanitize(figmaId). Print as-is;
   // figmaId itself IS the human-traceable identifier (back to figma URL).
@@ -128,6 +142,23 @@ async function runVerifyTarget(
     if (ok) pass++
     else failed.push(r.case)
   }
+  const failedRecords = results.filter((r) => r.blob_max_size > maxBlob)
+  await writeRggForFailedCases({
+    componentDir,
+    target,
+    failed: failedRecords,
+  })
   console.log(`\n[${target}] ${pass}/${results.length} passed${failed.length ? `, ${failed.length} failed` : ''}`)
-  return { pass, fail: failed.length, total: results.length, failed }
+  return {
+    pass,
+    fail: failed.length,
+    total: results.length,
+    failed,
+    report: {
+      target,
+      maxBlob,
+      records: results,
+      failed: failedRecords,
+    },
+  }
 }
