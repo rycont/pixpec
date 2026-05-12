@@ -1,18 +1,15 @@
 /**
- * pixpec dump-figma — exports a component's Figma frames to PNG.
- * Output: <root>/.pixpec-out/<ComponentName>/figma/<case>.png
+ * Figma source capture — exports a component's Figma cases to PNG.
  *
- * Single-purpose; independent of Chromium dump (parallelizable).
- * Lib function + CLI entrypoint.
+ * Single-purpose; independent of destination captures.
+ * Used by the generic capture backend.
  */
 import { mkdir } from 'node:fs/promises'
-import { resolve } from 'node:path'
-import type { Component } from './types.ts'
-import { exportFigmaNodes } from './figma.ts'
-import { switchToPageContaining } from './cfigma-meta.ts'
-import { loadConfig } from './init.ts'
+import type { Component } from '../types.ts'
+import { exportFigmaNodes } from '../figma.ts'
+import { switchToPageContaining } from '../cfigma-meta.ts'
 
-export interface DumpFigmaOptions {
+export interface CaptureFigmaSourceOptions {
   component: Component<unknown>
   outDir: string
   /** Force every case to export from this tab. Omit (undefined) to group
@@ -24,16 +21,16 @@ export interface DumpFigmaOptions {
   cfigmaBin?: string
 }
 
-export async function dumpFigma(opts: DumpFigmaOptions): Promise<void> {
+export async function captureFigmaSource(opts: CaptureFigmaSourceOptions): Promise<void> {
   const { component: comp, outDir, tabPattern, scale, bridge, cfigmaBin } = opts
   await mkdir(outDir, { recursive: true })
   if (comp.variants.length === 0) return
   // Cases can span multiple figma files (library masters + consuming-app
-  // usages, both emitted by usage-based init). Each Case.figmaId carries
+  // usages, both emitted by usage-based init). Each Case figmaId carries
   // its fileKey as a `<fileKey>:<nodeId>` prefix; group by that prefix
   // and run one exportFigmaNodes per tab. An explicit tabPattern arg
   // forces every export through that tab (legacy single-file usage).
-  const { splitFigmaId } = await import('./types.ts')
+  const { splitFigmaId } = await import('../types.ts')
   // Flatten variants → usecases. Each usecase is a real figma node we
   // need the reference PNG of; variant buckets themselves hold no
   // standalone figma node beyond the ones inside their usecases.
@@ -42,7 +39,7 @@ export async function dumpFigma(opts: DumpFigmaOptions): Promise<void> {
   if (flat.length === 0) return
   const grouped = new Map<string, string[]>()
   // nodeId → full figmaId; output filenames use sanitize(figmaId) so
-  // figma↔chromium↔measure all key on the SAME identifier.
+  // source↔destination↔measure all key on the SAME identifier.
   const figmaIdByNode = new Map<string, string>()
   for (const c of flat) {
     const { fileKey, nodeId } = splitFigmaId(c.figmaId)
@@ -88,7 +85,7 @@ export async function dumpFigma(opts: DumpFigmaOptions): Promise<void> {
     // cfigma now names each output `<sanitize(id)>.<ext>` (we pass `--by-id`
     // through exportFigmaNodes), so per-page batches no longer collide on
     // node names. Rename each export directly to `<caseName>.<ext>` for
-    // measure-rs's filename-based figma↔chromium pairing.
+    // measure-rs's filename-based source↔destination pairing.
     const { rename } = await import('node:fs/promises')
     for (const [, pageIds] of byPage) {
       await switchToPageContaining({ tabPattern: tab, nodeId: pageIds[0], cfigmaBin })
@@ -110,28 +107,4 @@ export async function dumpFigma(opts: DumpFigmaOptions): Promise<void> {
       }
     }
   }
-}
-
-export async function runDumpFigma(componentName: string, tabOverride?: string): Promise<void> {
-  const { cfg, root } = await loadConfig()
-  const componentsDir = cfg.componentsDir ?? 'src/components'
-  const componentMod = (await import(resolve(root, componentsDir, componentName, 'index.ts'))) as Record<string, unknown>
-  const comp = componentMod[componentName] as Component<unknown> | undefined
-  if (!comp || !Array.isArray(comp.variants)) {
-    throw new Error(`Component '${componentName}' not exported from ${componentsDir}/${componentName}/index.ts`)
-  }
-  const outDir = resolve(root, `.pixpec-out/${comp.name}/figma`)
-  console.log(`[dump-figma] ${comp.name}: ${comp.variants.length} cases → ${outDir}`)
-  const t0 = Date.now()
-  await dumpFigma({
-    component: comp,
-    outDir,
-    // Only force a single tab when the caller explicitly passed one.
-    // Default (undefined) lets dumpFigma group by each case's own fileKey.
-    tabPattern: tabOverride,
-    scale: cfg.scale,
-    bridge: cfg.bridge,
-    cfigmaBin: cfg.cfigmaBin,
-  })
-  console.log(`[dump-figma] done in ${Date.now() - t0}ms`)
 }

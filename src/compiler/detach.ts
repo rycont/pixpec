@@ -114,14 +114,14 @@ function isFieldCoveredByBinding(
   binding?: NodeBindingValue,
 ): boolean {
   if (!binding) return false;
-  if (field === "characters" && binding.attr?.text) return true;
-  if (field === "fills" && binding.attr?.fill) return true;
-  if (field === "textStyleId" && binding.attr?.textStyle) return true;
-  if (field === "visible" && binding.attr?.visible) return true;
+  if (field === "characters" && binding.node?.content) return true;
+  if (field === "fills" && binding.node?.paint) return true;
+  if (field === "textStyleId" && binding.node?.textStyle) return true;
+  if (field === "visible" && binding.node?.visible) return true;
   if (
     field === "componentProperties" &&
-    binding.instanceProps &&
-    Object.keys(binding.instanceProps).length > 0
+    binding.component &&
+    Object.keys(binding.component).length > 0
   )
     return true;
   return false;

@@ -1,11 +1,9 @@
 /**
  * `pixpec generate <fileKey>:<nodeId>` — new pipeline:
- *   dumper (raw figma) → compiler (Design AST) → emitter (target source).
+ *   src dump (raw figma) → compiler (Design AST) → target codegen.
  *
- * Sits alongside the legacy `pixpec generate` until the new pipeline reaches
- * full parity. Emitter is selected via `pixpec.toml#emitter` (default
- * `react-panda`); other targets (Slint, Flutter, etc.) plug in by registering
- * in `src/emitter/index.ts`.
+ * Target is selected via --target when pixpec.toml declares more than one
+ * destination target.
  */
 
 import { existsSync } from 'node:fs'
@@ -13,20 +11,42 @@ import { mkdir, readFile, writeFile } from 'node:fs/promises'
 import { dirname, join, resolve } from 'node:path'
 import { dump, exportNodeSvg } from './dumper/index.ts'
 import { compile, loadRegistry } from './compiler/index.ts'
-import { getEmitter } from './emitter/index.ts'
+import { getTarget, resolveConfiguredTargets } from './targets/index.ts'
 import { loadConfig } from './init.ts'
 import { listFigmaTabs } from './cfigma-meta.ts'
 
 export interface GenerateOptions {
-  /** Override the emitter chosen via pixpec.toml. */
-  emitter?: string
+  /** Target to generate. Required for runGenerate. */
+  target?: string
   /** Component the generated file slots into. Defaults to the figma node's
    *  containing component (resolved from componentSet membership). */
   componentName?: string
   /** Output filename (without dir). Defaults to a sanitized figmaId. */
   outName?: string
+  /** Directory to write generated target output into. Defaults to component generated dir. */
+  outputDir?: string
   /** Component-owned prop keys to strip before forwarding root props. */
   propKeys?: string[]
+  /** Props file for component output. Set null for view output. */
+  propsFile?: string | null
+}
+
+export interface GenerateManyOptions extends Omit<GenerateOptions, 'target'> {
+  target?: string
+}
+
+export async function runGenerateTargets(
+  componentId: string,
+  opts: GenerateManyOptions = {},
+): Promise<Array<{ target: string; componentName: string; outPath: string; source: string }>> {
+  const { cfg } = await loadConfig()
+  const targets = opts.target ? [opts.target] : resolveConfiguredTargets(cfg)
+  const results = []
+  for (const target of targets) {
+    const r = await runGenerate(componentId, { ...opts, target })
+    results.push({ target, ...r })
+  }
+  return results
 }
 
 export async function runGenerate(componentId: string, opts: GenerateOptions = {}): Promise<{
@@ -34,6 +54,9 @@ export async function runGenerate(componentId: string, opts: GenerateOptions = {
   outPath: string
   source: string
 }> {
+  if (!opts.target) {
+    throw new Error('pixpec generate: target is required; use runGenerateTargets for configured targets')
+  }
   const { cfg, root } = await loadConfig()
   const componentsDir = resolve(root, cfg.componentsDir ?? 'src/components')
 
@@ -103,18 +126,19 @@ export async function runGenerate(componentId: string, opts: GenerateOptions = {
   const bindingsForNode = ownerEntry?.bindings
   const componentName = opts.componentName ?? ownerEntry?.componentName ?? 'Generated'
 
-  // Dump → compile → emit.
+  // Dump → compile → target codegen.
   const raw = await dump({ cfigmaBin: cfg.cfigmaBin ?? 'cfigma', tab: tab.key, nodeId })
   const ast = await compile(raw, {
     registry, bindings: bindingsForNode, tokenMap, tokenValueMap,
     exportSvg: (id) => exportNodeSvg({ cfigmaBin: cfg.cfigmaBin ?? 'cfigma', tab: tab.key, nodeId: id }),
   })
-  const emitterName = opts.emitter ?? (cfg as { emitter?: string }).emitter ?? 'react-panda'
-  const emitter = getEmitter(emitterName)
-  // Land in <componentsDir>/<componentName>/generated/<safeId>.<ext>.
+  const targetName = opts.target
+  const target = getTarget(targetName)
+  // Land in <componentsDir>/<componentName>/generated/<safeId>.<ext> unless
+  // the caller delegates a different output directory.
   const safeId = (fileKey + '_' + nodeId).replace(/[^A-Za-z0-9]/g, '_')
-  const outDir = resolve(componentsDir, componentName, 'generated')
-  const result = await emitter.emit(ast, {
+  const outDir = opts.outputDir ?? resolve(componentsDir, componentName, 'generated')
+  const result = await target.codegen(ast, {
     componentName,
     designSystem: { tokens: tokenMap, tokenValues: tokenValueMap, typography: typographyMap },
     registry: new Map(
@@ -126,7 +150,9 @@ export async function runGenerate(componentId: string, opts: GenerateOptions = {
     outputDir: outDir,
     rootDir: root,
     componentsDir,
-    propsFile: resolve(componentsDir, componentName, 'props.ts'),
+    propsFile: opts.propsFile === null
+      ? undefined
+      : opts.propsFile ?? resolve(componentsDir, componentName, 'props.ts'),
   })
 
   const outName = opts.outName ?? `${safeId}.${result.fileExtension}`

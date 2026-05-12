@@ -8,7 +8,8 @@
   "types": "./src/index.ts",
   "exports": {
     ".": "./src/index.ts",
-    "./spec": "./src/spec.ts"
+    "./spec": "./src/spec.ts",
+    "./targets/react-panda/runtime": "./src/targets/react-panda/runtime.ts"
   },
   "bin": {
     "pixpec": "./src/cli.ts",
@@ -29,6 +30,7 @@
     "sharp": "^0.33.5",
     "smol-toml": "^1.6.1",
     "vite": "^8.0.10",
+    "vite-plugin-svgr": "^5.2.0",
     "zod": "^4.4.3"
   },
   "devDependencies": {

@@ -1,7 +1,5 @@
 export { defineComponent } from './types.ts'
 export type { Component, Case } from './types.ts'
-export { Renderer } from './render.ts'
-export type { RenderUrlOptions } from './render.ts'
 export { exportFigmaNode, exportFigmaNodes } from './figma.ts'
 export type { FigmaExportOptions } from './figma.ts'
 export { fetchComponentMeta } from './cfigma-meta.ts'

@@ -21,8 +21,13 @@ import { pathToFileURL } from 'node:url'
 import type { RawNode } from '../dumper/raw-node.ts'
 
 export interface NodeBindingValue {
-  attr?: { text?: string; visible?: string; color?: string; fill?: string; textStyle?: string }
-  instanceProps?: Record<string, string>
+  node?: {
+    content?: string
+    visible?: string
+    paint?: string
+    textStyle?: string
+  }
+  component?: Record<string, string>
 }
 
 /** Per-master-node-id → which figma fields are bound to which prop. */
@@ -115,8 +120,9 @@ function aggregateBindings(variants: unknown): NodeBindings {
     if (!v.bindings) continue
     for (const [nodeId, b] of Object.entries(v.bindings)) {
       const cur = out[nodeId] ?? {}
-      if (b.attr) cur.attr = { ...(cur.attr ?? {}), ...b.attr }
-      if (b.instanceProps) cur.instanceProps = { ...(cur.instanceProps ?? {}), ...b.instanceProps }
+      if (b.node) cur.node = { ...(cur.node ?? {}), ...b.node }
+      if (b.component)
+        cur.component = { ...(cur.component ?? {}), ...b.component }
       out[nodeId] = cur
     }
   }

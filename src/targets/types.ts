@@ -1,30 +1,30 @@
 /**
- * Emitter — Design AST → target-language source.
+ * CompileTarget — Design AST → target-language source, plus destination
+ * capture for rendered cases/views.
  *
- * Each emitter is a self-contained module that knows how to render the
- * Design AST to a particular framework (React+Panda today; Slint, Flutter,
- * SwiftUI, etc. tomorrow). The pixpec pipeline picks one emitter per build,
- * configured via `pixpec.toml` (`emitter = "react-panda"`).
+ * Each target is a self-contained module for one destination stack
+ * (React+Panda today; Slint, egui, etc. tomorrow). Pixpec selects destination
+ * targets via `pixpec.toml` (`targets = ["..."]`).
  *
- * Emitters share the same AST input but vary widely in:
+ * Targets share the same AST input but vary widely in:
  *   - output language (TSX / Slint / Dart / ...)
  *   - file layout (single .tsx vs split per-component)
  *   - styling system (panda atomic classes, CSS modules, native styles, ...)
  *
- * The interface stays minimal so each target can shape its own output
- * conventions without forcing a lowest-common-denominator API.
+ * The interface keeps code generation and destination capture collocated so
+ * target-specific harnesses do not leak into projects that consume Pixpec.
  */
 
 import type { DNode } from '../compiler/design-ast.ts'
 
-export interface EmitContext {
+export interface CodegenContext {
   /** The component being emitted (matches the source-tree directory name). */
   componentName: string
-  /** Resolved design-system metadata the emitter needs at render time:
+  /** Resolved design-system metadata the target needs at render time:
    *    - tokens:     variable id → semantic path (e.g. `content.standard.primary`)
    *    - typography: text-style ref → typography-component name
    *    - fonts:      font-family → font registry data (Y-shift, etc.)
-   *  Each emitter ignores the slots it doesn't care about. */
+   *  Each target ignores the slots it doesn't care about. */
   designSystem: {
     tokens?: Record<string, string>
     tokenValues?: Record<string, number>
@@ -32,17 +32,17 @@ export interface EmitContext {
     fonts?: unknown
   }
   /** Components registered in the project (for DInstance resolution). Map
-   *  keyed by componentName. Emitter uses this to derive import paths,
+   *  keyed by componentName. Target uses this to derive import paths,
    *  prop typing, etc. */
-  registry?: Map<string, EmitterComponentMeta>
-  /** Emitter-specific plugins (e.g. icon currentColor wrapper for React).
-   *  Emitter implementations choose how to interpret these. */
+  registry?: Map<string, TargetComponentMeta>
+  /** Target-specific plugins (e.g. icon currentColor wrapper for React).
+   *  Target implementations choose how to interpret these. */
   plugins?: unknown[]
   /** Design-unit → physical-unit base. Default 16 (CSS rem base). */
   remBase?: number
   /** Component-owned prop keys that must not be forwarded to the rendered root. */
   propKeys?: string[]
-  /** Source figma node id for emitter-specific comments or sidecar ids. */
+  /** Source figma node id for target-specific comments or sidecar ids. */
   sourceId?: string
   /** Directory where the emitted source file will be written. Import paths are
    *  computed relative to this directory when present. */
@@ -55,9 +55,9 @@ export interface EmitContext {
   propsFile?: string
 }
 
-/** Minimal component metadata an emitter needs about a registered DInstance
- *  target. Emitters may extend with target-specific extra fields. */
-export interface EmitterComponentMeta {
+/** Minimal component metadata a target needs about a registered DInstance
+ *  target. Targets may extend with target-specific extra fields. */
+export interface TargetComponentMeta {
   componentName: string
   /** Absolute path to the component's source directory. Used to compute
    *  relative import paths from the generated file. */
@@ -66,21 +66,39 @@ export interface EmitterComponentMeta {
   hasProps?: boolean
 }
 
-export interface EmitResult {
+export interface CodegenResult {
   /** Generated source file content. */
   source: string
   /** File extension to write (without dot) — `tsx`, `slint`, `dart`, ... */
   fileExtension: string
-  /** Optional sidecar files an emitter wants to drop next to the main
-   *  output (e.g. emitter-specific config, a CSS module, etc.). */
+  /** Optional sidecar files a target wants to drop next to the main output
+   *  (e.g. target-specific config, a CSS module, etc.). */
   sidecars?: Array<{ relativePath: string; content: string }>
 }
 
-export interface Emitter {
+export type CaptureKind = 'case' | 'view'
+
+export interface CaptureRequest {
+  kind: CaptureKind
+  ids: string[]
+}
+
+export interface CaptureArtifact {
+  id: string
+  pngPath: string
+}
+
+export interface CaptureResult {
+  artifacts: CaptureArtifact[]
+}
+
+export interface CompileTarget {
   /** Stable identifier referenced from `pixpec.toml`. */
   name: string
   /** Human-readable description for CLI listings. */
   description?: string
   /** Compile a single Design AST root to the target source. */
-  emit(root: DNode, ctx: EmitContext): EmitResult | Promise<EmitResult>
+  codegen(root: DNode, ctx: CodegenContext): CodegenResult | Promise<CodegenResult>
+  /** Capture rendered destination artifacts for cases or views. */
+  capture(request: CaptureRequest): Promise<CaptureResult>
 }

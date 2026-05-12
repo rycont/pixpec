@@ -65,7 +65,7 @@ export interface CompileOptions {
   /** Component registry (built by registry.ts from each component's index.ts). */
   registry: Registry;
   /** Variant bindings spec — per-master-node-id { attr.text/visible,
-   *  instanceProps } map. Walker stamps matching descendants with
+   *  component } map. Walker stamps matching descendants with
    *  contentBinding/visibilityBinding so the emitter renders prop-driven
    *  trees. Keyed by stripPrefix(node.id) so nested-instance overrides
    *  match the master node ids in cases.ts. */
@@ -394,7 +394,7 @@ function buildBase(
   }
   const bareId = stripPrefix(n.id);
   const binding = opts.bindings?.[bareId];
-  if (binding?.attr?.visible) out.visibilityBinding = binding.attr.visible;
+  if (binding?.node?.visible) out.visibilityBinding = binding.node.visible;
   return out;
 }
 
@@ -488,9 +488,9 @@ function compileText(
   };
   const bareId = stripPrefix(n.id);
   const binding = opts.bindings?.[bareId];
-  if (binding?.attr?.text) out.contentBinding = binding.attr.text;
-  if (binding?.attr?.fill) out.fillBinding = binding.attr.fill;
-  if (binding?.attr?.textStyle) out.textStyleBinding = binding.attr.textStyle;
+  if (binding?.node?.content) out.contentBinding = binding.node.content;
+  if (binding?.node?.paint) out.fillBinding = binding.node.paint;
+  if (binding?.node?.textStyle) out.textStyleBinding = binding.node.textStyle;
   return out;
 }
 
@@ -686,7 +686,7 @@ async function compileContainer(
     ),
     padding: paddingFromRaw(n, opts),
     background: pickColor(fill, bgVarId, opts),
-    fillBinding: binding?.attr?.fill,
+    fillBinding: binding?.node?.paint,
     border: stroke
       ? {
           paint: pickColor(stroke, strokeVarId, opts) ?? {
@@ -806,11 +806,11 @@ async function compileInstance(
   // Surface per-instance-property bindings from the variant spec so the
   // emitter can render `<Icon Type={iconType}/>` etc.
   const bareId = stripPrefix(n.id);
-  const ipb = opts.bindings?.[bareId]?.instanceProps;
+  const ipb = opts.bindings?.[bareId]?.component;
   if (ipb && Object.keys(ipb).length > 0) out.instancePropBindings = { ...ipb };
-  const fillBinding = opts.bindings?.[bareId]?.attr?.fill;
+  const fillBinding = opts.bindings?.[bareId]?.node?.paint;
   const childSupportsFill = Object.values(entry.bindings).some(
-    (b) => b.attr?.fill === "_fill",
+    (b) => b.node?.paint === "_fill",
   );
   if (fillBinding && childSupportsFill) {
     out.instancePropBindings = {

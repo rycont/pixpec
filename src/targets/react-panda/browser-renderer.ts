@@ -91,7 +91,7 @@ export class Renderer {
       // @font-face load is async even with font-display:block.
       if (opts.waitForFonts !== false)
         await page.waitForTimeout(FONT_SETTLE_MS);
-      // Harness post-mount work (SVG snap, Y-shift) — see __pixpec-entry.ts.
+      // Harness post-mount work (SVG snap, Y-shift).
       await page.evaluate(
         () =>
           (

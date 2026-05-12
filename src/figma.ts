@@ -125,7 +125,7 @@ export async function exportFigmaNodes(
     const format: FigmaExportFormat = opts.format ?? 'PNG'
     const ext = EXT_FOR[format]
     // Caller owns outDir lifecycle — exportFigmaNodes is called once per
-    // (tab, page) batch by dump-figma, and wiping here would erase prior
+    // (tab, page) batch by source capture, and wiping here would erase prior
     // batches' files (this dropped 34/37 cases on multi-page TabItem dumps).
     await mkdir(opts.outDir, { recursive: true })
 

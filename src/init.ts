@@ -3,13 +3,13 @@
  *
  * Reads `pixpec.toml` from cwd (or walks up). Fetches component metadata via
  * cfigma; auto-generates props type + cases from variants; exports each
- * variant PNG into `src/components/<Name>/figma/`.
+ * component cases and runs a post-init capture/verify check.
  *
  * Files generated under `<componentsDir>/<Name>/`:
  *   impl.ts    — props interface + render stub (TODO body)
  *   cases.ts   — auto-filled from variants
  *   index.ts   — defineComponent
- *   figma/     — exported variant PNGs (one per case)
+ *   .pixpec/   — capture and verify artifacts
  */
 import { existsSync, readFileSync } from "node:fs";
 import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
@@ -32,8 +32,8 @@ import type { DNode } from "./compiler/design-ast.ts";
 
 export interface PixpecConfig {
   figmaFileId: string;
-  /** Primary tab pattern — used by single-target commands (dump-figma,
-   * breakdown-prepare default). Equal to `tabPatterns[0]`. */
+  /** Primary tab pattern — used by single-target capture/breakdown flows.
+   * Equal to `tabPatterns[0]`. */
   tabPattern: string;
   /** All tab patterns the project may need to talk to. init walks this list
    * trying each until it finds the requested componentId (so a DS that
@@ -42,6 +42,8 @@ export interface PixpecConfig {
   tabPatterns: string[];
   /** Where component directories live. Default `src/components`. */
   componentsDir?: string;
+  /** Destination compile/capture targets. */
+  targets: string[];
   /** Override cfigma binary path. */
   cfigmaBin?: string;
   /** Default cfigma export scale. Default 2 (matches runner default). */
@@ -79,10 +81,16 @@ export async function loadConfig(start: string = process.cwd()): Promise<{
           : [];
       if (tabPatterns.length === 0)
         throw new Error(`${p}: missing tabPattern (or tabPatterns array)`);
+      const targets: string[] = Array.isArray(parsed.targets)
+        ? parsed.targets.filter((x): x is string => typeof x === "string" && x.length > 0)
+        : [];
+      if (targets.length === 0)
+        throw new Error(`${p}: missing targets array`);
       const cfg: PixpecConfig = {
         figmaFileId: parsed.figmaFileId,
         tabPattern: tabPatterns[0],
         tabPatterns,
+        targets,
         componentsDir:
           typeof parsed.componentsDir === "string"
             ? parsed.componentsDir
@@ -593,30 +601,25 @@ interface CaseRow {
    * `Variant.bindings` in cases.ts. generate threads this through the
    * walker so IR nodes get parametric annotations. */
   bindings?: Record<
-    string,
-    {
-      attr?: {
-        text?: string;
-        visible?: string;
-        fill?: string;
-        textStyle?: string;
-      };
-      instanceProps?: Record<string, string>;
-    }
-  >;
+      string,
+      {
+        node?: {
+          content?: string;
+          visible?: string;
+          paint?: string;
+          textStyle?: string;
+        };
+        component?: Record<string, string>;
+      }
+    >;
   /** Pre-rendered TS object literal (already-formatted prop entries
    * with `literalForValue`-friendly value forms). */
   propsLiteral: string;
   /** JSON.stringify of an order-stable {props, width, height} blob. Two
    * rows with the same signature collapse to one (the first wins). */
   signature: string;
-  /** When the figma usage overrode the root component's sizing (instance
-   * dim differs from master dim), init emits a wrapper that locks the
-   * chromium render to the same width/height — otherwise hug-content
-   * impl would diverge from figma's fixed-size frame. Stored as the
-   * literal source of the wrapper expression so generateCases can drop
-   * it straight into the case object. */
-  wrapperLiteral?: string;
+  /** Platform-neutral render/capture context literal for this usecase. */
+  renderLiteral?: string;
 }
 
 function stableSignature(
@@ -692,10 +695,8 @@ function generateCases(
       if (!def) return `    ${name}: ${JSON.stringify(value)}`;
       return `    ${propsKey(name)}: ${literalForValue(def, value as FigmaPropValue)}`;
     });
-    // Lock master variant case to its figma dim so the impl's CSS-flex
-    // hug doesn't drift sub-pixel from figma's layout-engine hug.
-    // boxWrapper rem-converts internally so the verify-mode supersample
-    // applies to the wrapper alongside the codegen'd JSX.
+    // Lock master variant case to its figma dim so platform renderers use
+    // the same capture box as figma export.
     const hasRenderBounds =
       v.renderWidth != null &&
       v.renderHeight != null &&
@@ -707,11 +708,11 @@ function generateCases(
         Math.abs(v.renderHeight - v.height) > 0.5 ||
         Math.abs(v.renderOffsetX) > 0.5 ||
         Math.abs(v.renderOffsetY) > 0.5);
-    const wrapperLiteral =
+    const renderLiteral =
       v.width != null && v.height != null
         ? hasRenderBounds
-          ? `boxWrapper({ width: ${v.renderWidth}, height: ${v.renderHeight}, paddingLeft: ${v.renderOffsetX}, paddingTop: ${v.renderOffsetY}, overflow: 'visible' })`
-          : `boxWrapper({ width: ${v.width}, height: ${v.height} })`
+          ? `{ box: { width: ${v.renderWidth}, height: ${v.renderHeight}, paddingLeft: ${v.renderOffsetX}, paddingTop: ${v.renderOffsetY}, overflow: 'visible' } }`
+          : `{ box: { width: ${v.width}, height: ${v.height} } }`
         : undefined;
     // Per-node bindings — for each TEXT layer matching detectedLabelProp
     // and each nested INSTANCE matching detectedNestedProps, record the
@@ -720,13 +721,13 @@ function generateCases(
     const bindings: Record<
       string,
       {
-        attr?: {
-          text?: string;
+        node?: {
+          content?: string;
           visible?: string;
-          fill?: string;
+          paint?: string;
           textStyle?: string;
         };
-        instanceProps?: Record<string, string>;
+        component?: Record<string, string>;
       }
     > = {};
     // Explicit figma TEXT property — each text node whose
@@ -741,9 +742,9 @@ function generateCases(
         const propKey = propName(propRefBare);
         if (!meta.propertyDefinitions[propRefBare]) continue;
         bindings[tn.id] = bindings[tn.id] ?? {};
-        bindings[tn.id].attr = {
-          ...(bindings[tn.id].attr ?? {}),
-          text: propKey,
+        bindings[tn.id].node = {
+          ...(bindings[tn.id].node ?? {}),
+          content: propKey,
         };
       }
     }
@@ -751,9 +752,9 @@ function generateCases(
       for (const tn of v.textNodes) {
         if (tn.name === detectedLabelProp.name) {
           bindings[tn.id] = bindings[tn.id] ?? {};
-          bindings[tn.id].attr = {
-            ...(bindings[tn.id].attr ?? {}),
-            text: "label",
+          bindings[tn.id].node = {
+            ...(bindings[tn.id].node ?? {}),
+            content: "label",
           };
         }
       }
@@ -764,8 +765,8 @@ function generateCases(
           if (nn.name !== np.layerName) continue;
           if (!(np.propKey in nn.props)) continue;
           bindings[nn.id] = bindings[nn.id] ?? {};
-          bindings[nn.id].instanceProps = {
-            ...(bindings[nn.id].instanceProps ?? {}),
+          bindings[nn.id].component = {
+            ...(bindings[nn.id].component ?? {}),
             [propName(np.propKey)]: np.propName,
           };
         }
@@ -778,8 +779,8 @@ function generateCases(
       for (const vn of v.visibilityNodes) {
         const propKey = propName(vn.propRef);
         bindings[vn.id] = bindings[vn.id] ?? {};
-        bindings[vn.id].attr = {
-          ...(bindings[vn.id].attr ?? {}),
+        bindings[vn.id].node = {
+          ...(bindings[vn.id].node ?? {}),
           visible: propKey,
         };
       }
@@ -788,9 +789,9 @@ function generateCases(
     if (fillNodes) {
       for (const nodeId of fillNodes) {
         bindings[nodeId] = bindings[nodeId] ?? {};
-        bindings[nodeId].attr = {
-          ...(bindings[nodeId].attr ?? {}),
-          fill: "_fill",
+        bindings[nodeId].node = {
+          ...(bindings[nodeId].node ?? {}),
+          paint: "_fill",
         };
       }
     }
@@ -800,8 +801,8 @@ function generateCases(
     if (textStyleNodes) {
       for (const nodeId of textStyleNodes) {
         bindings[nodeId] = bindings[nodeId] ?? {};
-        bindings[nodeId].attr = {
-          ...(bindings[nodeId].attr ?? {}),
+        bindings[nodeId].node = {
+          ...(bindings[nodeId].node ?? {}),
           textStyle: "_textStyle",
         };
       }
@@ -815,7 +816,7 @@ function generateCases(
       // (e.g. Tab_Item Status=true at 96×64 vs same props at 132×64)
       // don't collapse to one variant.
       signature: stableSignature(allProps, v.width, v.height),
-      wrapperLiteral,
+      renderLiteral,
       isMain: true,
     };
   });
@@ -855,13 +856,13 @@ function generateCases(
     usecasesByVariant.get(key)!.push(u);
   }
   const renderUsecase = (r: CaseRow) => {
-    const wrap = r.wrapperLiteral
-      ? `\n        wrapper: ${r.wrapperLiteral},`
+    const render = r.renderLiteral
+      ? `\n        render: ${r.renderLiteral},`
       : "";
     const main = r.isMain ? `\n        isMainCase: true,` : "";
     return `      {
         props: ${r.propsLiteral.replace(/\n/g, "\n    ")},
-        figmaId: ${JSON.stringify(r.figmaId)},${wrap}${main}
+        figmaId: ${JSON.stringify(r.figmaId)},${render}${main}
       }`;
   };
   const variantByKey = new Map(
@@ -883,11 +884,7 @@ ${us.map(renderUsecase).join(",\n")},
   const variantKeys = variantRows
     .map((v) => v.variantKey)
     .filter((k): k is string => !!k);
-  const needsBoxWrapper = allUsecases.some((r) => r.wrapperLiteral);
-  const wrapperImport = needsBoxWrapper
-    ? `import { boxWrapper } from 'pixpec/spec'\n`
-    : "";
-  return `${wrapperImport}import type { Variant } from 'pixpec/spec'
+  return `import type { Variant } from 'pixpec/spec'
 import type { ${componentName}Props } from './props.ts'
 
 /** Master variants — what breakdown / codegen / verify iterate. Each
@@ -1178,6 +1175,15 @@ export async function init(opts: {
       console.warn(`[init] instance scan failed: ${(e as Error).message}`);
     }
   }
+  const { loadRegistry } = await import("./compiler/registry.ts");
+  const componentRegistry = await loadRegistry(componentsDir);
+  const childSupportsFill = (componentSetKey?: string | null): boolean => {
+    if (!componentSetKey) return false;
+    const entry = componentRegistry.get(componentSetKey);
+    return Object.values(entry?.bindings ?? {}).some(
+      (b) => b.node?.paint === "_fill",
+    );
+  };
   // Auto-expose nested INSTANCE component properties whose ≥20% of usages
   // override the master default. propsFromFigma reads them from
   // `raw.nestedProps[layerName][propKey]`. Prop name = camelCase of
@@ -1239,6 +1245,10 @@ export async function init(opts: {
       );
     }
   }
+  const fillValue = (entry: { hex: string; opacity: number }): string =>
+    entry.opacity < 1
+      ? `rgba(${parseInt(entry.hex.slice(1, 3), 16)}, ${parseInt(entry.hex.slice(3, 5), 16)}, ${parseInt(entry.hex.slice(5, 7), 16)}, ${entry.opacity})`
+      : entry.hex;
   const singleFillValue = (u: {
     fillOverrides?: Record<string, { hex: string; opacity: number }>;
   }): string | undefined => {
@@ -1250,9 +1260,7 @@ export async function init(opts: {
       (e) => e.hex === first.hex && Math.abs(e.opacity - first.opacity) < 1e-3,
     );
     if (!allSame) return undefined;
-    return first.opacity < 1
-      ? `rgba(${parseInt(first.hex.slice(1, 3), 16)}, ${parseInt(first.hex.slice(3, 5), 16)}, ${parseInt(first.hex.slice(5, 7), 16)}, ${first.opacity})`
-      : first.hex;
+    return fillValue(first);
   };
   let detectedFillProp: { sample: string } | undefined;
   if (scanResult && scanResult.totalInstances > 0) {
@@ -1562,15 +1570,6 @@ export async function init(opts: {
     addRemStatic("width", v.width);
     addRemStatic("height", v.height);
   }
-  const { loadRegistry } = await import("./compiler/registry.ts");
-  const componentRegistry = await loadRegistry(componentsDir);
-  const childSupportsFill = (componentSetKey?: string | null): boolean => {
-    if (!componentSetKey) return false;
-    const entry = componentRegistry.get(componentSetKey);
-    return Object.values(entry?.bindings ?? {}).some(
-      (b) => b.attr?.fill === "_fill",
-    );
-  };
   const stripPrefix = (id: string) =>
     id.includes(";") ? id.substring(id.lastIndexOf(";") + 1) : id;
   const fillBindingsByVariantKey = new Map<string, Set<string>>();
@@ -1846,7 +1845,7 @@ export async function init(opts: {
         .split("\n")
         .map((l, i) => (i === 0 ? l : "    " + l))
         .join("\n");
-      // Dim-locking wrapper only for usages whose root sizing diverges
+      // Dim-locking render box only for usages whose root sizing diverges
       // from the master — i.e. designer expanded/shrank the instance
       // beyond hug-content. Skipping when dim matches master keeps the
       // emitted file slim (most cases) and lets impl's natural layout drive.
@@ -1855,12 +1854,8 @@ export async function init(opts: {
         u.mainHeight != null &&
         (Math.abs(u.width - u.mainWidth) > 0.5 ||
           Math.abs(u.height - u.mainHeight) > 0.5);
-      // Use the spec's boxWrapper helper instead of inlining a raw-px div.
-      // boxWrapper emits px→rem so the chromium harness's html font-size
-      // supersample scales the wrapper alongside the codegen'd impl —
-      // raw px would render at 1× and mismatch figma's `cfg.scale` export.
-      const wrapperLiteral = dimOverridden
-        ? `boxWrapper({ width: ${u.width}, height: ${u.height} })`
+      const renderLiteral = dimOverridden
+        ? `{ box: { width: ${u.width}, height: ${u.height} } }`
         : undefined;
       // Stash any concrete value for panda staticCss (see runtimeDims init).
       // Skip pure keyword tokens (none, transparent, currentColor) — those
@@ -1884,7 +1879,7 @@ export async function init(opts: {
         variantKey: u.mainKey ?? undefined,
         propsLiteral: lit,
         signature: stableSignature(fullProps, u.width, u.height),
-        wrapperLiteral,
+        renderLiteral,
       });
     }
     console.log(
@@ -1954,7 +1949,7 @@ export async function init(opts: {
   );
   // master-snapshot.json — raw figma dump of each master variant. The
   // compiler reads this off disk to (a) compare instance overrides for
-  // detach decisions and (b) supply variant context to the emitter
+  // detach decisions and (b) supply variant context to target codegen
   // without going back to figma. Keyed by variant.key (cross-file
   // durable id). Skipped silently when the dumper isn't available
   // (offline scenarios — registry just falls back to empty snapshots).
@@ -1986,7 +1981,7 @@ export async function init(opts: {
   // so the component is immediately ready to compose. Fail fast: if any
   // variant errors (e.g. references an unregistered nested component),
   // abort so the user fixes the dependency before re-running init.
-  const { runGenerate } = await import("./generate.ts");
+  const { runGenerateTargets } = await import("./generate.ts");
   const generatedVariants: Array<{
     propValues: Record<string, FigmaPropValue>;
     safeId: string;
@@ -1998,11 +1993,13 @@ export async function init(opts: {
         ...Object.keys(nestedSchemas),
         ...(detectedItemsProp ? [detectedItemsProp.propName] : []),
       ];
-      const r = await runGenerate(`${explicitFileKey}:${v.id}`, {
+      const results = await runGenerateTargets(`${explicitFileKey}:${v.id}`, {
         componentName,
         propKeys,
       });
-      console.log(`[init] generated ${componentName}/${v.name} → ${r.outPath}`);
+      for (const r of results) {
+        console.log(`[init] generated ${componentName}/${v.name} [${r.target}] → ${r.outPath}`);
+      }
       const safeId = `${explicitFileKey}_${v.id}`.replace(/[^A-Za-z0-9]/g, "_");
       generatedVariants.push({ propValues: v.propValues, safeId });
     } catch (e) {
@@ -2033,23 +2030,20 @@ export async function init(opts: {
       variantIds: normalizedMeta.variants.map((v) => v.id),
     };
   }
-  // Verification step — render every variant's generated tsx in chromium
-  // and pixel-compare against the figma export. This is a post-init health
+  // Verification step — capture target output and pixel-compare against
+  // the figma source export. This is a post-init health
   // check, not part of the generator transaction: init must still leave the
   // freshly generated component on disk when visual verification trips on a
-  // screenshot/runtime edge case. The standalone `verify-generated` command
-  // remains the strict gate for CI or local follow-up.
+  // screenshot/runtime edge case.
   console.log(`[init] verifying ${componentName} against figma…`);
   try {
-    const { runDumpFigma } = await import("./dump-figma.ts");
-    const { runVerifyGenerated } = await import("./verify-generated.ts");
-    await runDumpFigma(componentName);
-    const vr = await runVerifyGenerated(componentName);
+    const { runVerify } = await import("./verify.ts");
+    const vr = await runVerify(componentName);
     if (vr.fail > 0) {
       console.warn(
         `[init] ${componentName}: ${vr.fail}/${vr.total} usecase(s) failed pixel verify. ` +
           `Failed: ${vr.failed.slice(0, 5).join(", ")}${vr.failed.length > 5 ? ` (+${vr.failed.length - 5} more)` : ""}. ` +
-          `Inspect .pixpec-out/${componentName}/ for diffs.`,
+          `Inspect ${componentDir}/.pixpec/verify/ for diffs.`,
       );
     } else {
       console.log(
@@ -2059,7 +2053,7 @@ export async function init(opts: {
   } catch (e) {
     console.warn(
       `[init] ${componentName}: post-init visual verify failed after generation: ${(e as Error).message}. ` +
-        `Run \`pixpec verify-generated ${componentName}\` after fixing the render issue.`,
+        `Run \`pixpec verify ${componentName}\` after fixing the render issue.`,
     );
   }
   return {

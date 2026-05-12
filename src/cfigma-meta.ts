@@ -103,7 +103,7 @@ export interface FigmaVariantMeta {
   /** Per-node-id visibility-binding rows — each node whose `visible` field
    *  is bound to an owner-component boolean property. init maps the raw
    *  figma key (`Left Icon#2137:0`) to a TS prop name and records it in
-   *  `Variant.bindings[nodeId].attr.visible`. */
+   *  `Variant.bindings[nodeId].node.visible`. */
   visibilityNodes?: Array<{ id: string; propRef: string }>;
   /** Master variant's intrinsic figma dim. Used by init to emit a
    * boxWrapper on master variant cases — impl's CSS-flex hug may differ

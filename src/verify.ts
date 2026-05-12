@@ -1,15 +1,6 @@
 /**
- * `pixpec verify <Component>` — render every case via the synthesized
- * impl in chromium, then diff each output against the cached figma
- * reference PNGs (run `pixpec dump-figma <Component>` once beforehand
- * to populate those). Two batched ops, no per-case round-trip:
- *
- *   1. runDumpChromium(<Component>)         one chromium session, all cases
- *   2. pixpec-measure <componentDir>        batch dE diff over the dir
- *
- * Falls back to per-case `breakdown-verify` only when impl is still a stub
- * — that path uses IR-direct rendering and is the right tool *before*
- * impl is synthesized. Once impl exists, this is the fast loop.
+ * `pixpec verify <Component>` — capture source and destination artifacts,
+ * stage them for the Rust measurer, then report per-case pixel deltas.
  */
 import { execFile } from 'node:child_process'
 import { promisify } from 'node:util'
@@ -18,7 +9,8 @@ import { dirname, resolve } from 'node:path'
 import { existsSync } from 'node:fs'
 import { readFile } from 'node:fs/promises'
 import { loadConfig } from './init.ts'
-import { runDumpChromium } from './dump-chromium.ts'
+import { captureDir, runCapture, stageMeasureInput } from './capture/index.ts'
+import { resolveConfiguredTargets } from './targets/index.ts'
 
 const execFileAsync = promisify(execFile)
 const HERE = dirname(fileURLToPath(import.meta.url))
@@ -27,6 +19,7 @@ const MEASURE_BIN = resolve(HERE, '../measure-rs/target/release/pixpec-measure')
 export interface VerifyOptions {
   blobThreshold?: string
   maxBlob?: string
+  target?: string
 }
 
 export async function runVerify(
@@ -37,44 +30,92 @@ export async function runVerify(
   const componentsDir = cfg.componentsDir ?? 'src/components'
   const componentDir = resolve(root, componentsDir, componentName)
   if (!existsSync(componentDir)) throw new Error(`pixpec verify: no component dir ${componentDir}`)
-  const figmaDir = resolve(root, '.pixpec-out', componentName, 'figma')
-  if (!existsSync(figmaDir)) {
-    throw new Error(
-      `pixpec verify: no figma references at ${figmaDir}. ` +
-      `Run \`pixpec dump-figma ${componentName}\` first.`,
-    )
+  const targets = opts.target ? [opts.target] : resolveConfiguredTargets(cfg)
+  await runCapture('src', componentName, { backend: 'figma', clearOutDir: true })
+  let pass = 0
+  let fail = 0
+  let total = 0
+  const failed: string[] = []
+  for (const target of targets) {
+    const r = await runVerifyTarget(componentName, componentDir, target, opts)
+    pass += r.pass
+    fail += r.fail
+    total += r.total
+    failed.push(...r.failed.map((caseId) => `${target}:${caseId}`))
   }
-  console.log(`[verify] rendering ${componentName} cases via chromium…`)
-  await runDumpChromium(componentName)
+  return { pass, fail, total, failed }
+}
+
+async function runVerifyTarget(
+  componentName: string,
+  componentDir: string,
+  target: string,
+  opts: VerifyOptions,
+): Promise<{ pass: number; fail: number; total: number; failed: string[] }> {
+  console.log(`[verify:${target}] capturing ${componentName} destination artifacts…`)
+  await runCapture('dst', componentName, { backend: target, clearOutDir: true })
   // Pad both sides to next multiple of 8 (measure-rs's downsample factor)
-  // with white. Padding is identical on both → contributes 0 ΔE. Mirrors
-  // the placeFigmaPng/padChromiumPng pass in breakdown-verify.
+  // and to the per-case max size. Padding is identical on both → contributes 0 ΔE.
   const sharp = (await import('sharp')).default
   const { readdir, writeFile } = await import('node:fs/promises')
   const padToMul = (v: number) => Math.ceil(v / 8) * 8
-  for (const sub of ['figma', 'chromium']) {
-    const dir = resolve(root, '.pixpec-out', componentName, sub)
+  const srcDir = captureDir(componentDir, 'src', 'figma')
+  const dstDir = captureDir(componentDir, 'dst', target)
+  const dimsByCase = new Map<string, { sw?: number; sh?: number; dw?: number; dh?: number }>()
+  for (const [side, dir] of [
+    ['src', srcDir],
+    ['dst', dstDir],
+  ] as const) {
     if (!existsSync(dir)) continue
     for (const f of (await readdir(dir)).filter((x) => x.endsWith('.png'))) {
       const p = `${dir}/${f}`
       const meta = await sharp(p).metadata()
-      const w = meta.width!, h = meta.height!
-      const pw = padToMul(w), ph = padToMul(h)
-      if (pw === w && ph === h) continue
+      const entry = dimsByCase.get(f) ?? {}
+      if (side === 'src') {
+        entry.sw = meta.width!
+        entry.sh = meta.height!
+      } else {
+        entry.dw = meta.width!
+        entry.dh = meta.height!
+      }
+      dimsByCase.set(f, entry)
+    }
+  }
+  for (const [f, d] of dimsByCase) {
+    const targetW = padToMul(Math.max(d.sw ?? 0, d.dw ?? 0))
+    const targetH = padToMul(Math.max(d.sh ?? 0, d.dh ?? 0))
+    for (const [dir, w, h] of [
+      [srcDir, d.sw, d.sh] as const,
+      [dstDir, d.dw, d.dh] as const,
+    ]) {
+      if (w === undefined || h === undefined) continue
+      if (w === targetW && h === targetH) continue
+      const p = resolve(dir, f)
       const buf = await sharp(p)
-        .extend({ top: 0, left: 0, right: pw - w, bottom: ph - h, background: { r: 0, g: 0, b: 0, alpha: 0 } })
+        .extend({
+          top: 0,
+          left: 0,
+          right: targetW - w,
+          bottom: targetH - h,
+          background: { r: 0, g: 0, b: 0, alpha: 0 },
+        })
         .png()
         .toBuffer()
       await writeFile(p, buf)
     }
   }
+  const measureBase = await stageMeasureInput({
+    componentDir,
+    srcBackend: 'figma',
+    dstBackend: target,
+  })
   const measureArgs = [
-    resolve(root, '.pixpec-out', componentName),
+    measureBase,
     ...(opts.blobThreshold ? ['--blob-threshold', opts.blobThreshold] : []),
   ]
-  console.log(`[verify] measuring…`)
+  console.log(`[verify:${target}] measuring…`)
   await execFileAsync(MEASURE_BIN, measureArgs, { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 })
-  const results = JSON.parse(await readFile(resolve(root, '.pixpec-out', componentName, 'results.json'), 'utf8')) as
+  const results = JSON.parse(await readFile(resolve(measureBase, 'results.json'), 'utf8')) as
     Array<{ case: string; blob_max_size: number; dE00_max: number; dE00: number }>
   const maxBlob = opts.maxBlob ? parseInt(opts.maxBlob, 10) : 24
   // results.case is the on-disk basename = sanitize(figmaId). Print as-is;
@@ -87,6 +128,6 @@ export async function runVerify(
     if (ok) pass++
     else failed.push(r.case)
   }
-  console.log(`\n${pass}/${results.length} passed${failed.length ? `, ${failed.length} failed` : ''}`)
+  console.log(`\n[${target}] ${pass}/${results.length} passed${failed.length ? `, ${failed.length} failed` : ''}`)
   return { pass, fail: failed.length, total: results.length, failed }
 }

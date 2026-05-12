@@ -39,12 +39,27 @@ export interface Case<P> {
    * verify report (use to document why parity isn't achievable, e.g.
    * known figma↔Skia rasterizer divergence on sub-pixel curve sampling). */
   skipVerify?: string
-  /**
-   * Optional React component that wraps this individual usecase during
-   * render. Used when a Figma instance has an explicit screenshot box
-   * such as resized fixed dimensions.
-   */
-  wrapper?: import('react').ComponentType<{ children: import('react').ReactNode }>
+  /** Platform-neutral render/capture context for this usecase. */
+  render?: CaseRenderSpec
+}
+
+export interface RenderBoxSpec {
+  /** Omit when the rendered root should hug this axis. */
+  width?: number
+  height?: number
+  padding?: number
+  paddingTop?: number
+  paddingRight?: number
+  paddingBottom?: number
+  paddingLeft?: number
+  bg?: string
+  color?: string
+  overflow?: 'hidden' | 'visible'
+}
+
+export interface CaseRenderSpec {
+  /** Fixed capture box around the rendered component, expressed in design px. */
+  box?: RenderBoxSpec
 }
 
 /** Per-figma-node binding map — generate consumes this to annotate IR
@@ -52,20 +67,42 @@ export interface Case<P> {
  * in place of master-baked literals. Keyed by figma node id (within the
  * variant's master subtree); each entry classifies the bindings by kind
  * so future detachable-attribute additions slot in cleanly. */
-export interface NodeBinding<P> {
-  /** Direct attrs on the node — text content, color, visible, etc. */
-  attr?: {
-    text?: keyof P & string
-    color?: keyof P & string
-    fill?: keyof P & string
-    textStyle?: keyof P & string
-    visible?: keyof P & string
-  }
-  /** componentProperty key (figma's prop name on this INSTANCE) →
-   * owning-component prop key. e.g. `{ Type: 'iconType' }` for a nested
-   * Icon whose Type should track the owner's `iconType` prop. */
-  instanceProps?: Record<string, keyof P & string>
+export type PropKey<P> = Extract<keyof P, string>
+
+export interface NodeBindingSurface {
+  node?: object
+  component?: object
 }
+
+type PropertyBinding<Surface extends object, P> = Partial<
+  Record<Extract<keyof Surface, string>, PropKey<P>>
+>
+
+/** Per-node binding map. `node` targets the IR node's own bindable
+ * properties; `component` targets the public props of a nested component
+ * instance. Concrete generated type files may pass a node-id → surface map
+ * to `Variant<P, Nodes>` for stricter key checking. */
+export type NodeBinding<
+  P,
+  Surface extends NodeBindingSurface = NodeBindingSurface,
+> = {
+  node?: Surface["node"] extends object
+    ? PropertyBinding<Surface["node"], P>
+    : Record<string, PropKey<P>>
+  component?: Surface["component"] extends object
+    ? PropertyBinding<Surface["component"], P>
+    : Record<string, PropKey<P>>
+}
+
+export type NodeBindings<
+  P,
+  Nodes extends Record<string, NodeBindingSurface> = Record<
+    string,
+    NodeBindingSurface
+  >,
+> = string extends keyof Nodes
+  ? Record<string, NodeBinding<P>>
+  : { [NodeId in keyof Nodes]?: NodeBinding<P, Nodes[NodeId]> }
 
 /** A master variant of a registered component — pure addressable
  *  bucket. Variant carries no render data; the master is one of the
@@ -82,25 +119,18 @@ export interface NodeBinding<P> {
  *  `bindings` is the per-node owner-prop map init computed during scan
  *  — generate threads it through walker → codegen so the emitted
  *  per-variant tree is parametric without any post-processing pass. */
-export interface Variant<P> {
+export interface Variant<
+  P,
+  Nodes extends Record<string, NodeBindingSurface> = Record<
+    string,
+    NodeBindingSurface
+  >,
+> {
   key: string
-  bindings?: Record<string, NodeBinding<P>>
+  bindings?: NodeBindings<P, Nodes>
   usecases: Case<P>[]
-  /**
-   * Optional React component that wraps the impl during render. Owns all
-   * styling concerns (dim, padding, bg, color, layout) so the harness/type
-   * system doesn't need to know every CSS property. Harness puts `data-case`
-   * on an outer div around the wrapper, so the screenshot region = wrapper bounds.
-   *
-   *   import type { ComponentType, ReactNode } from 'react'
-   *   wrapper: ({ children }) => <div style={{...}}>{children}</div>
-   *
-   * Use to:
-   *   - lock dim (figma frame size in CSS px, no sub-pixel hug variance)
-   *   - apply parent CSS context (color for currentColor SVGs, font, etc.)
-   *   - simulate consumer environment (e.g., flex parent direction)
-   */
-  wrapper?: import('react').ComponentType<{ children: import('react').ReactNode }>
+  /** Platform-neutral render/capture context inherited by this variant's usecases. */
+  render?: CaseRenderSpec
 }
 
 /**

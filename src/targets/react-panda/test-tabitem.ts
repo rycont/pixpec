@@ -1,11 +1,11 @@
 /**
- * Quick validation test for the react-panda emitter.
+ * Quick validation test for the react-panda target codegen.
  *
  * Builds a synthetic Design AST modeled after the TabItem variant b master
  * (figma node 2127:1825) and feeds it through the emitter. Compares the
- * shape of the generated TSX against the expected legacy output.
+ * shape of the generated TSX against the expected output.
  *
- * Run with:  pnpm tsx src/emitter/react-panda/test-tabitem.ts
+ * Run with:  pnpm tsx src/targets/react-panda/test-tabitem.ts
  *
  * Note: a true `dumper → compiler → emitter` round-trip would require a live
  * raw figma dump for 2127:1825, which the project does not currently persist
@@ -18,8 +18,8 @@ import {
   NodeKind, FlowDirection, Sizing, Align, Justify, Positioning,
   Anchor, ShapeKind, StrokeCap, TextAutoResize, type DNode,
 } from '../../compiler/design-ast.ts'
-import { reactPandaEmitter } from './index.ts'
-import type { EmitContext } from '../types.ts'
+import { codegenReactPanda } from './codegen.ts'
+import type { CodegenContext } from '../types.ts'
 import type { CodegenPlugin } from '../../types.ts'
 
 // Mirror danah's iconCurrentColor plugin (emitWrap half — Icon → adds color attr).
@@ -107,7 +107,7 @@ const root: DNode = {
   ],
 }
 
-const ctx: EmitContext = {
+const ctx: CodegenContext = {
   componentName: 'TabItem',
   designSystem: {
     typography: { 'S:body-regular,': 'BodyRegular' },
@@ -120,6 +120,6 @@ const ctx: EmitContext = {
   plugins: [iconCurrentColor],
 }
 
-const result = await reactPandaEmitter.emit(root, ctx)
+const result = await codegenReactPanda(root, ctx)
 console.log('// fileExtension:', result.fileExtension)
 console.log(result.source)

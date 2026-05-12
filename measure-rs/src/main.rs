@@ -1,6 +1,6 @@
 //! pixpec-measure — pairwise CIEDE2000 (ΔE00) between two PNG dirs.
 //!
-//! Compares figma/<name>.png ↔ chromium/<name>.png (matching basenames).
+//! Compares figma/<name>.png ↔ dst/<name>.png (matching basenames).
 //! No alignment, no warp — assumes equal-size PNGs (verified upstream). Emits
 //! results.json {case, dE00, dE00_mean, n_px, artifacts} in the input dir.
 //!
@@ -9,7 +9,7 @@
 //!
 //! Usage:
 //!   pixpec-measure <component_dir> [--downsample <N>]
-//!     where component_dir contains figma/, chromium/
+//!     where component_dir contains figma/, dst/
 //!
 //! Default: --downsample 8. Both PNGs are box-filtered 8→1 before measuring.
 //! Pixpec renders at 8x supersample by default (scale=8 in pixpec.toml); the
@@ -41,7 +41,7 @@ struct Record {
     #[serde(rename = "n_px")]
     n_px: usize,
     /// Largest connected blob of pixels with ΔE00 > the FIRST blob_threshold
-    /// (8-connectivity). Kept for back-compat with `verify-generated`; new
+    /// (8-connectivity). Kept for back-compat with older result consumers; new
     /// callers should read the `blobs` array, which carries one entry per
     /// `--blob-threshold` value supplied.
     blob_max_size: usize,
@@ -115,22 +115,22 @@ fn main() -> Result<()> {
         blob_thresholds = vec![2.7, 1.9];
     }
     let figma_dir = base.join("figma");
-    let chrom_dir = base.join("chromium");
+    let dst_dir = base.join("dst");
     if !figma_dir.is_dir() {
         bail!("missing {}", figma_dir.display());
     }
-    if !chrom_dir.is_dir() {
-        bail!("missing {}", chrom_dir.display());
+    if !dst_dir.is_dir() {
+        bail!("missing {}", dst_dir.display());
     }
 
     let figma_set = list_pngs(&figma_dir)?;
-    let chrom_set = list_pngs(&chrom_dir)?;
-    let mut common: Vec<&String> = figma_set.iter().filter(|n| chrom_set.contains(*n)).collect();
+    let dst_set = list_pngs(&dst_dir)?;
+    let mut common: Vec<&String> = figma_set.iter().filter(|n| dst_set.contains(*n)).collect();
     common.sort();
     eprintln!(
-        "figma={} chromium={} paired={}",
+        "figma={} dst={} paired={}",
         figma_set.len(),
-        chrom_set.len(),
+        dst_set.len(),
         common.len(),
     );
     if common.is_empty() {
@@ -142,10 +142,10 @@ fn main() -> Result<()> {
         .par_iter()
         .map(|name| -> Result<Record> {
             let f = figma_dir.join(format!("{name}.png"));
-            let c = chrom_dir.join(format!("{name}.png"));
+            let c = dst_dir.join(format!("{name}.png"));
             let m = measure(&f, &c, downsample, &blob_thresholds).with_context(|| format!("measure {name}"))?;
-            // blob_max_size / blob_max_bbox shadow blobs[0] for back-compat
-            // with verify-generated.ts; new callers should consume `blobs`.
+            // blob_max_size / blob_max_bbox shadow blobs[0] for back-compat;
+            // new callers should consume `blobs`.
             let first = m.blobs.first().cloned().unwrap_or(BlobReport {
                 threshold: 0.0,
                 max_size: 0,
@@ -217,14 +217,14 @@ impl Clone for BlobReport {
     fn clone(&self) -> Self { BlobReport { threshold: self.threshold, max_size: self.max_size, max_bbox: self.max_bbox } }
 }
 
-fn measure(figma: &Path, chrom: &Path, downsample: u32, blob_thresholds: &[f32]) -> Result<Measurement> {
+fn measure(figma: &Path, dst: &Path, downsample: u32, blob_thresholds: &[f32]) -> Result<Measurement> {
     // Composite alpha against white FIRST, then box-filter. Compose-then-avg
     // is the perceptually-meaningful pipeline: each input pixel's contribution
     // to its output cell equals what a viewer would see at that location.
     let fa = load_rgba(figma)?;
-    let ca = load_rgba(chrom)?;
+    let ca = load_rgba(dst)?;
     if fa.w != ca.w || fa.h != ca.h {
-        bail!("dim mismatch: figma {}x{} vs chrom {}x{}", fa.w, fa.h, ca.w, ca.h);
+        bail!("dim mismatch: figma {}x{} vs dst {}x{}", fa.w, fa.h, ca.w, ca.h);
     }
     if downsample > 1 && (fa.w % downsample != 0 || fa.h % downsample != 0) {
         bail!(
