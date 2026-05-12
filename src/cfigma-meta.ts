@@ -84,7 +84,7 @@ export interface FigmaVariantMeta {
   /** Every nested INSTANCE descendant in this variant keyed by layer name
    * → propKey → resolved value. Same purpose as textLayers but for the
    * usage-detected nested-prop pattern (e.g. `iconType` ← Icon.Type). */
-  nestedProps?: Record<string, Record<string, unknown>>;
+  nestedProps?: Record<string, Record<string, string | boolean>>;
   /** Per-node-id text descendant rows — used to build Variant.bindings
    * (node id → owner-prop). textLayers groups by name; this preserves
    * the underlying nodeIds so init can emit a per-id binding map. */
@@ -388,6 +388,8 @@ export interface InstanceTextSummary {
 export interface NestedPropSummary {
   /** Layer name of the nested INSTANCE (e.g. "Icon"). */
   layerName: string;
+  /** Component set name of the nested INSTANCE. */
+  componentName: string | null;
   /** componentSetKey of the nested instance — for type emission. */
   componentSetKey: string | null;
   /** Raw figma prop key (e.g. "Type"). camelCased by init. */
@@ -442,7 +444,7 @@ export interface UsageInstance {
   overrides?: Array<{ id: string; fields: string[] }>;
   /** Per-nested-INSTANCE override `{ <layerName>: { <propKey>: value } }`,
    * only entries that diverge from the nested master's default. */
-  nestedProps: Record<string, Record<string, unknown>>;
+  nestedProps: Record<string, Record<string, string | boolean>>;
   /** Resolved fill colors per overridden descendant — keyed by stripped
    *  master-relative descendant id. init checks if all entries share a
    *  single hex; if so the usage is a fill-prop candidate. When the
@@ -516,7 +518,7 @@ export interface ChildVariationSample {
   children: Array<{
     componentProperties: Record<string, unknown>;
     textOverrides: Record<string, string>;
-    nestedProps: Record<string, Record<string, unknown>>;
+    nestedProps: Record<string, Record<string, string | boolean>>;
   }>;
   parentFileKey?: string;
 }
@@ -645,7 +647,7 @@ for (const inst of matches) {
     const cprops = ni.componentProperties || {};
     for (const [pk, pv] of Object.entries(cprops)) {
       const groupKey = ni.name + '|' + pk;
-      if (!perNested[groupKey]) perNested[groupKey] = { layerName: ni.name, componentSetKey: nKey, propKey: pk, samples: [], instanceCount: 0, overrideCount: 0 };
+      if (!perNested[groupKey]) perNested[groupKey] = { layerName: ni.name, componentName: (np && np.name) || (nm && nm.name) || null, componentSetKey: nKey, propKey: pk, samples: [], instanceCount: 0, overrideCount: 0 };
       perNested[groupKey].instanceCount++;
       if (perNested[groupKey].samples.indexOf(pv.value) === -1) perNested[groupKey].samples.push(pv.value);
       const masterDefault = masterDefs[pk] && masterDefs[pk].defaultValue;

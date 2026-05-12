@@ -207,6 +207,10 @@ function tsTypeForProp(def: FigmaPropertyDefinition): string {
   }
 }
 
+function definedVariantValues(values: unknown[]): string[] {
+  return values.filter((v): v is string => typeof v === "string");
+}
+
 /** Mirror walker's `pixpecSetProp`: store each componentProperty value
  * under its full ("Status#1234:0"), short ("Status"), and camelCase
  * ("status") forms so a generated propsFromFigma can read whichever
@@ -257,6 +261,35 @@ function literalForValue(
   return JSON.stringify(cleanControlValue(value));
 }
 
+function validateVariantPropValue(args: {
+  componentName: string;
+  propName: string;
+  value: unknown;
+  def: FigmaPropertyDefinition | undefined;
+  figmaId: string;
+  fileKey?: string;
+  instanceName?: string;
+  mainKey?: string | null;
+}): void {
+  if (args.def?.type !== "VARIANT" || typeof args.value !== "string") return;
+  const options = args.def.variantOptions ?? [];
+  if (options.includes(args.value)) return;
+  throw new Error(
+    [
+      `pixpec init: stale remote component proxy detected for ${args.componentName}.${args.propName}`,
+      `  value: ${JSON.stringify(args.value)}`,
+      `  expected one of: ${options.map((v) => JSON.stringify(v)).join(", ")}`,
+      `  usage: ${args.figmaId}`,
+      args.fileKey ? `  fileKey: ${args.fileKey}` : null,
+      args.instanceName ? `  layer: ${args.instanceName}` : null,
+      args.mainKey ? `  mainVariantKey: ${args.mainKey}` : null,
+      `Refresh/reload the consuming Figma file's remote component library before running init.`,
+    ]
+      .filter((line): line is string => line !== null)
+      .join("\n"),
+  );
+}
+
 function variantKey(v: FigmaVariantMeta): string {
   // Prefer the Figma variant name (e.g. "size=md, state=default"); fall back to id.
   return sanitize(v.name) || v.id.replace(/:/g, "-");
@@ -269,6 +302,20 @@ function isIdent(name: string): boolean {
 
 function propsKey(name: string): string {
   return isIdent(name) ? name : JSON.stringify(name);
+}
+
+function propAccess(root: string, key: string): string {
+  return isIdent(key) ? `${root}.${key}` : `${root}[${JSON.stringify(key)}]`;
+}
+
+function optionalPropAccess(root: string, key: string): string {
+  return isIdent(key) ? `${root}?.${key}` : `${root}?.[${JSON.stringify(key)}]`;
+}
+
+function objectShapeAccess(root: string, key: string): string {
+  return isIdent(key)
+    ? `${root}.shape.${key}`
+    : `${root}.shape[${JSON.stringify(key)}]`;
 }
 
 /** Build TS field lines from a propertyDefinitions map (used both for the
@@ -309,8 +356,38 @@ function generateProps(
     childComponentName: string;
     varyingHydratedKeys: string[];
   },
+  detectedNestedProps: Array<{
+    propName: string;
+    layerName: string;
+    propKey: string;
+    componentName?: string | null;
+  }> = [],
 ): string {
-  const ownLines = defsToFieldLines(defs);
+  const nestedPropTypeByName = new Map<string, string>();
+  const nestedPropImports = new Map<string, string>();
+  for (const np of detectedNestedProps) {
+    if (!np.componentName) continue;
+    const childComponentName = np.componentName.replace(/[^A-Za-z0-9]/g, "");
+    if (!childComponentName) continue;
+    const childPropsName = `${childComponentName}Props`;
+    nestedPropImports.set(
+      childPropsName,
+      `import type { ${childPropsName} } from '../${childComponentName}/props.ts'\n`,
+    );
+    nestedPropTypeByName.set(
+      np.propName,
+      `NonNullable<${childPropsName}[${JSON.stringify(np.propKey.replace(/#[^#]*$/, ""))}]>`,
+    );
+  }
+  const ownLines = Object.entries(defs).map(([name, def]) => {
+    const override = nestedPropTypeByName.get(name);
+    const t = override ?? tsTypeForProp(def);
+    const tag =
+      def.type === "INSTANCE_SWAP"
+        ? "  // INSTANCE_SWAP — narrow type if needed"
+        : "";
+    return `  ${propsKey(name)}?: ${t}${tag}`;
+  });
 
   // Group nested slots by main componentSet key — slots referencing the
   // same DS component (e.g. left+right Icon) share one sub-interface.
@@ -382,7 +459,7 @@ function generateProps(
   // Root props stay generic: every generated variant instantiates this
   // with the Panda prop type for its actual root component.
   const styledImport = `import type { BoxProps, FlexProps, StackProps } from '../../../styled-system/jsx'\n`;
-  const headerImports = `${reactNodeImport}${containerImport}${styledImport}`;
+  const headerImports = `${reactNodeImport}${containerImport}${[...nestedPropImports.values()].join("")}${styledImport}`;
   return `${headerImports}\n/**
  * AUTO-GENERATED from figma componentPropertyDefinitions for ${componentName}.
  * Re-run \`pixpec init\` to refresh after figma changes. Hand-edits here will
@@ -392,7 +469,8 @@ export interface ${componentName}OwnProps {
 ${propLines}
 }
 export type ${componentName}RootProps = BoxProps | FlexProps | StackProps
-export type ${componentName}Props<TRootProps extends object = ${componentName}RootProps> =
+export type ${componentName}PixpecStyleProps = BoxProps
+export type ${componentName}Props<TRootProps extends object = ${componentName}PixpecStyleProps> =
   ${componentName}OwnProps & TRootProps
 ${subBlock}`;
 }
@@ -431,11 +509,11 @@ function generateImpl(
     if (seenKeys.has(k)) continue;
     seenKeys.add(k);
     cases.push(
-      `    ${JSON.stringify(k)}: V_${v.safeId} as FC<${componentName}Props>,`,
+      `    ${JSON.stringify(k)}: V_${v.safeId},`,
     );
   }
   const fallback = variants[0]
-    ? `V_${variants[0].safeId} as FC<${componentName}Props>`
+    ? `V_${variants[0].safeId}`
     : "null";
   const keyExpr =
     variantPropNames.length === 0
@@ -475,18 +553,18 @@ function generateDefaults(
   componentName: string,
   defs: Record<string, FigmaPropertyDefinition>,
 ): string {
-  const lines = Object.entries(defs).map(([name, def]) => {
-    if (name === "_fill")
-      return `  ${propsKey(name)}: undefined as unknown as string,`;
-    return `  ${propsKey(name)}: ${literalForValue(def, def.defaultValue as FigmaPropValue)},`;
-  });
+  const entries = Object.entries(defs).filter(([, def]) => def.defaultValue !== undefined);
+  const lines = entries.map(([name, def]) =>
+    `  ${propsKey(name)}: ${literalForValue(def, def.defaultValue as FigmaPropValue)},`,
+  );
   return `import type { ${componentName}Props } from './props.ts'
 
 /** Defaults pulled from figma componentPropertyDefinitions[].defaultValue —
  * used by codegen as the "what you'd get without overriding" baseline so
  * generated JSX can elide redundant prop emissions on instance call sites. */
-export const defaults: Required<Pick<${componentName}Props, ${
-    Object.keys(defs)
+export const defaults: Partial<Pick<${componentName}Props, ${
+    entries
+      .map(([k]) => k)
       .map((k) => JSON.stringify(k))
       .join(" | ") || "never"
   }>> = {
@@ -569,6 +647,7 @@ function generateCases(
     propName: string;
     layerName: string;
     propKey: string;
+    componentName?: string | null;
   }> = [],
   // Map of prop key → default value (built from augmentedDefs at the call
   // site). Variant rows drop fields equal to this map so the emitted
@@ -836,6 +915,7 @@ function generateIndex(
     propName: string;
     layerName: string;
     propKey: string;
+    componentName?: string | null;
   }> = [],
 ): string {
   // raw.props is already pre-cleaned (walker's pixpecSetProp strips control
@@ -845,26 +925,85 @@ function generateIndex(
   // pattern) reads walker's textOverrides[descId] map instead of raw.props
   // — designer didn't expose the text via figma componentProperties, so
   // walker keys it by the master descendant id instead.
+  const schemaForProp = (
+    _name: string,
+    def: FigmaPropertyDefinition,
+  ): string => {
+    if (def.type === "TEXT") return "z.string().optional()";
+    if (def.type === "BOOLEAN") {
+      return "z.union([z.boolean(), z.enum(['true', 'false']).transform((value) => value === 'true')]).optional()";
+    }
+    if (def.type === "INSTANCE_SWAP") return "z.undefined().optional()";
+    const options = definedVariantValues(def.variantOptions ?? []).map(
+      cleanControlValue,
+    );
+    if (options.length === 0) return "z.string().optional()";
+    return `z.enum([${options
+      .map((option) => JSON.stringify(option))
+      .join(", ")}]).optional()`;
+  };
+
+  const schemaName = `${componentName}PropsSchema`;
+  const nestedPropByName = new Map(
+    detectedNestedProps.map((nested) => [nested.propName, nested]),
+  );
+  const nestedSchemaImports = new Map<string, string>();
+  for (const nested of detectedNestedProps) {
+    if (!nested.componentName) continue;
+    const childComponentName = nested.componentName.replace(/[^A-Za-z0-9]/g, "");
+    if (!childComponentName || childComponentName === componentName) continue;
+    nestedSchemaImports.set(
+      childComponentName,
+      `import { ${childComponentName}PropsSchema } from '../${childComponentName}/index.ts'\n`,
+    );
+  }
+
+  const schemaForField = (
+    name: string,
+    def: FigmaPropertyDefinition,
+  ): string => {
+    const nested = nestedPropByName.get(name);
+    if (nested?.componentName) {
+      const childComponentName = nested.componentName.replace(
+        /[^A-Za-z0-9]/g,
+        "",
+      );
+      const childPropName = nested.propKey.replace(/#[^#]*$/, "");
+      if (childComponentName && childComponentName !== componentName) {
+        return objectShapeAccess(`${childComponentName}PropsSchema`, childPropName);
+      }
+    }
+    return schemaForProp(name, def);
+  };
+
+  const schemaBlock = `export const ${schemaName} = z.object({
+${Object.entries(defs)
+  .map(([name, def]) => `  ${propsKey(name)}: ${schemaForField(name, def)},`)
+  .join("\n")}
+})`;
   const propMappings = Object.entries(defs)
-    .map(([name, def]) => {
+    .flatMap(([name, def]) => {
       const k = propsKey(name);
       if (name === "label" && autoLabelLayerName) {
         // walker keys textOverrides by the TEXT layer NAME, which stays
         // consistent across master variants (figma copies child names when
         // authoring variants) — no per-variant id enumeration needed.
-        return `    ${k}: raw.textOverrides?.[${JSON.stringify(autoLabelLayerName)}] as ${componentName}Props[${JSON.stringify(name)}],`;
+        const access = optionalPropAccess("raw.textOverrides", autoLabelLayerName);
+        return [`      ${k}: ${access},`];
       }
       // Auto-detected nested INSTANCE prop — read from
       // raw.nestedProps[layerName][propKey], populated by walker.
       const nested = detectedNestedProps.find((n) => n.propName === name);
       if (nested) {
-        return `    ${k}: raw.nestedProps?.[${JSON.stringify(nested.layerName)}]?.[${JSON.stringify(nested.propKey)}] as ${componentName}Props[${JSON.stringify(name)}],`;
+        const access = `${optionalPropAccess("raw.nestedProps", nested.layerName)}?.${propsKey(nested.propKey)}`;
+        return [`      ${k}: ${access},`];
       }
-      const access = `raw.props[${JSON.stringify(name)}]`;
       if (def.type === "INSTANCE_SWAP") {
-        return `    ${k}: undefined, // INSTANCE_SWAP — wire to a React node lookup`;
+        return [
+          `      ${k}: undefined, // INSTANCE_SWAP — wire to a React node lookup`,
+        ];
       }
-      return `    ${k}: ${access} as ${componentName}Props[${JSON.stringify(name)}],`;
+      return [];
     })
     .join("\n");
   // Container array prop — auto-detected. propsFromFigma filters the
@@ -876,30 +1015,39 @@ function generateIndex(
     const pickFields = detectedItemsProp.varyingHydratedKeys
       .map(
         (k) =>
-          `${k}: (c as { props: Record<string, unknown> }).props[${JSON.stringify(k)}]`,
+          `${k}: c.props[${JSON.stringify(k)}]`,
       )
       .join(", ");
-    containerMapping = `\n    ${detectedItemsProp.propName}: (children ?? [])
+    containerMapping = `\n      ${detectedItemsProp.propName}: (children ?? [])
       .filter((c) => c.kind === 'instance')
-      .map((c) => ({ ${pickFields} })) as ${componentName}Props[${JSON.stringify(detectedItemsProp.propName)}],`;
+      .map((c) => ({ ${pickFields} })),`;
   }
   const fnSig = detectedItemsProp ? "(raw, children)" : "(raw)";
+  const hasPropMapping = propMappings.length > 0 || containerMapping.length > 0;
+  const parseInput = hasPropMapping
+    ? `{
+      ...raw.props,
+${propMappings}${containerMapping}
+    }`
+    : "raw.props";
   const figmaBlock = componentSetKey
     ? `,
   figma: {
     componentSetKey: ${JSON.stringify(componentSetKey)},${componentSetId ? `\n    componentSetId: ${JSON.stringify(componentSetId)},` : ""}
-    propsFromFigma: ${fnSig} => ({
-${propMappings}${containerMapping}
-    }),
+    propsFromFigma: ${fnSig} => ${schemaName}.parse(${parseInput}),
   }`
     : "";
-  return `import { defineComponent } from 'pixpec/spec'
-import { variants } from './cases.ts'
+  const specImports = ["defineComponent", "z"].join(", ");
+  const schemaImports = [...nestedSchemaImports.values()].join("");
+  return `import { ${specImports} } from 'pixpec/spec'
+${schemaImports}import { variants } from './cases.ts'
 import { defaults } from './defaults.ts'
 import type { ${componentName}Props } from './props.ts'
 
 export type { ${componentName}Props }
 export { defaults }
+
+${schemaBlock}
 
 export const ${componentName} = defineComponent<${componentName}Props>({
   name: ${JSON.stringify(componentName)},
@@ -1041,6 +1189,8 @@ export async function init(opts: {
     layerName: string;
     /** Raw figma componentProperty key (e.g. "Type"). */
     propKey: string;
+    /** Component name for the nested instance's component set. */
+    componentName?: string | null;
     /** Distinct values seen across overrides. Used to emit a union TS type. */
     samples: unknown[];
   };
@@ -1081,6 +1231,7 @@ export async function init(opts: {
         propName,
         layerName: ns.layerName,
         propKey: ns.propKey,
+        componentName: ns.componentName,
         samples: ns.samples,
       });
       console.log(
@@ -1372,6 +1523,7 @@ export async function init(opts: {
         augmentedDefs,
         nestedSchemas,
         detectedItemsProp,
+        detectedNestedProps,
       ),
     ),
   );
@@ -1676,6 +1828,17 @@ export async function init(opts: {
           defVal === undefined ||
           JSON.stringify(defVal) !== JSON.stringify(v)
         ) {
+          const def = augmentedDefs[k];
+          validateVariantPropValue({
+            componentName,
+            propName: k,
+            value: v,
+            def,
+            figmaId: `${u.fileKey ?? explicitFileKey}:${u.id}`,
+            fileKey: u.fileKey,
+            instanceName: u.name,
+            mainKey: u.mainKey,
+          });
           slimProps[k] = v;
         }
       }
@@ -1862,6 +2025,14 @@ export async function init(opts: {
     ),
     preservedImpl,
   );
+  if (process.env.PIXPEC_SKIP_INIT_VERIFY === "1") {
+    return {
+      componentDir,
+      componentName,
+      variantCount: normalizedMeta.variants.length,
+      variantIds: normalizedMeta.variants.map((v) => v.id),
+    };
+  }
   // Verification step — render every variant's generated tsx in chromium
   // and pixel-compare against the figma export. This is a post-init health
   // check, not part of the generator transaction: init must still leave the

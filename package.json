@@ -28,7 +28,8 @@
     "prettier": "^3.8.3",
     "sharp": "^0.33.5",
     "smol-toml": "^1.6.1",
-    "vite": "^8.0.10"
+    "vite": "^8.0.10",
+    "zod": "^4.4.3"
   },
   "devDependencies": {
     "@types/node": "^20.0.0",

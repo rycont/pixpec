@@ -750,7 +750,7 @@ function emitText(n: DText, ctx: Ctx, parent: ParentCtx): ast.JsxElement {
         fixedWidth !== undefined
     if (n.textDecoration && !wrapsUnderlineRun) {
         if (n.textDecoration === TextDecoration.Underline) {
-            styles.underline = true
+            styles.textDecoration = 'underline'
         } else {
             styles.textDecoration = n.textDecoration
         }
@@ -808,7 +808,7 @@ function emitText(n: DText, ctx: Ctx, parent: ParentCtx): ast.JsxElement {
                       tag(),
                       undefined,
                       f.createJsxAttributes(
-                          attrsFromObject({ underline: true }),
+                          attrsFromObject({ textDecoration: 'underline' }),
                       ),
                   ),
                   children,
@@ -1832,12 +1832,10 @@ function buildSource(
     )
     const fcType = f.createTypeReferenceNode(f.createIdentifier('FC'), [
         ctx.propsFile
-            ? f.createTypeReferenceNode(f.createIdentifier(propsTypeName), [
-                  f.createTypeReferenceNode(
-                      f.createIdentifier(rootPropsTypeName),
-                      undefined,
-                  ),
-              ])
+            ? f.createTypeReferenceNode(
+                  f.createIdentifier(propsTypeName),
+                  undefined,
+              )
             : f.createTypeReferenceNode(
                   f.createIdentifier(rootPropsTypeName),
                   undefined,
@@ -1951,7 +1949,7 @@ function buildSource(
         'export interface GeneratedProps {}\n'
     printed = printed.replace(
         'PIXPEC_CSS_PROPS_DECL;',
-        `const [{ direction: _cssDirection, ...cssProps }] = splitCssProps<${rootPropsTypeName}>(props)`,
+        `const [{ direction: _cssDirection, ...cssProps }] = splitCssProps(props)`,
     )
     // Rewrite `PIXPEC_PROP_<key>` marker identifiers into `props.<key>` member
     // access. tsgo's printer panics on factory-built PropertyAccess inside JSX,
@@ -2000,12 +1998,24 @@ function buildSource(
         // setting CSS color on the parent (via Panda style props) tints the
         // whole svg silhouette. Done as a string substitution because tsgo's
         // printer panics on factory-built JSX-child ternaries.
+        const tintedStyle =
+            'style={{ display: "block", width: "100%", height: "100%" }}'
+        const fillTintedStyle =
+            'style={{ display: "block", width: "100%", height: "100%", color: props._fill }}'
         printed = printed.replace(
             /<PIXPEC_TINT_SWAP\s+normal=\{(\w+)\}\s+tinted=\{(\w+)\}\s*\/>/g,
-            (_m, normal, tinted) =>
-                `{((props as { _fill?: string })._fill ?? cssProps.color) ` +
-                `? <${tinted} preserveAspectRatio="none" style={{ display: "block", width: "100%", height: "100%", color: (props as { _fill?: string })._fill ?? "inherit" }}/> ` +
-                `: <${normal} preserveAspectRatio="none" style={{ display: "block", width: "100%", height: "100%" }}/>}`,
+            (_m, normal, tinted) => {
+                if (ctx.usedPropBindings.has('_fill')) {
+                    return `{props._fill ` +
+                        `? <${tinted} preserveAspectRatio="none" ${fillTintedStyle}/> ` +
+                        `: cssProps.color ` +
+                        `? <${tinted} preserveAspectRatio="none" ${tintedStyle}/> ` +
+                        `: <${normal} preserveAspectRatio="none" style={{ display: "block", width: "100%", height: "100%" }}/>}`
+                }
+                return `{cssProps.color ` +
+                    `? <${tinted} preserveAspectRatio="none" ${tintedStyle}/> ` +
+                    `: <${normal} preserveAspectRatio="none" style={{ display: "block", width: "100%", height: "100%" }}/>}`
+            },
         )
     }
     return printed

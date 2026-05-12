@@ -7,6 +7,8 @@
  * imported from any module Vite serves to the browser.
  */
 import { createElement, type ComponentType, type ReactNode } from "react";
+import { z } from "zod";
+export { z };
 export { defineComponent } from "./types.ts";
 export type { Component, Case, Variant } from "./types.ts";
 

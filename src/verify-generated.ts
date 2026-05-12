@@ -20,8 +20,8 @@ import { fileURLToPath } from 'node:url'
 import { dirname, resolve } from 'node:path'
 import { existsSync } from 'node:fs'
 import { readFile } from 'node:fs/promises'
-import { runDumpChromium } from './dump-chromium.ts'
 import { loadConfig } from './init.ts'
+import { runDumpChromium } from './dump-chromium.ts'
 
 const execFileAsync = promisify(execFile)
 const HERE = dirname(fileURLToPath(import.meta.url))

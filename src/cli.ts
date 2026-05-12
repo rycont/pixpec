@@ -105,21 +105,6 @@ async function main() {
       if (r.fail > 0) process.exit(1)
       break
     }
-    case 'verify-generated': {
-      const componentName = rest[0]
-      if (!componentName) {
-        console.error('usage: pixpec verify-generated <Component> [--blob-threshold X] [--max-blob N]')
-        process.exit(2)
-      }
-      const btIdx = rest.indexOf('--blob-threshold')
-      const mbIdx = rest.indexOf('--max-blob')
-      const r = await runVerifyGenerated(componentName, {
-        blobThreshold: btIdx >= 0 ? rest[btIdx + 1] : undefined,
-        maxBlob: mbIdx >= 0 ? rest[mbIdx + 1] : undefined,
-      })
-      if (r.fail > 0) process.exit(1)
-      break
-    }
     case 'analyze': {
       const componentName = rest[0]
       const caseName = rest[1]
@@ -158,3 +143,18 @@ main().catch((e) => {
   console.error(e instanceof Error ? e.stack ?? e.message : e)
   process.exit(1)
 })
+    case 'verify-generated': {
+      const componentName = rest[0]
+      if (!componentName) {
+        console.error('usage: pixpec verify-generated <Component> [--blob-threshold X] [--max-blob N]')
+        process.exit(2)
+      }
+      const btIdx = rest.indexOf('--blob-threshold')
+      const mbIdx = rest.indexOf('--max-blob')
+      const r = await runVerifyGenerated(componentName, {
+        blobThreshold: btIdx >= 0 ? rest[btIdx + 1] : undefined,
+        maxBlob: mbIdx >= 0 ? rest[mbIdx + 1] : undefined,
+      })
+      if (r.fail > 0) process.exit(1)
+      break
+    }

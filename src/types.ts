@@ -209,7 +209,7 @@ export interface FigmaInstanceRaw {
    * (e.g. an Icon child's Type) without detaching. Walker dumps all such
    * overrides; init's auto-detect picks which (layer, prop) combos are
    * worth exposing as parent-level props. */
-  nestedProps?: Record<string, Record<string, unknown>>
+  nestedProps?: Record<string, Record<string, string | boolean>>
 }
 
 
