@@ -80,7 +80,7 @@ function pluginScript(rootId: string): string {
 const ROOT_ID = ${JSON.stringify(rootId)};
 const FRAMELIKE = new Set(['FRAME', 'COMPONENT', 'INSTANCE', 'COMPONENT_SET']);
 const SHAPELIKE = new Set(['RECTANGLE', 'ELLIPSE', 'POLYGON', 'STAR', 'LINE']);
-const VECTORLIKE = new Set(['VECTOR', 'BOOLEAN_OPERATION', 'GROUP']);
+const VECTORLIKE = new Set(['VECTOR', 'BOOLEAN_OPERATION']);
 function clean(value) {
   if (typeof value === 'string') return value.replace(/[\\x00-\\x08\\x0b\\x0c\\x0e-\\x1f\\x7f]/g, '');
   if (Array.isArray(value)) return value.map(clean);
@@ -124,6 +124,14 @@ async function cleanPaints(paints) {
     out.push(p);
   }
   return out;
+}
+function hasCropImageFill(paints) {
+  return Array.isArray(paints)
+    && paints.some(p => p && p.type === 'IMAGE' && p.visible !== false && p.scaleMode === 'CROP');
+}
+async function exportNodePngDataUrl(node) {
+  const bytes = await node.exportAsync({ format: 'PNG', constraint: { type: 'SCALE', value: 1 } });
+  return 'data:image/png;base64,' + bytesToBase64(bytes);
 }
 function readOrError(out, key, fn) {
   try {
@@ -190,15 +198,23 @@ async function dumpNode(node) {
     name: node.name,
     type: node.type,
     visible: node.visible,
+    isMask: node.isMask,
     width: node.width,
     height: node.height,
     x: node.x,
     y: node.y,
   };
+  const absoluteBoundingBox = safe(() => node.absoluteBoundingBox, undefined);
+  if (absoluteBoundingBox) out.absoluteBoundingBox = clean(absoluteBoundingBox);
+  const absoluteRenderBounds = safe(() => node.absoluteRenderBounds, undefined);
+  if (absoluteRenderBounds !== undefined) out.absoluteRenderBounds = clean(absoluteRenderBounds);
   if (typeof node.rotation === 'number' && Math.abs(node.rotation) >= 0.01) out.rotation = node.rotation;
   if (node.type === 'INSTANCE' && typeof node.scaleFactor === 'number') out.scaleFactor = node.scaleFactor;
   if (typeof node.opacity === 'number' && node.opacity < 0.999) out.opacity = node.opacity;
   if (node.layoutPositioning) out.layoutPositioning = node.layoutPositioning;
+  if (node.layoutSizingHorizontal) out.layoutSizingHorizontal = node.layoutSizingHorizontal;
+  if (node.layoutSizingVertical) out.layoutSizingVertical = node.layoutSizingVertical;
+  if (typeof node.layoutGrow === 'number') out.layoutGrow = node.layoutGrow;
   if (node.constraints) out.constraints = { horizontal: node.constraints.horizontal, vertical: node.constraints.vertical };
   if (node.componentPropertyReferences) out.componentPropertyReferences = clean(node.componentPropertyReferences);
   if (node.boundVariables && Object.keys(node.boundVariables).length) out.boundVariables = clean(node.boundVariables);
@@ -207,9 +223,6 @@ async function dumpNode(node) {
     out.layoutMode = node.layoutMode;
     out.primaryAxisSizingMode = node.primaryAxisSizingMode;
     out.counterAxisSizingMode = node.counterAxisSizingMode;
-    out.layoutSizingHorizontal = node.layoutSizingHorizontal;
-    out.layoutSizingVertical = node.layoutSizingVertical;
-    if (typeof node.layoutGrow === 'number') out.layoutGrow = node.layoutGrow;
     out.paddingTop = node.paddingTop;
     out.paddingRight = node.paddingRight;
     out.paddingBottom = node.paddingBottom;
@@ -305,6 +318,7 @@ async function dumpNode(node) {
 
   if (SHAPELIKE.has(node.type)) {
     if (Array.isArray(node.fills)) out.fills = await cleanPaints(node.fills);
+    if (hasCropImageFill(node.fills)) out.renderedDataUrl = await exportNodePngDataUrl(node);
     if (Array.isArray(node.strokes) && node.strokes.length) out.strokes = clean(node.strokes);
     if (typeof node.strokeWeight === 'number') out.strokeWeight = node.strokeWeight;
     if (node.strokeAlign) out.strokeAlign = node.strokeAlign;

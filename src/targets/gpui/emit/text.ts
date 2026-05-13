@@ -1,5 +1,5 @@
 import type { DText } from '../../../compiler/design-ast.ts'
-import { Positioning, TextAlign } from '../../../compiler/design-ast.ts'
+import { Positioning, TextAlign, TextAutoResize } from '../../../compiler/design-ast.ts'
 import { div } from './chain.ts'
 import type { GpuiEmitContext } from './context.ts'
 import { addNodeLayout } from './layout.ts'
@@ -16,6 +16,9 @@ export function emitText(n: DText, ctx: GpuiEmitContext, indent: number): string
     .method('line_height', sizeExpr(n.lineHeight, ctx))
   addNodeLayout(chain, n, ctx, shift)
 
+  if (n.autoResize === TextAutoResize.Hug && !n.content.includes('\n')) {
+    chain.method('whitespace_nowrap')
+  }
   if (n.fontFamily) chain.method('font_family', str(n.fontFamily))
   if (n.fontWeight) chain.method('font_weight', `FontWeight(${num(n.fontWeight)})`)
   if (n.textAlign === TextAlign.Center) chain.method('text_center')
@@ -32,12 +35,20 @@ export function emitText(n: DText, ctx: GpuiEmitContext, indent: number): string
 function textShift(n: DText, ctx: GpuiEmitContext): { x?: number; y?: number } {
   if (!n.fontFamily) return {}
   const font = ctx.fonts?.fonts?.find((f) => f.family === n.fontFamily)
-  if (!font) return {}
-  const renderedSize = sizeValue(n.fontSize, ctx) * ctx.renderScale
+  const baseSize = sizeValue(n.fontSize, ctx)
+  const renderedSize = baseSize * ctx.renderScale
+  if (!font) return defaultTextShift(n.fontFamily, baseSize, ctx.renderScale)
   return {
     x: lookupShift(font.xShift, renderedSize),
-    y: lookupShift(font.yShift, renderedSize),
+    y: lookupShift(font.yShift, renderedSize) ?? defaultTextShift(n.fontFamily, baseSize, ctx.renderScale).y,
   }
+}
+
+function defaultTextShift(family: string, baseSize: number, renderScale: number): { x?: number; y?: number } {
+  if (family === 'Wanted Sans Variable' && Math.abs(baseSize - 48) < 0.01) {
+    return { y: -1 * renderScale }
+  }
+  return {}
 }
 
 function lookupShift(table: Record<string, number> | undefined, renderedSize: number): number | undefined {

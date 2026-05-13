@@ -48,6 +48,7 @@ import {
     TextDecoration,
     TextAlign,
     ShapeKind,
+    StrokeAlign,
     StrokeCap,
     FlowDirection,
 } from '../../compiler/design-ast.ts'
@@ -122,7 +123,7 @@ function jsxStringInitializer(v: string): ast.JsxAttributeValue {
 function attrsFromObject(obj: Record<string, unknown>): ast.JsxAttributeLike[] {
     const inline: ast.JsxAttributeLike[] = []
     const rest: Record<string, unknown> = {}
-    for (const [k, v] of Object.entries(obj)) {
+    for (const [k, v] of Object.entries(normalizeJsxProps(obj))) {
         if (v === undefined) continue
         if (IDENT_RE.test(k)) {
             const initializer: ast.JsxAttributeValue =
@@ -139,6 +140,15 @@ function attrsFromObject(obj: Record<string, unknown>): ast.JsxAttributeLike[] {
     if (Object.keys(rest).length)
         inline.push(f.createJsxSpreadAttribute(valueToExpr(rest)))
     return inline
+}
+
+function normalizeJsxProps(obj: Record<string, unknown>): Record<string, unknown> {
+    const out = compactPaddingStyles(obj)
+    if (out.borderRadius !== undefined) {
+        out.rounded = out.borderRadius
+        delete out.borderRadius
+    }
+    return out
 }
 
 function jsxAttr(name: string, value: unknown): ast.JsxAttribute {
@@ -248,6 +258,12 @@ function colorToCss(c: Color | undefined): string {
     return prop
 }
 
+function tokenCssVar(tokenPath: string, ctx: Ctx): string {
+    const fallback = ctx.tokenColorMap[tokenPath]
+    const name = `--colors-${tokenPath.replace(/\./g, '-')}`
+    return fallback ? `var(${name}, ${fallback})` : `var(${name})`
+}
+
 function shadowToCss(shadow: Shadow, remBase: number): string {
     const x = sizeToPx(shadow.x) ?? 0
     const y = sizeToPx(shadow.y) ?? 0
@@ -315,6 +331,7 @@ interface Ctx {
     registry: Map<string, TargetComponentMeta>
     tokenMap: Record<string, string>
     tokenValueMap: Record<string, number>
+    tokenColorMap: Record<string, string>
     typographyMap: Record<string, string>
     plugins: CodegenPlugin[]
     usedJsxPatterns: Set<string> // Flex / Stack / Box / styled
@@ -326,10 +343,14 @@ interface Ctx {
     rootDir?: string
     componentsDir?: string
     propsFile?: string
-    /** SVG sidecars to write alongside the .tsx, plus the import alias the
-     *  generated JSX references. relativePath is filename only (no ./), the
-     *  emit pipeline writes them next to the tsx file. */
-    svgSidecars: Map<string, { alias: string; content: string }>
+    viewConfig: NonNullable<CodegenContext['viewConfig']>
+    repetitionComponents: Array<{ name: string; props: Record<string, unknown[]>; jsx: ast.JsxChild }>
+    repetitionMarkers: Map<string, string>
+    repetitionCounter: number
+    /** Target asset sidecars plus the import alias the generated JSX references. */
+    svgSidecars: Map<string, { alias: string; content: string; importPath: string }>
+    imageSidecars: Map<string, { content: Uint8Array }>
+    assetUrls: Map<string, string>
     squircleHooks: Array<{ id: number; radiusPx: number; smoothing: number }>
     /** When true, the generated FC inlines an SVG filter `<defs>` and the
      *  inner Svg conditionally applies `filter: url(#tint_<id>)` when the
@@ -362,6 +383,19 @@ function propExpression(key: string): ast.JsxExpression {
     return f.createJsxExpression(
         undefined,
         f.createIdentifier(`PIXPEC_PROP_${key}`),
+    )
+}
+
+function propExpressionWithFallback(key: string, fallback: unknown): ast.JsxExpression {
+    return f.createJsxExpression(
+        undefined,
+        f.createBinaryExpression(
+            undefined,
+            f.createIdentifier(`PIXPEC_PROP_${key}`),
+            undefined,
+            f.createToken(ast.SyntaxKind.QuestionQuestionToken),
+            valueToExpr(fallback),
+        ),
     )
 }
 
@@ -513,12 +547,10 @@ function emitContainer(
             styles.minWidth = 0
         } else if (parentDir === 'column') {
             styles.alignSelf = 'stretch'
-            styles.minWidth = 0
         }
     } else if (sizingH === Sizing.Fixed && n.width) {
         const w = sizeToProp(n.width, ctx.remBase)
         if (w !== undefined) styles.width = w
-        if (parentDir !== 'none') styles.minWidth = 0
     }
     if (sizingV === Sizing.Fill) {
         if (parentDir === 'none') styles.height = '100%'
@@ -527,12 +559,10 @@ function emitContainer(
             styles.minHeight = 0
         } else if (parentDir === 'row') {
             styles.alignSelf = 'stretch'
-            styles.minHeight = 0
         }
     } else if (sizingV === Sizing.Fixed && n.height) {
         const h = sizeToProp(n.height, ctx.remBase)
         if (h !== undefined) styles.height = h
-        if (parentDir !== 'none') styles.minHeight = 0
     }
     // FIXED main-axis child of FILL/FIXED parent: don't flex-shrink.
     if (parent.mainSizing !== Sizing.Hug) {
@@ -554,16 +584,21 @@ function emitContainer(
         if (bg !== undefined) styles.background = bg
     }
     if (n.opacity !== undefined) styles.opacity = n.opacity
+    if (n.positioning !== Positioning.Absolute && n.renderBoundsOffset) {
+        styles.transform = `translate(${px2rem(-n.renderBoundsOffset.x, ctx.remBase)}, ${px2rem(-n.renderBoundsOffset.y, ctx.remBase)})`
+    }
 
     // border (uniform-only path; per-side via boxShadow inset)
     if (n.border) {
         const w = n.border.width
         const colorStr = colorToProp(n.border.paint)
+        const colorRef = colorStr
+            ? colorStr.startsWith('#') || colorStr.startsWith('rgb')
+                ? colorStr
+                : `var(--colors-${String(colorStr).replace(/\./g, '-')})`
+            : '#000'
         if ('top' in w) {
             // mixed per-side
-            const colorRef = colorStr
-                ? `var(--colors-${String(colorStr).replace(/\./g, '-')})`
-                : '#000'
             const shadows: string[] = []
             const wt = sizeToPx(w.top),
                 wb = sizeToPx(w.bottom),
@@ -588,12 +623,13 @@ function emitContainer(
             if (shadows.length) styles.boxShadow = shadows.join(', ')
         } else {
             const wPx = sizeToPx(w)
-            if (wPx !== undefined && Number.isInteger(wPx)) {
+            if (wPx !== undefined && n.border.align === StrokeAlign.Outside) {
+                styles.boxShadow = `0 0 0 ${px2rem(wPx, ctx.remBase)} ${colorRef}`
+            } else if (wPx !== undefined && n.border.align === StrokeAlign.Center) {
+                styles.boxShadow = `0 0 0 ${px2rem(wPx / 2, ctx.remBase)} ${colorRef}, inset 0 0 0 ${px2rem(wPx / 2, ctx.remBase)} ${colorRef}`
+            } else if (wPx !== undefined && Number.isInteger(wPx)) {
                 styles.insetBorder = `${wPx} ${colorStr}`
             } else if (wPx !== undefined) {
-                const colorRef = colorStr
-                    ? `var(--colors-${String(colorStr).replace(/\./g, '-')})`
-                    : '#000'
                 styles.boxShadow = `inset 0 0 0 ${px2rem(wPx, ctx.remBase)} ${colorRef}`
             }
         }
@@ -634,7 +670,12 @@ function emitContainer(
     const compact = compactPaddingStyles(styles)
     const attrs = attrsFromObject(compact)
     const squircleRadius =
-        n.cornerSmoothing && n.cornerSmoothing > 0
+        n.cornerSmoothing &&
+        n.cornerSmoothing > 0 &&
+        n.width &&
+        n.height &&
+        sizingH === Sizing.Fixed &&
+        sizingV === Sizing.Fixed
             ? sizeToPxWithTokens(n.cornerRadius as Size, ctx.tokenValueMap)
             : undefined
     const squircleHook =
@@ -690,8 +731,378 @@ function emitContainer(
                   ? sizingV
                   : Sizing.Fixed,
     }
-    const children = n.children.map((c) => emitNode(c, ctx, childParent))
+    const repeated = emitRepetitionChildren(n, ctx, childParent)
+    const children = repeated ?? n.children.map((c) => emitNode(c, ctx, childParent))
     return f.createJsxElement(open, children, close)
+}
+
+function emitRepetitionChildren(
+    n: DFlex | DStack | DBox,
+    ctx: Ctx,
+    childParent: ParentCtx,
+): ast.JsxChild[] | undefined {
+    const cfg = ctx.viewConfig[n.sourceId]?.repetition
+    if (!cfg) return undefined
+    if (n.children.length === 0) {
+        throw new Error(`pixpec react-panda: repetition container ${n.sourceId} has no children`)
+    }
+    const name = cfg.childComponent.name
+    const rows = analyzeRepetitionRows(n.sourceId, name, n.children)
+    const template = applyRepetitionBindings(rows.template, rows.bindings)
+    const jsx = emitNode(template, ctx, childParent)
+    const marker = `PIXPEC_REPETITION_${ctx.repetitionCounter++}`
+    ctx.repetitionComponents.push({ name, props: rows.valuesByProp, jsx })
+    ctx.repetitionMarkers.set(marker, repetitionMapSource(name, rows.records))
+    return [f.createJsxExpression(undefined, f.createIdentifier(marker))]
+}
+
+interface RepetitionBinding {
+    path: number[]
+    kind: 'textContent' | 'textFill' | 'instanceProp' | 'containerFill' | 'visibility'
+    key?: string
+    propName: string
+}
+
+interface RepetitionRowAlignment {
+    nodesByPath: Map<string, DNode>
+    missingPaths: number[][]
+}
+
+function analyzeRepetitionRows(
+    containerId: string,
+    componentName: string,
+    rows: DNode[],
+): {
+    template: DNode
+    bindings: RepetitionBinding[]
+    records: Array<Record<string, unknown>>
+    valuesByProp: Record<string, unknown[]>
+} {
+    const templateIndex = chooseRepetitionTemplateIndex(rows)
+    const template = rows[templateIndex]
+    const alignments = rows.map((row, i) => {
+        const alignment = alignRepetitionRow(template, row)
+        if (alignment.error) {
+            throw new Error(
+                `pixpec repetition ${containerId}: child ${i + 1} does not match ${componentName} template (${alignment.error})`,
+            )
+        }
+        if (rootMissingPaths(alignment.missingPaths).length > 1) {
+            throw new Error(
+                `pixpec repetition ${containerId}: child ${i + 1} differs from ${componentName} template by more than one missing node`,
+            )
+        }
+        return alignment
+    })
+    const candidates: Array<{ binding: RepetitionBinding; values: unknown[] }> = []
+    const seenVisibilityPaths = new Set<string>()
+    for (const alignment of alignments) {
+        for (const path of rootMissingPaths(alignment.missingPaths)) {
+            const key = pathKey(path)
+            if (seenVisibilityPaths.has(key)) continue
+            const node = nodeAtPath(template, path)
+            if (!node) continue
+            candidates.push({
+                binding: {
+                    path,
+                    kind: 'visibility',
+                    propName: uniquePropName(showPropName(node.sourceName), candidates),
+                },
+                values: alignments.map((a) => !a.missingPaths.some((missing) => samePath(missing, path))),
+            })
+            seenVisibilityPaths.add(key)
+        }
+    }
+    walkAlignedRows(template, alignments, [], (nodes, path) => {
+        if (nodes.some((node) => !node)) return
+        const present = nodes as DNode[]
+        const sample = present[0]
+        if (sample.kind === NodeKind.Text) {
+            const values = present.map((n) => (n as DText).content)
+            if (hasVariation(values)) {
+                candidates.push({
+                    binding: {
+                        path,
+                        kind: 'textContent',
+                        propName: uniquePropName(propName(sample.sourceName), candidates),
+                    },
+                    values,
+                })
+            }
+            const colors = present.map((n) => colorToProp((n as DText).color))
+            if (hasVariation(colors)) {
+                candidates.push({
+                    binding: {
+                        path,
+                        kind: 'textFill',
+                        propName: uniquePropName(`${propName(sample.sourceName)}Fill`, candidates),
+                    },
+                    values: colors,
+                })
+            }
+        } else if (sample.kind === NodeKind.Instance) {
+            const keys = new Set<string>()
+            for (const node of present) {
+                for (const key of Object.keys((node as DInstance).props ?? {})) keys.add(key)
+            }
+            for (const key of [...keys].sort()) {
+                const values = present.map((n) => (n as DInstance).props?.[key])
+                if (!hasVariation(values)) continue
+                candidates.push({
+                    binding: {
+                        path,
+                        kind: 'instanceProp',
+                        key,
+                        propName: uniquePropName(nestedPropName(sample.sourceName, key), candidates),
+                    },
+                    values,
+                })
+            }
+        } else if (isContainerNode(sample)) {
+            const values = present.map((n) => colorToProp((n as DFlex | DStack | DBox).background))
+            if (hasVariation(values)) {
+                candidates.push({
+                    binding: {
+                        path,
+                        kind: 'containerFill',
+                        propName: uniquePropName(`${propName(sample.sourceName)}Fill`, candidates),
+                    },
+                    values,
+                })
+            }
+        }
+    })
+    const records = rows.map((_, i) =>
+        Object.fromEntries(candidates.map(({ binding, values }) => [binding.propName, values[i]])),
+    )
+    const valuesByProp = Object.fromEntries(
+        candidates.map(({ binding, values }) => [binding.propName, values]),
+    )
+    return { template, bindings: candidates.map((c) => c.binding), records, valuesByProp }
+}
+
+function chooseRepetitionTemplateIndex(rows: DNode[]): number {
+    let bestIndex = 0
+    let bestCount = -1
+    for (let i = 0; i < rows.length; i += 1) {
+        const count = nodeCount(rows[i])
+        if (count > bestCount) {
+            bestIndex = i
+            bestCount = count
+        }
+    }
+    return bestIndex
+}
+
+function nodeCount(node: DNode): number {
+    return 1 + nodeChildren(node).reduce((sum, child) => sum + nodeCount(child), 0)
+}
+
+function alignRepetitionRow(template: DNode, row: DNode): RepetitionRowAlignment & { error?: string } {
+    const nodesByPath = new Map<string, DNode>()
+    const missingPaths: number[][] = []
+    const error = alignNode(template, row, [], nodesByPath, missingPaths)
+    return { nodesByPath, missingPaths, error }
+}
+
+function alignNode(
+    template: DNode,
+    row: DNode | undefined,
+    path: number[],
+    nodesByPath: Map<string, DNode>,
+    missingPaths: number[][],
+): string | undefined {
+    if (!row) {
+        missingPaths.push(path)
+        return undefined
+    }
+    const mismatch = compatibleNodeMismatch(template, row, pathLabel(path))
+    if (mismatch) return mismatch
+    nodesByPath.set(pathKey(path), row)
+    const templateChildren = nodeChildren(template)
+    const rowChildren = nodeChildren(row)
+    let rowIndex = 0
+    for (let i = 0; i < templateChildren.length; i += 1) {
+        const templateChild = templateChildren[i]
+        const rowChild = rowChildren[rowIndex]
+        if (rowChild && !compatibleNodeMismatch(templateChild, rowChild, pathLabel([...path, i]))) {
+            const error = alignNode(templateChild, rowChild, [...path, i], nodesByPath, missingPaths)
+            if (error) return error
+            rowIndex += 1
+        } else {
+            missingPaths.push([...path, i])
+        }
+    }
+    if (rowIndex < rowChildren.length) {
+        return `${pathLabel(path)}: extra child ${rowIndex + 1} of ${rowChildren.length}`
+    }
+    return undefined
+}
+
+function compatibleNodeMismatch(a: DNode, b: DNode, path: string): string | undefined {
+    if (a.kind !== b.kind) return `${path}: kind ${a.kind} != ${b.kind}`
+    if (a.kind === NodeKind.Instance && (a as DInstance).componentName !== (b as DInstance).componentName) {
+        return `${path}: instance ${(a as DInstance).componentName} != ${(b as DInstance).componentName}`
+    }
+    if (a.kind === NodeKind.Shape && (a as DShape).shape !== (b as DShape).shape) {
+        return `${path}: shape ${(a as DShape).shape} != ${(b as DShape).shape}`
+    }
+    const ad = containerDirection(a)
+    const bd = containerDirection(b)
+    if (ad !== bd) return `${path}: direction ${ad} != ${bd}`
+    return undefined
+}
+
+function walkAlignedRows(
+    template: DNode,
+    alignments: RepetitionRowAlignment[],
+    path: number[],
+    visit: (nodes: Array<DNode | undefined>, path: number[]) => void,
+): void {
+    visit(alignments.map((alignment) => alignment.nodesByPath.get(pathKey(path))), path)
+    const children = nodeChildren(template)
+    for (let i = 0; i < children.length; i += 1) {
+        walkAlignedRows(children[i], alignments, [...path, i], visit)
+    }
+}
+
+function rootMissingPaths(paths: number[][]): number[][] {
+    const roots: number[][] = []
+    for (const path of paths) {
+        if (!roots.some((root) => isDescendantPath(root, path))) roots.push(path)
+    }
+    return roots
+}
+
+function isDescendantPath(parent: number[], child: number[]): boolean {
+    return child.length > parent.length && parent.every((value, i) => child[i] === value)
+}
+
+function samePath(a: number[], b: number[]): boolean {
+    return a.length === b.length && a.every((value, i) => b[i] === value)
+}
+
+function pathKey(path: number[]): string {
+    return path.join('.')
+}
+
+function pathLabel(path: number[]): string {
+    return path.length ? `root.${path.join('.')}` : 'root'
+}
+
+function showPropName(name: string): string {
+    const base = propName(name)
+    const pascal = base ? `${base[0].toUpperCase()}${base.slice(1)}` : 'Node'
+    return `show${pascal}`
+}
+
+function nodeChildren(n: DNode): DNode[] {
+    return isContainerNode(n) ? n.children : []
+}
+
+function isContainerNode(n: DNode): n is DFlex | DStack | DBox {
+    return n.kind === NodeKind.Flex || n.kind === NodeKind.Stack || n.kind === NodeKind.Box
+}
+
+function containerDirection(n: DNode): 'row' | 'column' | 'none' {
+    return n.kind === NodeKind.Flex ? 'row' : n.kind === NodeKind.Stack ? 'column' : n.kind === NodeKind.Box ? 'none' : 'none'
+}
+
+function hasVariation(values: unknown[]): boolean {
+    const first = stableValue(values[0])
+    return values.some((v) => stableValue(v) !== first)
+}
+
+function stableValue(value: unknown): string {
+    return JSON.stringify(value)
+}
+
+function uniquePropName(base: string, candidates: Array<{ binding: RepetitionBinding }>): string {
+    const used = new Set(candidates.map((c) => c.binding.propName))
+    let name = IDENT_RE.test(base) ? base : propName(base)
+    let i = 2
+    while (used.has(name)) name = `${base}${i++}`
+    return name
+}
+
+function propName(name: string): string {
+    const stripped = name
+        .replace(/[\x00-\x1f\x7f]/g, '')
+        .replace(/#[^#]*$/, '')
+        .trim()
+    const parts = stripped.split(/[^A-Za-z0-9]+/).filter(Boolean)
+    if (!parts.length) return 'prop'
+    const joined = parts.join('')
+    return joined === 'style' ? 'styleVariant' : joined
+}
+
+function nestedPropName(layerName: string, key: string): string {
+    const layer = propName(layerName)
+    const prop = propName(key)
+    return `${layer ? layer[0].toLowerCase() + layer.slice(1) : 'item'}${prop}`
+}
+
+function applyRepetitionBindings(root: DNode, bindings: RepetitionBinding[]): DNode {
+    const clone = cloneNode(root)
+    for (const binding of bindings) {
+        const node = nodeAtPath(clone, binding.path)
+        if (!node) continue
+        if (binding.kind === 'textContent' && node.kind === NodeKind.Text) {
+            ;(node as DText).contentBinding = binding.propName
+        } else if (binding.kind === 'textFill' && node.kind === NodeKind.Text) {
+            ;(node as DText).fillBinding = binding.propName
+        } else if (binding.kind === 'instanceProp' && node.kind === NodeKind.Instance && binding.key) {
+            const inst = node as DInstance
+            inst.instancePropBindings = { ...(inst.instancePropBindings ?? {}), [binding.key]: binding.propName }
+        } else if (binding.kind === 'containerFill' && isContainerNode(node)) {
+            node.fillBinding = binding.propName
+        } else if (binding.kind === 'visibility') {
+            node.visibilityBinding = binding.propName
+        }
+    }
+    return clone
+}
+
+function cloneNode<T extends DNode>(node: T): T {
+    return structuredClone(node)
+}
+
+function nodeAtPath(root: DNode, path: number[]): DNode | undefined {
+    let node: DNode | undefined = root
+    for (const index of path) {
+        if (!node || !isContainerNode(node)) return undefined
+        node = node.children[index]
+    }
+    return node
+}
+
+function repetitionMapSource(componentName: string, records: Array<Record<string, unknown>>): string {
+    return `{${JSON.stringify(records, null, 4)}.map((item, index) => <${componentName} key={index} {...item} />)}`
+}
+
+function localComponentSource(
+    component: { name: string; props: Record<string, unknown[]>; jsx: ast.JsxChild },
+    printNode: (n: ast.Node) => string,
+): string {
+    const propsType = `${component.name}Props`
+    const fields = Object.entries(component.props)
+        .map(([name, values]) => `    ${name}: ${unionType(values)}`)
+        .join('\n')
+    const body = printNode(component.jsx as unknown as ast.Node)
+    return `interface ${propsType} {\n${fields}\n}\n\nconst ${component.name}: FC<${propsType}> = (props) => {\n    return (${body})\n}\n`
+}
+
+function unionType(values: unknown[]): string {
+    const unique = [...new Set(values.map((v) => JSON.stringify(v)).filter((v): v is string => v !== undefined))]
+    if (unique.length === 0) return 'unknown'
+    if (unique.every((v) => typeof JSON.parse(v) === 'boolean')) return 'boolean'
+    if (unique.every((v) => {
+        const parsed = JSON.parse(v) as unknown
+        return typeof parsed === 'string' || typeof parsed === 'boolean' || typeof parsed === 'number' || parsed === null
+    })) {
+        return unique.join(' | ')
+    }
+    return 'unknown'
 }
 
 function lookupTypoByPrefix(
@@ -792,14 +1203,12 @@ function emitText(n: DText, ctx: Ctx, parent: ParentCtx): ast.JsxElement {
     if (boundKey) ctx.usedPropBindings.add(boundKey)
     const children: ast.JsxChild[] = boundKey
         ? [propExpression(boundKey)]
-        : hasExplicitLineBreak
-          ? [
-                f.createJsxExpression(
-                    undefined,
-                    stringLiteral(normalizeTextLineBreaks(n.content)),
-                ),
-            ]
-          : [f.createJsxText(n.content)]
+        : [
+              f.createJsxExpression(
+                  undefined,
+                  stringLiteral(normalizeTextLineBreaks(n.content)),
+              ),
+          ]
     const renderedChildren: ast.JsxChild[] = wrapsUnderlineRun
         ? [
               f.createJsxElement(
@@ -836,16 +1245,17 @@ function emitShape(n: DShape, ctx: Ctx, _parent: ParentCtx): ast.JsxElement {
     // matching CSS custom-property reference so theme switches still work.
     const svgColor = (c: Color | undefined): string | undefined => {
         if (!c) return undefined
-        if ('tokenPath' in c)
-            return `var(--colors-${c.tokenPath.replace(/\./g, '-')})`
+        if ('tokenPath' in c) return tokenCssVar(c.tokenPath, ctx)
         return c.color
     }
     const fillVal = svgColor(n.fill) ?? 'none'
     ctx.usedJsxPatterns.add('styled')
     const innerAttrs: Record<string, unknown> = { fill: fillVal }
+    const strokeWidth = n.stroke ? (sizeToPx(n.stroke.width) ?? 1) : 0
+    const strokeInset = n.stroke?.align === StrokeAlign.Inside ? strokeWidth / 2 : 0
     if (n.stroke) {
         innerAttrs.stroke = svgColor(n.stroke.paint) ?? '#000'
-        innerAttrs['strokeWidth'] = sizeToPx(n.stroke.width) ?? 1
+        innerAttrs['strokeWidth'] = strokeWidth
     }
 
     let inner: ast.JsxChild
@@ -861,13 +1271,25 @@ function emitShape(n: DShape, ctx: Ctx, _parent: ParentCtx): ast.JsxElement {
             f.createIdentifier('rect'),
             undefined,
             f.createJsxAttributes([
+                ...(strokeInset > 0
+                    ? [
+                          f.createJsxAttribute(
+                              f.createIdentifier('x'),
+                              f.createJsxExpression(undefined, valueToExpr(strokeInset)),
+                          ),
+                          f.createJsxAttribute(
+                              f.createIdentifier('y'),
+                              f.createJsxExpression(undefined, valueToExpr(strokeInset)),
+                          ),
+                      ]
+                    : []),
                 f.createJsxAttribute(
                     f.createIdentifier('width'),
-                    f.createJsxExpression(undefined, valueToExpr(w)),
+                    f.createJsxExpression(undefined, valueToExpr(Math.max(0, w - strokeInset * 2))),
                 ),
                 f.createJsxAttribute(
                     f.createIdentifier('height'),
-                    f.createJsxExpression(undefined, valueToExpr(h)),
+                    f.createJsxExpression(undefined, valueToExpr(Math.max(0, h - strokeInset * 2))),
                 ),
                 ...Object.entries(innerAttrs).map(([k, v]) =>
                     f.createJsxAttribute(
@@ -892,11 +1314,11 @@ function emitShape(n: DShape, ctx: Ctx, _parent: ParentCtx): ast.JsxElement {
                 ),
                 f.createJsxAttribute(
                     f.createIdentifier('rx'),
-                    f.createJsxExpression(undefined, valueToExpr(w / 2)),
+                    f.createJsxExpression(undefined, valueToExpr(Math.max(0, (w - strokeInset * 2) / 2))),
                 ),
                 f.createJsxAttribute(
                     f.createIdentifier('ry'),
-                    f.createJsxExpression(undefined, valueToExpr(h / 2)),
+                    f.createJsxExpression(undefined, valueToExpr(Math.max(0, (h - strokeInset * 2) / 2))),
                 ),
                 ...Object.entries(innerAttrs).map(([k, v]) =>
                     f.createJsxAttribute(
@@ -1047,8 +1469,11 @@ function emitShape(n: DShape, ctx: Ctx, _parent: ParentCtx): ast.JsxElement {
 }
 
 function emitVector(n: DVector, ctx: Ctx): ast.JsxChild {
-    const w = sizeToPx(n.width) ?? 0
-    const h = sizeToPx(n.height) ?? 0
+    const rawW = sizeToPx(n.width) ?? 0
+    const rawH = sizeToPx(n.height) ?? 0
+    const svgSize = n.svg.startsWith('data:') ? undefined : svgRootSize(n.svg)
+    const w = svgSize?.width ?? rawW
+    const h = svgSize?.height ?? rawH
     if (n.svg.startsWith('data:')) {
         ctx.usedJsxPatterns.add('styled')
         const tag = () =>
@@ -1070,29 +1495,28 @@ function emitVector(n: DVector, ctx: Ctx): ast.JsxChild {
                     f.createIdentifier('alt'),
                     stringLiteral(''),
                 ),
+                jsxAttr('flexShrink', 0),
+                jsxAttr('width', px2rem(w, ctx.remBase)),
+                jsxAttr('height', px2rem(h, ctx.remBase)),
                 styleAttr({
                     display: 'block',
-                    flexShrink: 0,
-                    width: px2rem(w, ctx.remBase),
-                    height: px2rem(h, ctx.remBase),
                 }),
             ]),
         )
     }
-    // Wrap the svgr-imported component in a Panda <Box> sized to the figma
-    // master dim. The Box receives the master defaults via direct Panda
-    // style props (width/height in rem), so a downstream `splitCssProps`
-    // spread can override them. Inner Svg is locked to 100% so it scales
-    // with whatever size wins on the outer Box.
-    const sidecarKey = sidecarFilename(n.sourceId)
+    // Wrap the svgr-imported component in an inline-sized element. Breakdown
+    // generated files are not part of Panda's static extraction set, so
+    // arbitrary width/height must not depend on generated utility classes.
+    const sidecarKey = assetSidecarPath(ctx, sidecarFilename(n.sourceId))
     const alias = sidecarAlias(n.sourceId)
+    const normalizedSvg = n.svg
     if (!ctx.svgSidecars.has(sidecarKey)) {
         ctx.svgSidecars.set(sidecarKey, {
             alias,
-            content: ringifyStrokeCircles(n.svg),
+            content: ringifyStrokeCircles(normalizedSvg),
+            importPath: assetImportPath(sidecarKey, '?react'),
         })
     }
-    ctx.usedJsxPatterns.add('Box')
     ctx.usesTinting = true
     // preserveAspectRatio="none" matches figma's behaviour: a resized
     // instance stretches the master svg anisotropically to fill the box,
@@ -1106,12 +1530,13 @@ function emitVector(n: DVector, ctx: Ctx): ast.JsxChild {
     // marker JSX element here; post-process in buildSource() rewrites it
     // to a real `{rootProps.color ? <SvgC/> : <Svg/>}` (tsgo's printer
     // panics on factory-built JSX-child conditionals).
-    const tintedKey = sidecarFilenameTinted(n.sourceId)
+    const tintedKey = assetSidecarPath(ctx, sidecarFilenameTinted(n.sourceId))
     const tintedAlias = sidecarAliasTinted(n.sourceId)
     if (!ctx.svgSidecars.has(tintedKey)) {
         ctx.svgSidecars.set(tintedKey, {
             alias: tintedAlias,
-            content: makeCurrentColorSvg(ringifyStrokeCircles(n.svg)),
+            content: makeCurrentColorSvg(ringifyStrokeCircles(normalizedSvg)),
+            importPath: assetImportPath(tintedKey, '?react'),
         })
     }
     ctx.usesTinting = true
@@ -1132,20 +1557,51 @@ function emitVector(n: DVector, ctx: Ctx): ast.JsxChild {
             ),
         ]),
     )
+    ctx.usedJsxPatterns.add('styled')
+    const tag = () =>
+        f.createPropertyAccessExpression(
+            f.createIdentifier('styled'),
+            undefined,
+            f.createIdentifier('span'),
+            0 as ast.NodeFlags,
+        )
     const open = f.createJsxOpeningElement(
-        f.createIdentifier('Box'),
+        tag(),
         undefined,
         f.createJsxAttributes([
+            jsxAttr('flexShrink', 0),
             jsxAttr('width', px2rem(w, ctx.remBase)),
             jsxAttr('height', px2rem(h, ctx.remBase)),
-            jsxAttr('flexShrink', 0),
+            styleAttr({
+                display: 'block',
+            }),
         ]),
     )
     return f.createJsxElement(
         open,
         [innerSvg],
-        f.createJsxClosingElement(f.createIdentifier('Box')),
+        f.createJsxClosingElement(tag()),
     )
+}
+
+function svgRootSize(svg: string): { width: number; height: number } | undefined {
+    const root = svg.match(/<svg\b([^>]*)>/i)?.[1]
+    if (!root) return undefined
+    const read = (name: string) => {
+        const raw = root.match(new RegExp(`\\s${name}="([^"]+)"`, 'i'))?.[1]
+        if (!raw) return undefined
+        const n = Number.parseFloat(raw)
+        return Number.isFinite(n) && n > 0 ? n : undefined
+    }
+    const width = read('width')
+    const height = read('height')
+    if (width && height) return { width, height }
+    const viewBox = root.match(/\sviewBox="([^"]+)"/i)?.[1]?.trim().split(/\s+/).map(Number)
+    if (viewBox?.length === 4 && viewBox.every(Number.isFinite)) {
+        const [, , w, h] = viewBox
+        if (w > 0 && h > 0) return { width: w, height: h }
+    }
+    return undefined
 }
 
 function sidecarFilename(sourceId: string): string {
@@ -1159,6 +1615,51 @@ function sidecarAlias(sourceId: string): string {
 }
 function sidecarAliasTinted(sourceId: string): string {
     return `SvgC_${sourceId.replace(/[^A-Za-z0-9]/g, '_')}`
+}
+function assetSidecarPath(ctx: Ctx, filename: string): string {
+    const base = ctx.outputDir ? nodePath.basename(ctx.outputDir) : ''
+    if (base === 'generated' || base === 'breakdown') return `../.pixpec/assets/${filename}`
+    return `.pixpec/assets/${filename}`
+}
+function assetImportPath(relativePath: string, suffix = ''): string {
+    const rel = relativePath.replace(/\\/g, '/')
+    return `${rel.startsWith('.') ? rel : `./${rel}`}${suffix}`
+}
+function imageFilename(sourceId: string, mime: string): string | undefined {
+    const ext = extensionForImageMime(mime)
+    if (!ext) return undefined
+    return `image__${sourceId.replace(/[^A-Za-z0-9]/g, '_')}.${ext}`
+}
+function extensionForImageMime(mime: string): string | undefined {
+    switch (mime.toLowerCase()) {
+        case 'image/png':
+            return 'png'
+        case 'image/jpeg':
+            return 'jpg'
+        case 'image/gif':
+            return 'gif'
+        case 'image/webp':
+            return 'webp'
+        default:
+            return undefined
+    }
+}
+function imageAssetUrlMarker(n: DImage, ctx: Ctx): string | undefined {
+    if (!n.dataUrl) return undefined
+    const match = /^data:([^;,]+);base64,(.*)$/s.exec(n.dataUrl)
+    if (!match) return undefined
+    const mime = match[1] ?? ''
+    const filename = imageFilename(n.sourceId, mime)
+    if (!filename) return undefined
+    const relativePath = assetSidecarPath(ctx, filename)
+    if (!ctx.imageSidecars.has(relativePath)) {
+        ctx.imageSidecars.set(relativePath, {
+            content: Buffer.from(match[2] ?? '', 'base64'),
+        })
+    }
+    const marker = `PIXPEC_ASSET_URL_${ctx.assetUrls.size}`
+    ctx.assetUrls.set(marker, assetImportPath(relativePath))
+    return marker
 }
 /** Replace every literal fill color in an SVG string with `currentColor`,
  *  so the rendered svg picks up the host element's CSS color. Strokes
@@ -1179,6 +1680,102 @@ function makeCurrentColorSvg(svg: string): string {
         )
         .join('')
 }
+
+function normalizeFigmaAngularGradients(svg: string): string {
+    const gradients: string[] = []
+    const out = svg.replace(
+        /<g clip-path="url\(#([^"]+)_clip_path\)" data-figma-skip-parse="true"><g transform="[^"]*"><foreignObject\b[\s\S]*?<\/foreignObject><\/g><\/g><rect\b([^>]*?)\sdata-figma-gradient-fill="([^"]+)"([^>]*)\/>/g,
+        (match, clipBase: string, before: string, rawJson: string, after: string) => {
+            const parsed = parseFigmaGradient(rawJson)
+            if (!parsed) return match
+            const id = `${clipBase}_linear_pixpec`
+            gradients.push(figmaGradientDef(id, parsed))
+            return `<rect${before} ${after} fill="url(#${id})"/>`
+        },
+    )
+    if (gradients.length === 0) return out
+    if (out.includes('</defs>')) return out.replace('</defs>', `${gradients.join('')}</defs>`)
+    return out.replace('</svg>', `<defs>${gradients.join('')}</defs></svg>`)
+}
+
+function parseFigmaGradient(
+    raw: string,
+): Array<{ color: { r: number; g: number; b: number; a: number }; position: number }> | undefined {
+    try {
+        const parsed = JSON.parse(
+            raw.replace(/&quot;/g, '"').replace(/&#34;/g, '"').replace(/&amp;/g, '&'),
+        ) as {
+            stops?: Array<{
+                color?: { r?: number; g?: number; b?: number; a?: number }
+                position?: number
+            }>
+        }
+        const stops = parsed.stops
+            ?.map((stop) => {
+                const c = stop.color
+                if (!c) return undefined
+                return {
+                    color: { r: c.r ?? 0, g: c.g ?? 0, b: c.b ?? 0, a: c.a ?? 1 },
+                    position: stop.position ?? 0,
+                }
+            })
+            .filter(
+                (
+                    stop,
+                ): stop is {
+                    color: { r: number; g: number; b: number; a: number }
+                    position: number
+                } => !!stop,
+            )
+        return stops && stops.length >= 2 ? stops : undefined
+    } catch {
+        return undefined
+    }
+}
+
+function figmaGradientDef(
+    id: string,
+    stops: Array<{ color: { r: number; g: number; b: number; a: number }; position: number }>,
+): string {
+    const stopTags = stops
+        .map((stop) => {
+            const c = stop.color
+            const r = Math.round(Math.max(0, Math.min(1, c.r)) * 255)
+            const g = Math.round(Math.max(0, Math.min(1, c.g)) * 255)
+            const b = Math.round(Math.max(0, Math.min(1, c.b)) * 255)
+            const offset = `${Math.max(0, Math.min(100, stop.position * 100))}%`
+            return `<stop offset="${offset}" stop-color="rgb(${r},${g},${b})" stop-opacity="${c.a}"/>`
+        })
+        .join('')
+    return `<linearGradient id="${id}" x1="20" y1="96" x2="100" y2="16" gradientUnits="userSpaceOnUse">${stopTags}</linearGradient>`
+}
+
+function normalizeFigmaDropShadowFilters(svg: string): string {
+    const filters = new Map<string, string>()
+    const withoutDefs = svg.replace(
+        /<filter id="([^"]+)"[^>]*>[\s\S]*?<feOffset(?:\s+dx="([^"]+)")?\s+dy="([^"]+)"\/>\s*<feGaussianBlur stdDeviation="([^"]+)"\/>[\s\S]*?<feColorMatrix type="matrix" values="([^"]+)"\/>[\s\S]*?<\/filter>/g,
+        (match, id: string, dxRaw: string | undefined, dyRaw: string, blurRaw: string, matrix: string) => {
+            const values = matrix.trim().split(/\s+/).map(Number)
+            if (values.length < 20) return match
+            const r = Math.round(Math.max(0, Math.min(1, values[4] ?? 0)) * 255)
+            const g = Math.round(Math.max(0, Math.min(1, values[9] ?? 0)) * 255)
+            const b = Math.round(Math.max(0, Math.min(1, values[14] ?? 0)) * 255)
+            const a = Math.max(0, Math.min(1, values[18] ?? 1))
+            const dx = Number(dxRaw ?? 0)
+            const dy = Number(dyRaw)
+            const blur = Number(blurRaw) * 2
+            if (![dx, dy, blur].every(Number.isFinite)) return match
+            filters.set(id, `filter:drop-shadow(${dx}px ${dy}px ${blur}px rgba(${r},${g},${b},${a}))`)
+            return ''
+        },
+    )
+    if (filters.size === 0) return svg
+    return withoutDefs.replace(/<g filter="url\(#([^)]+)\)">/g, (match, id: string) => {
+        const style = filters.get(id)
+        return style ? `<g style="${style}">` : match
+    })
+}
+
 // Convert `<circle stroke=... stroke-width=W>` (no real fill) to a filled
 // ring path. Stroke geometry scales with viewBox under preserveAspectRatio
 // ="none", so anisotropic stretch produces a ring with direction-dependent
@@ -1222,7 +1819,8 @@ function emitImage(n: DImage, ctx: Ctx): ast.JsxSelfClosingElement {
         height: px2rem(h, ctx.remBase),
     }
     if (n.opacity !== undefined) styles.opacity = n.opacity
-    if (!n.dataUrl) {
+    const srcMarker = imageAssetUrlMarker(n, ctx)
+    if (!srcMarker) {
         return f.createJsxSelfClosingElement(
             f.createIdentifier('div'),
             undefined,
@@ -1243,7 +1841,10 @@ function emitImage(n: DImage, ctx: Ctx): ast.JsxSelfClosingElement {
         f.createJsxAttributes([
             f.createJsxAttribute(
                 f.createIdentifier('src'),
-                stringLiteral(n.dataUrl),
+                f.createJsxExpression(
+                    undefined,
+                    f.createIdentifier(srcMarker),
+                ),
             ),
             f.createJsxAttribute(f.createIdentifier('alt'), stringLiteral('')),
             styleAttr(styles),
@@ -1254,13 +1855,14 @@ function emitImage(n: DImage, ctx: Ctx): ast.JsxSelfClosingElement {
 function emitInstance(n: DInstance, ctx: Ctx, parent: ParentCtx): ast.JsxChild {
     ctx.usedComponents.add(n.componentName)
     // Elide props that match defaultProps.
+    const allProps = n.props
     const props = n.defaultProps
         ? Object.fromEntries(
-              Object.entries(n.props).filter(
+              Object.entries(allProps).filter(
                   ([k, v]) => !deepEq(v, n.defaultProps![k]),
               ),
           )
-        : n.props
+        : allProps
     // Optional binding overlay — DInstance is open-ended, so plugins or upstream
     // compiler may attach `instancePropBindings: Record<propName, ownerKey>`.
     const bindings = (n as Record<string, unknown>).instancePropBindings as
@@ -1275,10 +1877,13 @@ function emitInstance(n: DInstance, ctx: Ctx, parent: ParentCtx): ast.JsxChild {
         const boundKey = bindings?.[k]
         if (boundKey) {
             ctx.usedPropBindings.add(boundKey)
+            const fallback = allProps[k]
             attrs.push(
                 f.createJsxAttribute(
                     f.createIdentifier(k),
-                    propExpression(boundKey),
+                    fallback === undefined
+                        ? propExpression(boundKey)
+                        : propExpressionWithFallback(boundKey, fallback),
                 ),
             )
         } else {
@@ -1303,8 +1908,11 @@ function emitInstance(n: DInstance, ctx: Ctx, parent: ParentCtx): ast.JsxChild {
     ) {
         layoutStyles.flex = 1
         layoutStyles.minWidth = 0
+    } else if (sizingH === Sizing.Fill && parent.dir === 'none') {
+        layoutStyles.width = '100%'
     } else if (sizingH === Sizing.Fill && parent.dir === 'column') {
         layoutStyles.alignSelf = 'stretch'
+        layoutStyles.width = '100%'
     }
     if (
         sizingV === Sizing.Fill &&
@@ -1313,8 +1921,11 @@ function emitInstance(n: DInstance, ctx: Ctx, parent: ParentCtx): ast.JsxChild {
     ) {
         layoutStyles.flex = 1
         layoutStyles.minHeight = 0
+    } else if (sizingV === Sizing.Fill && parent.dir === 'none') {
+        layoutStyles.height = '100%'
     } else if (sizingV === Sizing.Fill && parent.dir === 'row') {
         layoutStyles.alignSelf = 'stretch'
+        layoutStyles.height = '100%'
     }
     if (n.layoutOverrides) {
         for (const [k, v] of Object.entries(n.layoutOverrides)) {
@@ -1351,15 +1962,36 @@ function emitInstance(n: DInstance, ctx: Ctx, parent: ParentCtx): ast.JsxChild {
 function emitUnknown(n: DUnknown, ctx: Ctx): ast.JsxSelfClosingElement {
     const w = sizeToPx(n.width) ?? 0
     const h = sizeToPx(n.height) ?? 0
+    ctx.usedJsxPatterns.add('styled')
+    const tag = () =>
+        f.createPropertyAccessExpression(
+            f.createIdentifier('styled'),
+            undefined,
+            f.createIdentifier('div'),
+            0 as ast.NodeFlags,
+        )
+    if (n.hidden) {
+        return f.createJsxSelfClosingElement(
+            tag(),
+            undefined,
+            f.createJsxAttributes([
+                styleAttr({
+                    width: px2rem(w, ctx.remBase),
+                    height: px2rem(h, ctx.remBase),
+                    opacity: 0,
+                }),
+            ]),
+        )
+    }
     if (w === 0 || h === 0) {
         return f.createJsxSelfClosingElement(
-            f.createIdentifier('div'),
+            tag(),
             undefined,
             f.createJsxAttributes([styleAttr({ display: 'none' })]),
         )
     }
     return f.createJsxSelfClosingElement(
-        f.createIdentifier('div'),
+        tag(),
         undefined,
         f.createJsxAttributes([
             styleAttr({
@@ -1459,6 +2091,11 @@ function wrapAbsolute(n: DNode, jsx: ast.JsxChild, ctx: Ctx): ast.JsxChild {
         if (h === 0) absY -= sw
         if (w === 0) absX -= sw
     }
+    if (n.renderBoundsOffset) {
+        const offset = n.renderBoundsOffset
+        absX += offset.x
+        absY += offset.y
+    }
     const wrapStyle: Record<string, unknown> = {
         position: 'absolute',
         left: px2rem(absX, ctx.remBase),
@@ -1488,7 +2125,7 @@ function wrapAbsolute(n: DNode, jsx: ast.JsxChild, ctx: Ctx): ast.JsxChild {
         f.createJsxOpeningElement(
             tag(),
             undefined,
-            f.createJsxAttributes(attrsFromObject(wrapStyle)),
+            f.createJsxAttributes([styleAttr(wrapStyle)]),
         ),
         [jsx],
         f.createJsxClosingElement(tag()),
@@ -1706,7 +2343,7 @@ function buildSource(
         : []
     const svgImports = [...ctx.svgSidecars.entries()]
         .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
-        .map(([filename, { alias }]) =>
+        .map(([, { alias, importPath }]) =>
             f.createImportDeclaration(
                 undefined,
                 f.createImportClause(
@@ -1714,7 +2351,7 @@ function buildSource(
                     f.createIdentifier(alias),
                     undefined,
                 ),
-                stringLiteral(`./${filename}?react`),
+                stringLiteral(importPath),
             ),
         )
     const jsxPatternImport =
@@ -1944,12 +2581,16 @@ function buildSource(
         ...jsxPatternImport,
         ...squircleImport,
         ...svgImports,
-        generatedFn,
     ]
+    const localComponents = ctx.repetitionComponents
+        .map((component) => localComponentSource(component, printNode))
+        .join('\n')
     const header = `/**\n * AUTO-GENERATED by pixpec react-panda target.\n * Source: ${sourceId}\n */\n`
     let printed =
         header +
         statements.map(printNode).join('\n') +
+        (localComponents ? `\n${localComponents}\n` : '\n') +
+        printNode(generatedFn) +
         '\n' +
         'export interface GeneratedProps {}\n'
     printed = printed.replace(
@@ -1996,6 +2637,15 @@ function buildSource(
         (_m, key, id) =>
             `{ clipPath: squircleClipPath${id}, background: props.${key} }`,
     )
+    for (const [marker, importPath] of ctx.assetUrls) {
+        printed = printed.replaceAll(
+            marker,
+            `new URL('${importPath}', import.meta.url).href`,
+        )
+    }
+    for (const [marker, source] of ctx.repetitionMarkers) {
+        printed = printed.replaceAll(marker, source)
+    }
     if (ctx.usesTinting) {
         // Rewrite the `<PIXPEC_TINT_SWAP normal={X} tinted={Y}/>` marker into
         // a real conditional. Two `?react` imports are already in scope; the
@@ -2012,14 +2662,14 @@ function buildSource(
             (_m, normal, tinted) => {
                 if (ctx.usedPropBindings.has('_fill')) {
                     return `{props._fill ` +
-                        `? <${tinted} preserveAspectRatio="none" ${fillTintedStyle}/> ` +
+                        `? <${tinted} preserveAspectRatio="none" shapeRendering="geometricPrecision" ${fillTintedStyle}/> ` +
                         `: cssProps.color ` +
-                        `? <${tinted} preserveAspectRatio="none" ${tintedStyle}/> ` +
-                        `: <${normal} preserveAspectRatio="none" style={{ display: "block", width: "100%", height: "100%" }}/>}`
+                        `? <${tinted} preserveAspectRatio="none" shapeRendering="geometricPrecision" ${tintedStyle}/> ` +
+                        `: <${normal} preserveAspectRatio="none" shapeRendering="geometricPrecision" style={{ display: "block", width: "100%", height: "100%" }}/>}`
                 }
                 return `{cssProps.color ` +
-                    `? <${tinted} preserveAspectRatio="none" ${tintedStyle}/> ` +
-                    `: <${normal} preserveAspectRatio="none" style={{ display: "block", width: "100%", height: "100%" }}/>}`
+                    `? <${tinted} preserveAspectRatio="none" shapeRendering="geometricPrecision" ${tintedStyle}/> ` +
+                    `: <${normal} preserveAspectRatio="none" shapeRendering="geometricPrecision" style={{ display: "block", width: "100%", height: "100%" }}/>}`
             },
         )
     }
@@ -2037,6 +2687,7 @@ export function codegenReactPanda(root: DNode, ctx: CodegenContext): CodegenResu
             registry: ctx.registry ?? new Map(),
             tokenMap: ctx.designSystem?.tokens ?? {},
             tokenValueMap: ctx.designSystem?.tokenValues ?? {},
+            tokenColorMap: ctx.designSystem?.tokenColors ?? {},
             typographyMap: ctx.designSystem?.typography ?? {},
             plugins,
             usedJsxPatterns: new Set(),
@@ -2048,7 +2699,13 @@ export function codegenReactPanda(root: DNode, ctx: CodegenContext): CodegenResu
             rootDir: ctx.rootDir,
             componentsDir: ctx.componentsDir,
             propsFile: ctx.propsFile,
+            viewConfig: ctx.viewConfig ?? {},
+            repetitionComponents: [],
+            repetitionMarkers: new Map(),
+            repetitionCounter: 0,
             svgSidecars: new Map(),
+            imageSidecars: new Map(),
+            assetUrls: new Map(),
             squircleHooks: [],
             usesTinting: false,
             tintFilterId: '',
@@ -2086,11 +2743,19 @@ export function codegenReactPanda(root: DNode, ctx: CodegenContext): CodegenResu
         } finally {
             if (api) api.close()
         }
-        const sidecars = [...cgCtx.svgSidecars.entries()].map(
-            ([filename, { content }]) => ({
-                relativePath: filename,
-                content,
-            }),
-        )
+        const sidecars = [
+            ...[...cgCtx.svgSidecars.entries()].map(
+                ([relativePath, { content }]) => ({
+                    relativePath,
+                    content,
+                }),
+            ),
+            ...[...cgCtx.imageSidecars.entries()].map(
+                ([relativePath, { content }]) => ({
+                    relativePath,
+                    content,
+                }),
+            ),
+        ]
         return { source, fileExtension: ext.fileExtension ?? 'tsx', sidecars }
 }

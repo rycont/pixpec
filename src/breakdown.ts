@@ -5,7 +5,7 @@
  * delegates per-node target output to the normal generate flow.
  */
 
-import { mkdir, writeFile } from 'node:fs/promises'
+import { mkdir, rm, writeFile } from 'node:fs/promises'
 import { relative, resolve } from 'node:path'
 import { dump, type RawNode } from './dumper/index.ts'
 import { loadConfig } from './init.ts'
@@ -13,6 +13,7 @@ import { listFigmaTabs } from './cfigma-meta.ts'
 import { resolveConfiguredTargets } from './targets/index.ts'
 import { runGenerate } from './generate.ts'
 import { runBreakdownVerify } from './breakdown-verify.ts'
+import { loadViewCodegenConfig } from './view-config.ts'
 
 export interface BreakdownOptions {
     name?: string
@@ -39,6 +40,8 @@ interface BreakdownEntry {
     sourceId: string
     sourceName: string
     sourceType: string
+    sourceWidth?: number
+    sourceHeight?: number
     depth: number
     childCount: number
     viewId: string
@@ -72,6 +75,13 @@ export async function runBreakdown(
     const targets = opts.target ? [opts.target] : resolveConfiguredTargets(cfg)
     const renderScale = opts.scale ?? cfg.scale
     await mkdir(breakdownDir, { recursive: true })
+    const viewConfig = await loadViewCodegenConfig(viewDir)
+    for (const target of targets) {
+        const targetDir = resolve(viewDir, 'impl', target)
+        await rm(resolve(targetDir, 'generated'), { recursive: true, force: true })
+        await rm(resolve(targetDir, 'breakdown'), { recursive: true, force: true })
+        await rm(resolve(targetDir, '.pixpec'), { recursive: true, force: true })
+    }
 
     const rootOutputs: Record<string, string> = {}
     for (const target of targets) {
@@ -83,6 +93,7 @@ export async function runBreakdown(
             propsFile: null,
             detachInstances: opts.detachInstances,
             renderScale,
+            viewConfig,
         })
         rootOutputs[target] = relativeFrom(viewDir, r.outPath)
     }
@@ -98,6 +109,8 @@ export async function runBreakdown(
             sourceId: node.id,
             sourceName: node.name,
             sourceType: node.type,
+            sourceWidth: sourceWidth(node),
+            sourceHeight: sourceHeight(node),
             depth,
             childCount: node.children?.length ?? 0,
             viewId,
@@ -113,6 +126,7 @@ export async function runBreakdown(
                     propsFile: null,
                     detachInstances: opts.detachInstances,
                     renderScale,
+                    viewConfig,
                 })
                 entry.outputs[target] = relativeFrom(viewDir, r.outPath)
             } catch (e) {
@@ -201,6 +215,22 @@ function safeFilename(s: string): string {
 
 function relativeFrom(base: string, target: string): string {
     return relative(base, target).replace(/\\/g, '/')
+}
+
+function isOrthogonalSwapRotation(node: RawNode): boolean {
+    if (typeof node.rotation !== 'number') return false
+    const normalized = ((node.rotation % 360) + 360) % 360
+    return Math.abs(normalized - 90) < 0.01 || Math.abs(normalized - 270) < 0.01
+}
+
+function sourceWidth(node: RawNode): number | undefined {
+    if (typeof node.width !== 'number' && typeof node.height !== 'number') return undefined
+    return isOrthogonalSwapRotation(node) ? node.height : node.width
+}
+
+function sourceHeight(node: RawNode): number | undefined {
+    if (typeof node.width !== 'number' && typeof node.height !== 'number') return undefined
+    return isOrthogonalSwapRotation(node) ? node.width : node.height
 }
 
 function toPascalIdentifier(name: string, fallback: string): string {

@@ -14,6 +14,7 @@ import { compile, loadRegistry } from './compiler/index.ts'
 import { getTarget, resolveConfiguredTargets } from './targets/index.ts'
 import { loadConfig } from './init.ts'
 import { listFigmaTabs } from './cfigma-meta.ts'
+import type { ViewCodegenConfig } from './targets/types.ts'
 
 export interface GenerateOptions {
   /** Target to generate. Required for runGenerate. */
@@ -33,6 +34,8 @@ export interface GenerateOptions {
   detachInstances?: boolean
   /** Override pixpec.toml scale for generated target code. */
   renderScale?: number
+  /** Normalized view.config.json data for view-level semantic codegen. */
+  viewConfig?: ViewCodegenConfig
 }
 
 export interface GenerateManyOptions extends Omit<GenerateOptions, 'target'> {
@@ -177,6 +180,7 @@ export async function runGenerate(componentId: string, opts: GenerateOptions = {
     outputDir: outDir,
     rootDir: root,
     componentsDir,
+    viewConfig: opts.viewConfig,
     propsFile: opts.propsFile === null
       ? undefined
       : opts.propsFile ?? resolve(componentsDir, componentName, 'props.ts'),

@@ -2,7 +2,6 @@ import { createHash } from 'node:crypto'
 import { existsSync } from 'node:fs'
 import { copyFile, mkdir, readdir, readFile, rm, stat, symlink, unlink, writeFile } from 'node:fs/promises'
 import { spawn } from 'node:child_process'
-import { tmpdir } from 'node:os'
 import { resolve } from 'node:path'
 import type { CaptureRequest, CaptureResult } from '../types.ts'
 import {
@@ -55,14 +54,17 @@ export interface GpuiCaptureRuntime {
   runtimeDir: string
   libDir: string
   gpuiPreviewDir: string
+  cargoLockPath: string
   fontDir?: string
 }
 
 export async function prepareGpuiCaptureRuntime(runtimeDir: string): Promise<GpuiCaptureRuntime> {
+  const gpuiPreviewDir = await ensurePatchedGpui()
   return {
     runtimeDir,
     libDir: await ensureLinkerLibs(),
-    gpuiPreviewDir: await ensurePatchedGpui(),
+    gpuiPreviewDir,
+    cargoLockPath: resolve(gpuiPreviewDir, 'Cargo.lock'),
     fontDir: await prepareGpuiFontDir(runtimeDir),
   }
 }
@@ -81,6 +83,7 @@ export async function captureGpuiGeneratedWithRuntime(opts: {
     caseDir: opts.caseDir,
     generatedPath: opts.generatedPath,
     gpuiPath: resolve(opts.runtime.gpuiPreviewDir, 'vendor/gpui'),
+    cargoLockPath: opts.runtime.cargoLockPath,
     width: opts.width,
     height: opts.height,
     outputScale: opts.outputScale,
@@ -100,6 +103,7 @@ async function writeRuntimeProject(opts: {
   caseDir: string
   generatedPath: string
   gpuiPath: string
+  cargoLockPath: string
   width: number
   height: number
   outputScale: number
@@ -118,12 +122,17 @@ gpui = { path = ${JSON.stringify(opts.gpuiPath)} }
 image = { version = "0.25.9", default-features = false, features = ["png"] }
 `,
   )
+  await copyFile(opts.cargoLockPath, resolve(opts.caseDir, 'Cargo.lock'))
+  const generatedHash = createHash('sha1')
+    .update(await readFile(opts.generatedPath))
+    .digest('hex')
   await writeFile(
     resolve(opts.caseDir, 'src/main.rs'),
-    `use anyhow::Result;
+    `// generated source hash: ${generatedHash}
+use anyhow::Result;
 use gpui::{
     px, point, size, App, Application, AssetSource, Bounds, SharedString, WindowBounds,
-    WindowOptions,
+    WindowKind, WindowOptions,
 };
 use gpui::prelude::*;
 use std::borrow::Cow;
@@ -176,8 +185,14 @@ fn main() {
             }
         }
 
+        let hide_window = std::env::var_os("PIXPEC_GPUI_SHOW_WINDOW").is_none();
+        let origin = if hide_window {
+            point(px(-100000.0), px(-100000.0))
+        } else {
+            point(px(0.0), px(0.0))
+        };
         let bounds = Bounds::new(
-            point(px(0.0), px(0.0)),
+            origin,
             size(
                 px(${float(opts.width)} * ${float(opts.outputScale)}),
                 px(${float(opts.height)} * ${float(opts.outputScale)}),
@@ -187,7 +202,8 @@ fn main() {
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
                 focus: false,
-                show: false,
+                show: true,
+                kind: WindowKind::PopUp,
                 is_resizable: false,
                 app_id: Some("pixpec-gpui-capture".to_string()),
                 ..Default::default()
@@ -282,9 +298,12 @@ fn collect_font_files(dir: &Path, out: &mut Vec<Cow<'static, [u8]>>) {
 
 async function ensurePatchedGpui(): Promise<string> {
   const fromEnv = process.env.PIXPEC_GPUI_PREVIEW_DIR
-  if (fromEnv && existsSync(resolve(fromEnv, 'vendor/gpui'))) return fromEnv
+  if (fromEnv && existsSync(resolve(fromEnv, 'vendor/gpui'))) {
+    await ensureHiddenWindowPatch(resolve(fromEnv, 'vendor/gpui'))
+    return fromEnv
+  }
 
-  const dir = resolve(tmpdir(), 'pixpec-gpui-preview')
+  const dir = resolve(reusableWorkdir(), 'pixpec-gpui-preview')
   if (!existsSync(resolve(dir, 'vendor/gpui'))) {
     await rm(dir, { recursive: true, force: true })
     await execFileStrict('git', [
@@ -295,11 +314,26 @@ async function ensurePatchedGpui(): Promise<string> {
       dir,
     ])
   }
+  await ensureHiddenWindowPatch(resolve(dir, 'vendor/gpui'))
   return dir
 }
 
+async function ensureHiddenWindowPatch(gpuiDir: string): Promise<void> {
+  const windowPath = resolve(gpuiDir, 'src/window.rs')
+  const source = await readFile(windowPath, 'utf8')
+  if (source.includes('if show {\n            platform_window.map_window().unwrap();\n        }')) return
+  const next = source.replace(
+    '        platform_window.map_window().unwrap();\n',
+    '        if show {\n            platform_window.map_window().unwrap();\n        }\n',
+  )
+  if (next === source) {
+    throw new Error(`GPUI hidden-window patch failed: ${windowPath}`)
+  }
+  await writeFile(windowPath, next)
+}
+
 async function ensureLinkerLibs(): Promise<string> {
-  const dir = '/tmp/pixpec-gpui-libs'
+  const dir = resolve(reusableWorkdir(), 'pixpec-gpui-libs')
   await mkdir(dir, { recursive: true })
   await forceSymlink('/lib/x86_64-linux-gnu/libxcb.so.1', resolve(dir, 'libxcb.so'))
   await forceSymlink('/lib/x86_64-linux-gnu/libxkbcommon.so.0', resolve(dir, 'libxkbcommon.so'))
@@ -308,6 +342,15 @@ async function ensureLinkerLibs(): Promise<string> {
     resolve(dir, 'libxkbcommon-x11.so'),
   )
   return dir
+}
+
+function reusableWorkdir(): string {
+  const explicit = process.env.PIXPEC_WORKDIR || process.env.PIXPEC_CACHE_DIR
+  if (explicit) return explicit
+  const current = process.cwd()
+  const pixpecWorkdir = '/home/rycont/dev/pixpec-workdir'
+  if (current === pixpecWorkdir || current.startsWith(`${pixpecWorkdir}/`)) return pixpecWorkdir
+  return resolve(current, '..')
 }
 
 async function prepareGpuiFontDir(runtimeDir: string): Promise<string | undefined> {
@@ -394,10 +437,12 @@ function sharedCargoEnv(
   libDir: string,
   fontDir?: string,
 ): NodeJS.ProcessEnv {
+  const hideWindow = process.env.PIXPEC_GPUI_SHOW_WINDOW !== '1'
   return {
     ...process.env,
     CARGO_TARGET_DIR: resolve(runtimeDir, 'target'),
     LIBRARY_PATH: libDir,
+    ...(hideWindow ? { WAYLAND_DISPLAY: '' } : {}),
     ...(fontDir ? { PIXPEC_GPUI_FONT_DIR: fontDir } : {}),
   }
 }

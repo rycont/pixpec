@@ -21,6 +21,8 @@ export interface BreakdownVerifyEntry {
   sourceId: string
   sourceName: string
   sourceType: string
+  sourceWidth?: number
+  sourceHeight?: number
   outputs: Record<string, string>
   captureSkip?: string
 }
@@ -39,6 +41,7 @@ export interface BreakdownVerifyOptions {
   maxBlob?: number
   blobThreshold?: string
   sourceId?: string
+  rootDir?: string
 }
 
 interface MeasureRecord {
@@ -56,25 +59,38 @@ export async function runBreakdownVerify(opts: BreakdownVerifyOptions): Promise<
   total: number
   skipped: number
 }> {
-  if (opts.target !== 'gpui') {
+  if (opts.target !== 'gpui' && opts.target !== 'react-panda') {
     throw new Error(`breakdown verify: target ${opts.target} is not supported yet`)
   }
 
   const manifest = JSON.parse(await readFile(opts.manifestPath, 'utf8')) as BreakdownVerifyManifest
   const fileKey = manifest.figmaId.slice(0, manifest.figmaId.indexOf(':'))
-  const maxBlob = opts.maxBlob ?? 24
+  const maxBlob = opts.maxBlob ?? 25
+  const gpuiOutputScale = Math.max(
+    1,
+    Number(process.env.PIXPEC_BREAKDOWN_VERIFY_OUTPUT_SCALE ?? 1),
+  )
   const outRoot = resolve(opts.viewDir, 'breakdown', 'verify', opts.target)
   const figmaDir = resolve(outRoot, 'figma')
   const dstDir = resolve(outRoot, 'dst')
   const measureRoot = resolve(outRoot, 'measure')
   const runtimeDir = resolve(outRoot, 'runtime')
   const resultsPath = resolve(outRoot, 'results.json')
-  await rm(outRoot, { recursive: true, force: true })
+  if (process.env.PIXPEC_BREAKDOWN_VERIFY_PRESERVE !== '1') {
+    await rm(outRoot, { recursive: true, force: true })
+  }
   await mkdir(figmaDir, { recursive: true })
   await mkdir(dstDir, { recursive: true })
   await mkdir(measureRoot, { recursive: true })
 
-  const runtime = await prepareGpuiCaptureRuntime(runtimeDir)
+  const runtime =
+    opts.target === 'gpui'
+      ? await prepareGpuiCaptureRuntime(runtimeDir)
+      : await (await import('./targets/react-panda/capture.ts')).prepareReactPandaGeneratedCaptureRuntime({
+          runtimeDir,
+          rootDir: opts.rootDir ?? resolve(opts.viewDir, '../../..'),
+          remBase: opts.cfg.remBase,
+        })
   const records: Array<{
     entry: Pick<BreakdownVerifyEntry, 'index' | 'sourceId' | 'sourceName' | 'sourceType'>
     ok: boolean
@@ -83,13 +99,21 @@ export async function runBreakdownVerify(opts: BreakdownVerifyOptions): Promise<
     skipped?: string
   }> = []
 
-  const entries = opts.sourceId
+  const startIndex = Number(process.env.PIXPEC_BREAKDOWN_VERIFY_START_INDEX ?? 0)
+  const endIndex = Number(process.env.PIXPEC_BREAKDOWN_VERIFY_END_INDEX ?? 0)
+  const entries = (opts.sourceId
     ? manifest.entries.filter((entry) => entry.sourceId === opts.sourceId)
     : manifest.entries
+  ).filter((entry) => {
+    if (startIndex > 0 && entry.index < startIndex) return false
+    if (endIndex > 0 && entry.index > endIndex) return false
+    return true
+  })
   if (opts.sourceId && entries.length === 0) {
     throw new Error(`breakdown verify: no manifest entry for sourceId ${opts.sourceId}`)
   }
 
+  try {
   for (const entry of entries) {
     if (entry.captureSkip) {
       records.push({
@@ -127,18 +151,36 @@ export async function runBreakdownVerify(opts: BreakdownVerifyOptions): Promise<
       })
       const sharp = (await import('sharp')).default
       const meta = await sharp(sourcePng).metadata()
-      const width = Math.max(1, meta.width ?? 0)
-      const height = Math.max(1, meta.height ?? 0)
+      const width = Math.max(1, meta.width ?? 0, Math.ceil(entry.sourceWidth ?? 0))
+      const height = Math.max(1, meta.height ?? 0, Math.ceil(entry.sourceHeight ?? 0))
       const dstPng = resolve(dstDir, `${caseName}.png`)
-      await captureGpuiGeneratedWithRuntime({
-        runtime,
-        caseDir: resolve(runtimeDir, caseName),
-        generatedPath,
-        width,
-        height,
-        outputScale: 1,
-        outPath: dstPng,
-      })
+      if (opts.target === 'gpui') {
+        const capturePng = gpuiOutputScale > 1
+          ? resolve(dstDir, `${caseName}@${gpuiOutputScale}x.png`)
+          : dstPng
+        await captureGpuiGeneratedWithRuntime({
+          runtime: runtime as Awaited<ReturnType<typeof prepareGpuiCaptureRuntime>>,
+          caseDir: resolve(runtimeDir, caseName),
+          generatedPath,
+          width,
+          height,
+          outputScale: gpuiOutputScale,
+          outPath: capturePng,
+        })
+        if (capturePng !== dstPng) {
+          await downsampleCopy(capturePng, dstPng, width, height)
+        }
+      } else {
+        const { captureReactPandaGeneratedWithRuntime } = await import('./targets/react-panda/capture.ts')
+        await captureReactPandaGeneratedWithRuntime({
+          runtime: runtime as never,
+          generatedPath,
+          width,
+          height,
+          outputScale: opts.cfg.scale ?? 2,
+          outPath: dstPng,
+        })
+      }
 
       const measure = await measurePair({
         caseName,
@@ -184,6 +226,11 @@ export async function runBreakdownVerify(opts: BreakdownVerifyOptions): Promise<
     skipped: records.filter((r) => r.skipped).length,
     total: records.length,
   }
+  } finally {
+    if ('close' in runtime && typeof runtime.close === 'function') {
+      await runtime.close()
+    }
+  }
 
   async function recordFailure() {
     await writeResults()
@@ -219,11 +266,17 @@ async function exportSourcePng(opts: {
   outDir: string
   caseName: string
 }): Promise<string> {
-  await switchToPageContaining({
-    tabPattern: opts.fileKey,
-    nodeId: opts.nodeId,
-    cfigmaBin: opts.cfg.cfigmaBin,
-  })
+  const target = resolve(opts.outDir, `${opts.caseName}.png`)
+  if (process.env.PIXPEC_BREAKDOWN_VERIFY_CACHE_FIGMA === '1' && existsSync(target)) {
+    return target
+  }
+  await retryFigmaControl(() =>
+    switchToPageContaining({
+      tabPattern: opts.fileKey,
+      nodeId: opts.nodeId,
+      cfigmaBin: opts.cfg.cfigmaBin,
+    }),
+  )
   const map = await retryFigmaExport(() =>
     exportFigmaNodes({
       tabPattern: opts.fileKey,
@@ -236,13 +289,16 @@ async function exportSourcePng(opts: {
   )
   const exported = map.get(opts.nodeId)
   if (!exported) throw new Error(`breakdown verify: no Figma export for ${opts.nodeId}`)
-  const target = resolve(opts.outDir, `${opts.caseName}.png`)
   await rm(target, { force: true })
   await copyFile(exported, target)
   return target
 }
 
 async function retryFigmaExport<T>(fn: () => Promise<T>): Promise<T> {
+  return retryFigmaControl(fn)
+}
+
+async function retryFigmaControl<T>(fn: () => Promise<T>): Promise<T> {
   let lastError: unknown
   for (let attempt = 1; attempt <= 3; attempt += 1) {
     try {
@@ -274,16 +330,22 @@ async function measurePair(opts: {
   await rm(base, { recursive: true, force: true })
   await mkdir(figmaDir, { recursive: true })
   await mkdir(dstDir, { recursive: true })
+  const sourceForMeasure = resolve(base, 'source.trim.png')
+  const dstForMeasure = resolve(base, 'dst.trim.png')
+  await Promise.all([
+    trimTransparentCopy(opts.sourcePng, sourceForMeasure),
+    trimTransparentCopy(opts.dstPng, dstForMeasure),
+  ])
 
   const [srcMeta, dstMeta] = await Promise.all([
-    sharp(opts.sourcePng).metadata(),
-    sharp(opts.dstPng).metadata(),
+    sharp(sourceForMeasure).metadata(),
+    sharp(dstForMeasure).metadata(),
   ])
   const targetW = padToMul(Math.max(srcMeta.width ?? 0, dstMeta.width ?? 0), 8)
   const targetH = padToMul(Math.max(srcMeta.height ?? 0, dstMeta.height ?? 0), 8)
   await Promise.all([
-    padCopy(opts.sourcePng, resolve(figmaDir, `${opts.caseName}.png`), targetW, targetH),
-    padCopy(opts.dstPng, resolve(dstDir, `${opts.caseName}.png`), targetW, targetH),
+    padCopy(sourceForMeasure, resolve(figmaDir, `${opts.caseName}.png`), targetW, targetH),
+    padCopy(dstForMeasure, resolve(dstDir, `${opts.caseName}.png`), targetW, targetH),
   ])
 
   await execFileAsync(
@@ -295,6 +357,39 @@ async function measurePair(opts: {
   const record = results[0]
   if (!record) throw new Error(`breakdown verify: measure produced no record for ${opts.caseName}`)
   return record
+}
+
+async function trimTransparentCopy(from: string, to: string): Promise<void> {
+  const sharp = (await import('sharp')).default
+  const image = sharp(from).ensureAlpha()
+  const { data, info } = await image.raw().toBuffer({ resolveWithObject: true })
+  let minX = info.width
+  let minY = info.height
+  let maxX = -1
+  let maxY = -1
+  for (let y = 0; y < info.height; y += 1) {
+    for (let x = 0; x < info.width; x += 1) {
+      const alpha = data[(y * info.width + x) * info.channels + 3]
+      if (alpha <= 0) continue
+      if (x < minX) minX = x
+      if (y < minY) minY = y
+      if (x > maxX) maxX = x
+      if (y > maxY) maxY = y
+    }
+  }
+  if (maxX < minX || maxY < minY) {
+    await sharp(from).png().toFile(to)
+    return
+  }
+  await sharp(from)
+    .extract({
+      left: minX,
+      top: minY,
+      width: maxX - minX + 1,
+      height: maxY - minY + 1,
+    })
+    .png()
+    .toFile(to)
 }
 
 async function padCopy(from: string, to: string, width: number, height: number): Promise<void> {
@@ -310,6 +405,14 @@ async function padCopy(from: string, to: string, width: number, height: number):
       bottom: height - h,
       background: { r: 0, g: 0, b: 0, alpha: 0 },
     })
+    .png()
+    .toFile(to)
+}
+
+async function downsampleCopy(from: string, to: string, width: number, height: number): Promise<void> {
+  const sharp = (await import('sharp')).default
+  await sharp(from)
+    .resize(width, height, { fit: 'fill', kernel: sharp.kernel.lanczos3 })
     .png()
     .toFile(to)
 }

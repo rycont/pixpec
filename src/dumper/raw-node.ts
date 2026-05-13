@@ -79,6 +79,7 @@ export interface RawNode {
   name: string;
   type: string;
   visible?: boolean;
+  isMask?: boolean;
   /** Bounding-box dim (post-rotation if rotation set; figma quirks). */
   width?: number;
   height?: number;
@@ -88,6 +89,8 @@ export interface RawNode {
   /** Position relative to parent. */
   x?: number;
   y?: number;
+  absoluteBoundingBox?: { x: number; y: number; width: number; height: number };
+  absoluteRenderBounds?: { x: number; y: number; width: number; height: number } | null;
   /** Rotation in degrees CCW. */
   rotation?: number;
   /** Layer-level opacity (0..1). */
@@ -121,6 +124,9 @@ export interface RawNode {
   primaryAxisAlignItems?: "MIN" | "CENTER" | "MAX" | "SPACE_BETWEEN";
   layoutWrap?: "NO_WRAP" | "WRAP";
   fills?: RawPaint[];
+  /** Figma-rendered PNG for bitmap-backed shape nodes whose image crop math
+   *  is renderer-specific. Only set for image fills, never for text/vector. */
+  renderedDataUrl?: string;
   strokes?: RawPaint[];
   effects?: RawEffect[];
   strokeWeight?: number;

@@ -11,7 +11,8 @@ export async function emitContainer(
   n: DFlex | DStack | DBox,
   ctx: GpuiEmitContext,
   indent: number,
-  emitChild: (n: DNode, ctx: GpuiEmitContext, indent: number) => Promise<string>,
+  emitChild: (n: DNode, ctx: GpuiEmitContext, indent: number, parentDirection?: FlowDirection) => Promise<string>,
+  parentDirection?: FlowDirection,
 ): Promise<string> {
   const chain = div(indent)
   const direction =
@@ -25,7 +26,7 @@ export async function emitContainer(
     chain.method('flex')
     if (direction === FlowDirection.Column) chain.method('flex_col')
   }
-  addSizing(chain, n, ctx)
+  addSizing(chain, n, ctx, parentDirection)
   addNodeLayout(chain, n, ctx)
   addContainerStyles(chain, n, ctx)
 
@@ -42,7 +43,7 @@ export async function emitContainer(
   }
 
   for (const child of n.children) {
-    chain.child(await emitChild(child, ctx, indent + 2))
+    chain.child(await emitChild(child, ctx, indent + 2, direction))
   }
   return chain.toString()
 }

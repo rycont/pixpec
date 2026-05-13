@@ -802,7 +802,10 @@ ${Object.entries(schemaDefs)
       }
       const nested = detectedNestedProps.find((n) => n.propName === name);
       if (nested) {
-        const access = `${optionalPropAccess("raw.nestedProps", nested.layerName)}?.${propsKey(nested.propKey)}`;
+        const access = optionalPropAccess(
+          optionalPropAccess("raw.nestedProps", nested.layerName),
+          nested.propKey,
+        );
         return [`      ${k}: ${access},`];
       }
       if (def.type === "INSTANCE_SWAP") {

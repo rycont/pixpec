@@ -135,6 +135,7 @@ export class Renderer {
     viewport: { width: number; height: number };
     outputScale: number;
     remBase: number;
+    caseBox?: { width: number; height: number };
   }): Promise<BatchSession> {
     const remPx = (opts.remBase * opts.outputScale) / VERIFY_DPR;
     const ctx: BrowserContext = await this.browser.newContext({
@@ -143,6 +144,11 @@ export class Renderer {
     });
     const page = await ctx.newPage();
     await page.addInitScript({ content: buildInitScript(remPx) });
+    if (opts.caseBox) {
+      await page.addInitScript({
+        content: `window.__pixpecGeneratedCaseBox=${JSON.stringify(opts.caseBox)};`,
+      });
+    }
     let lastError: Error | null = null;
     page.on("console", (m) => {
       if (m.type() === "error" || process.env.PIXPEC_DEBUG) {
@@ -212,10 +218,22 @@ export class Renderer {
         // Harness post-mount.
         await waitForFontSettle(page);
         await page.evaluate(() => (window as any).__pixpecSettle());
+        await page.evaluate(
+          () =>
+            new Promise((resolve) =>
+              requestAnimationFrame(() =>
+                requestAnimationFrame(() => resolve(undefined)),
+              ),
+            ),
+        );
+        await page.waitForTimeout(100);
         if (lastError) throw lastError;
       },
       async screenshot(selector: string, outPath: string) {
-        await page.locator(selector).first().screenshot({ path: outPath });
+        await page.locator(selector).first().screenshot({
+          path: outPath,
+          omitBackground: true,
+        });
       },
       async screenshotMany(items) {
         const specs = items.map((it) => ({
@@ -405,10 +423,12 @@ export class Renderer {
         await Promise.all(
           items.map(async (item, i) => {
             const b = bounds[i]!;
-            const left = Math.max(0, Math.round((b.x - clipX) * dpr));
-            const top = Math.max(0, Math.round((b.y - clipY) * dpr));
-            const wantW = Math.round(b.w * dpr);
-            const wantH = Math.round(b.h * dpr);
+            const left = Math.max(0, Math.floor((b.x - clipX) * dpr));
+            const top = Math.max(0, Math.floor((b.y - clipY) * dpr));
+            const right = Math.ceil((b.x + b.w - clipX) * dpr);
+            const bottom = Math.ceil((b.y + b.h - clipY) * dpr);
+            const wantW = Math.max(1, right - left);
+            const wantH = Math.max(1, bottom - top);
             const haveW = Math.min(wantW, fullW - left);
             const haveH = Math.min(wantH, fullH - top);
             if (haveW <= 0 || haveH <= 0) {

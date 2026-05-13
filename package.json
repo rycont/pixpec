@@ -21,6 +21,7 @@
     "typecheck": "tsgo --noEmit"
   },
   "dependencies": {
+    "@pandacss/dev": "1.10.0",
     "@playwright/test": "^1.48.0",
     "@techstark/opencv-js": "^4.12.0-release.1",
     "@typescript/native-preview": "7.0.0-dev.20260506.1",

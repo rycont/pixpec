@@ -47,6 +47,7 @@ import {
   TextDecoration,
   TextAlign,
   ShapeKind,
+  StrokeAlign,
   StrokeCap,
   FlowDirection,
 } from "./design-ast.ts";
@@ -104,8 +105,6 @@ export interface CompileOptions {
 function isPureVisualSubtree(n: RawNode): boolean {
   if (n.type === "TEXT" || n.type === "INSTANCE" || n.type === "COMPONENT_SET")
     return false;
-  if (FRAMELIKE.has(n.type) && n.layoutMode && n.layoutMode !== "NONE")
-    return false;
   if (FRAMELIKE.has(n.type) || n.type === "GROUP") {
     for (const c of n.children ?? []) {
       if (c.visible === false) continue;
@@ -115,6 +114,15 @@ function isPureVisualSubtree(n: RawNode): boolean {
   }
   if (SHAPELIKE.has(n.type) || VECTORLIKE.has(n.type)) return true;
   return false;
+}
+
+function isDetachedPureVisualInstance(n: RawNode): boolean {
+  if (n.type !== "INSTANCE") return false;
+  for (const c of n.children ?? []) {
+    if (c.visible === false) continue;
+    if (!isPureVisualSubtree(c)) return false;
+  }
+  return true;
 }
 
 /** All shape/vector descendants carry constraints `{ horizontal: 'SCALE',
@@ -132,6 +140,7 @@ function allChildrenSafeToFold(
     // resize semantics. Recurse without checking the container itself.
     if (
       FRAMELIKE.has(c.type) ||
+      c.type === "INSTANCE" ||
       c.type === "GROUP" ||
       c.type === "BOOLEAN_OPERATION"
     ) {
@@ -155,7 +164,7 @@ function allChildrenSafeToFold(
 }
 
 const SHAPELIKE = new Set(["RECTANGLE", "ELLIPSE", "POLYGON", "STAR", "LINE"]);
-const VECTORLIKE = new Set(["VECTOR", "BOOLEAN_OPERATION", "GROUP"]);
+const VECTORLIKE = new Set(["VECTOR", "BOOLEAN_OPERATION"]);
 const FRAMELIKE = new Set(["FRAME", "COMPONENT", "COMPONENT_SET"]);
 
 /** Shape-like figma node with neither paint nor stroke renders to nothing —
@@ -245,6 +254,32 @@ function justifyFromRaw(
 
 function px(n: number): Size {
   return { value: n, unit: "px" };
+}
+
+function isOrthogonalSwapRotation(n: RawNode): boolean {
+  if (typeof n.rotation !== "number") return false;
+  const normalized = ((n.rotation % 360) + 360) % 360;
+  return Math.abs(normalized - 90) < 0.01 || Math.abs(normalized - 270) < 0.01;
+}
+
+function nodeWidth(n: RawNode): number | undefined {
+  return isOrthogonalSwapRotation(n) ? n.height : n.width;
+}
+
+function nodeHeight(n: RawNode): number | undefined {
+  return isOrthogonalSwapRotation(n) ? n.width : n.height;
+}
+
+function nodeWidthVar(n: RawNode): string | undefined {
+  return isOrthogonalSwapRotation(n)
+    ? varId(n.boundVariables, "height")
+    : varId(n.boundVariables, "width");
+}
+
+function nodeHeightVar(n: RawNode): string | undefined {
+  return isOrthogonalSwapRotation(n)
+    ? varId(n.boundVariables, "width")
+    : varId(n.boundVariables, "height");
 }
 
 function tokenLookupKeys(varId: string): string[] {
@@ -406,7 +441,7 @@ function buildBase(
   if (typeof n.opacity === "number" && n.opacity < 1) out.opacity = n.opacity;
   if (typeof n.rotation === "number" && Math.abs(n.rotation) >= 0.01)
     out.rotation = n.rotation;
-  if (n.layoutPositioning === "ABSOLUTE") {
+  if (parent && n.layoutPositioning === "ABSOLUTE") {
     out.positioning = Positioning.Absolute;
     out.inset = { left: n.x ?? 0, top: n.y ?? 0 };
     if (
@@ -433,15 +468,31 @@ function buildBase(
     typeof n.layoutSizingHorizontal === "string" ||
     typeof n.layoutSizingVertical === "string"
   ) {
+    const swapAxes = isOrthogonalSwapRotation(n);
     out.sizing = {
-      horizontal: sizingFromRaw(n.layoutSizingHorizontal),
-      vertical: sizingFromRaw(n.layoutSizingVertical),
+      horizontal: sizingFromRaw(
+        swapAxes ? n.layoutSizingVertical : n.layoutSizingHorizontal,
+      ),
+      vertical: sizingFromRaw(
+        swapAxes ? n.layoutSizingHorizontal : n.layoutSizingVertical,
+      ),
     };
   }
   const bareId = stripPrefix(n.id);
   const binding = opts.bindings?.[bareId];
+  out.renderBoundsOffset = renderBoundsOffsetFromRaw(n);
   if (binding?.node?.visible) out.visibilityBinding = binding.node.visible;
   return out;
+}
+
+function renderBoundsOffsetFromRaw(n: RawNode): { x: number; y: number } | undefined {
+  const bb = n.absoluteBoundingBox;
+  const rb = n.absoluteRenderBounds;
+  if (!bb || !rb) return undefined;
+  const x = rb.x - bb.x;
+  const y = rb.y - bb.y;
+  if (Math.abs(x) < 0.001 && Math.abs(y) < 0.001) return undefined;
+  return { x, y };
 }
 
 function compileText(
@@ -554,10 +605,11 @@ async function compileShape(
     return {
       ...buildBase(n, opts, parent),
       kind: NodeKind.Image,
-      width: pickSize(n.width, varId(n.boundVariables, "width"), opts) ?? px(0),
+      width: pickSize(nodeWidth(n), nodeWidthVar(n), opts) ?? px(0),
       height:
-        pickSize(n.height, varId(n.boundVariables, "height"), opts) ?? px(0),
+        pickSize(nodeHeight(n), nodeHeightVar(n), opts) ?? px(0),
       dataUrl: imageFill.dataUrl,
+      renderedDataUrl: n.renderedDataUrl,
       imageScaleMode: imageFill.scaleMode,
       imageTransform: imageFill.imageTransform,
     };
@@ -585,9 +637,9 @@ async function compileShape(
             : n.type === "POLYGON"
               ? ShapeKind.Polygon
               : ShapeKind.Star,
-    width: pickSize(n.width, varId(n.boundVariables, "width"), opts) ?? px(0),
+    width: pickSize(nodeWidth(n), nodeWidthVar(n), opts) ?? px(0),
     height:
-      pickSize(n.height, varId(n.boundVariables, "height"), opts) ?? px(0),
+      pickSize(nodeHeight(n), nodeHeightVar(n), opts) ?? px(0),
     fill: pickColor(fill, fillVarId, opts),
     stroke: stroke
       ? {
@@ -597,6 +649,14 @@ async function compileShape(
           width:
             strokeWidth ??
             px(typeof n.strokeWeight === "number" ? n.strokeWeight : 1),
+          align:
+            n.strokeAlign === "INSIDE"
+              ? StrokeAlign.Inside
+              : n.strokeAlign === "OUTSIDE"
+                ? StrokeAlign.Outside
+                : n.strokeAlign === "CENTER"
+                  ? StrokeAlign.Center
+                  : undefined,
           cap:
             n.strokeCap === "ROUND"
               ? StrokeCap.Round
@@ -692,6 +752,7 @@ async function compileVector(
       width: w,
       height: h,
       svg,
+      renderBoundsOffset: renderBoundsOffsetFromRaw(n),
     };
   }
   return {
@@ -762,8 +823,8 @@ async function compileContainer(
   const binding = opts.bindings?.[bareId];
   const common = {
     ...buildBase(n, opts, parent),
-    width: pickSize(n.width, varId(n.boundVariables, "width"), opts),
-    height: pickSize(n.height, varId(n.boundVariables, "height"), opts),
+    width: pickSize(nodeWidth(n), nodeWidthVar(n), opts),
+    height: pickSize(nodeHeight(n), nodeHeightVar(n), opts),
     minWidth: pickSize(n.minWidth, varId(n.boundVariables, "minWidth"), opts),
     maxWidth: pickSize(n.maxWidth, varId(n.boundVariables, "maxWidth"), opts),
     minHeight: pickSize(
@@ -796,6 +857,14 @@ async function compileContainer(
                 }
               : (strokeWidth ??
                 px(typeof n.strokeWeight === "number" ? n.strokeWeight : 1)),
+          align:
+            n.strokeAlign === "INSIDE"
+              ? StrokeAlign.Inside
+              : n.strokeAlign === "OUTSIDE"
+                ? StrokeAlign.Outside
+                : n.strokeAlign === "CENTER"
+                  ? StrokeAlign.Center
+                  : undefined,
         }
       : undefined,
     shadow: shadowFromRaw(n),
@@ -854,18 +923,28 @@ function applyAbsoluteChildPosition(
 ): void {
   if (out.positioning === Positioning.Absolute) return;
   out.positioning = Positioning.Absolute;
-  out.inset = { left: n.x ?? 0, top: n.y ?? 0 };
+  const left =
+    typeof n.absoluteBoundingBox?.x === "number" &&
+    typeof parent.absoluteBoundingBox?.x === "number"
+      ? n.absoluteBoundingBox.x - parent.absoluteBoundingBox.x
+      : (n.x ?? 0);
+  const top =
+    typeof n.absoluteBoundingBox?.y === "number" &&
+    typeof parent.absoluteBoundingBox?.y === "number"
+      ? n.absoluteBoundingBox.y - parent.absoluteBoundingBox.y
+      : (n.y ?? 0);
+  out.inset = { left, top };
   if (
     typeof parent.width === "number" &&
     typeof n.width === "number"
   ) {
-    out.inset.right = parent.width - (n.x ?? 0) - n.width;
+    out.inset.right = parent.width - left - n.width;
   }
   if (
     typeof parent.height === "number" &&
     typeof n.height === "number"
   ) {
-    out.inset.bottom = parent.height - (n.y ?? 0) - n.height;
+    out.inset.bottom = parent.height - top - n.height;
   }
   if (n.constraints) {
     const h = anchorFromConstraint(n.constraints.horizontal);
@@ -918,8 +997,8 @@ async function compileInstance(
     componentName: entry.componentName,
     props,
     defaultProps: entry.defaults,
-    width: pickSize(n.width, varId(n.boundVariables, "width"), opts),
-    height: pickSize(n.height, varId(n.boundVariables, "height"), opts),
+    width: pickSize(nodeWidth(n), nodeWidthVar(n), opts),
+    height: pickSize(nodeHeight(n), nodeHeightVar(n), opts),
   };
   // Surface per-instance-property bindings from the variant spec so the
   // emitter can render `<Icon Type={iconType}/>` etc.
@@ -1013,8 +1092,8 @@ function compileUnknown(
     ...buildBase(n, opts, parent),
     kind: NodeKind.Unknown,
     sourceType: n.type,
-    width: pickSize(n.width, undefined, opts) ?? px(0),
-    height: pickSize(n.height, undefined, opts) ?? px(0),
+    width: pickSize(nodeWidth(n), undefined, opts) ?? px(0),
+    height: pickSize(nodeHeight(n), undefined, opts) ?? px(0),
   };
 }
 
@@ -1024,6 +1103,12 @@ async function compileNode(
   parent?: RawNode,
   rawSubtree = false,
 ): Promise<DNode> {
+  if (n.isMask) {
+    return {
+      ...compileUnknown(n, opts, parent),
+      hidden: true,
+    };
+  }
   // Fold pure-visual subtrees (non-autolayout Frame/Group/Shape only, no
   // INSTANCE/TEXT inside) into a single DVector via figma SVG export. The
   // alternative — recursing children — loses absolute-position info on
@@ -1031,8 +1116,9 @@ async function compileNode(
   // captured in the raw dump.
   if (
     opts.exportSvg &&
-    isPureVisualSubtree(n) &&
-    (FRAMELIKE.has(n.type) || n.type === "GROUP") &&
+    (isPureVisualSubtree(n) ||
+      (opts.detachInstances && isDetachedPureVisualInstance(n))) &&
+    (FRAMELIKE.has(n.type) || n.type === "GROUP" || n.type === "INSTANCE") &&
     (n.children?.length ?? 0) > 0
   ) {
     const safe = allChildrenSafeToFold(n);
@@ -1049,6 +1135,7 @@ async function compileNode(
             pickSize(n.height, varId(n.boundVariables, "height"), opts) ??
             px(n.height ?? 0),
           svg,
+          renderBoundsOffset: renderBoundsOffsetFromRaw(n),
         };
       } catch {
         // Some detached-instance descendants have visible vector geometry but
@@ -1061,6 +1148,7 @@ async function compileNode(
   if (SHAPELIKE.has(n.type)) return compileShape(n, opts, parent);
   if (VECTORLIKE.has(n.type)) return compileVector(n, opts, parent);
   if (n.type === "INSTANCE") return compileInstance(n, opts, parent, rawSubtree);
+  if (n.type === "GROUP") return compileContainer(n, opts, parent, rawSubtree);
   if (FRAMELIKE.has(n.type)) return compileContainer(n, opts, parent, rawSubtree);
   return compileUnknown(n, opts, parent);
 }

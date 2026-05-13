@@ -57,6 +57,16 @@ export interface CodegenContext {
   componentsDir?: string
   /** Optional props file for component output. Omit for prop-less view output. */
   propsFile?: string
+  /** Optional view-level semantic transforms, loaded from src/view/<View>/view.config.json. */
+  viewConfig?: ViewCodegenConfig
+}
+
+export interface ViewCodegenConfig {
+  [sourceId: string]: {
+    repetition: {
+      childComponent: { name: string }
+    }
+  }
 }
 
 /** Minimal component metadata a target needs about a registered DInstance

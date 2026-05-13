@@ -1,5 +1,5 @@
 import type { DNode } from '../../../compiler/design-ast.ts'
-import { NodeKind } from '../../../compiler/design-ast.ts'
+import { FlowDirection, NodeKind } from '../../../compiler/design-ast.ts'
 import type { GpuiEmitContext } from './context.ts'
 import { emitContainer } from './container.ts'
 import { emitImage } from './image.ts'
@@ -10,12 +10,17 @@ import { emitText } from './text.ts'
 import { emitUnknown } from './unknown.ts'
 import { emitVector } from './vector.ts'
 
-export async function emitNode(n: DNode, ctx: GpuiEmitContext, indent: number): Promise<string> {
+export async function emitNode(
+  n: DNode,
+  ctx: GpuiEmitContext,
+  indent: number,
+  parentDirection?: FlowDirection,
+): Promise<string> {
   switch (n.kind) {
     case NodeKind.Flex:
     case NodeKind.Stack:
     case NodeKind.Box:
-      return emitContainer(n, ctx, indent, emitChildExpr)
+      return emitContainer(n, ctx, indent, emitChildExpr, parentDirection)
     case NodeKind.Text:
       return emitText(n, ctx, indent)
     case NodeKind.Shape:
@@ -31,12 +36,17 @@ export async function emitNode(n: DNode, ctx: GpuiEmitContext, indent: number): 
   }
 }
 
-export async function emitChildExpr(n: DNode, ctx: GpuiEmitContext, indent: number): Promise<string> {
-  if (!n.visibilityBinding) return emitNode(n, ctx, indent)
+export async function emitChildExpr(
+  n: DNode,
+  ctx: GpuiEmitContext,
+  indent: number,
+  parentDirection?: FlowDirection,
+): Promise<string> {
+  if (!n.visibilityBinding) return emitNode(n, ctx, indent, parentDirection)
 
   return [
     `${pad(indent)}if true {`,
-    await emitNode(n, ctx, indent + 1),
+    await emitNode(n, ctx, indent + 1, parentDirection),
     `${pad(indent)}} else {`,
     `${pad(indent + 1)}div()`,
     `${pad(indent)}}`,

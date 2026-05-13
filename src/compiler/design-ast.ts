@@ -89,6 +89,13 @@ export enum StrokeCap {
   Square = "square",
 }
 
+/** Stroke placement relative to the shape's geometry. */
+export enum StrokeAlign {
+  Inside = "inside",
+  Outside = "outside",
+  Center = "center",
+}
+
 /** Text horizontal alignment. */
 export enum TextAlign {
   Left = "left",
@@ -153,6 +160,7 @@ export interface CornerRadii {
 export interface Border {
   paint: Color;
   width: Size | { top: Size; right: Size; bottom: Size; left: Size };
+  align?: StrokeAlign;
 }
 
 export interface Shadow {
@@ -184,6 +192,8 @@ export interface DNodeBase {
   anchor?: { horizontal?: Anchor; vertical?: Anchor };
   /** Sibling sizing inside the parent container. */
   sizing?: { horizontal?: Sizing; vertical?: Sizing };
+  /** Offset from the node's design box to Figma's exported render bounds. */
+  renderBoundsOffset?: { x: number; y: number };
   /** Owner-component prop key whose boolean value gates this node's render.
    *  Emitter wraps the rendered element with a conditional. */
   visibilityBinding?: string;
@@ -287,6 +297,7 @@ export interface DShape extends DNodeBase {
   stroke?: {
     paint: Color;
     width: Size;
+    align?: StrokeAlign;
     /** End-cap shape on open paths (lines, vectors). */
     cap?: StrokeCap;
   };
@@ -309,6 +320,9 @@ export interface DImage extends DNodeBase {
   height: Size;
   /** `data:image/svg+xml;base64,...` URL. */
   dataUrl?: string;
+  /** Figma-rendered PNG for bitmap image-fill nodes when scale/crop semantics
+   *  need exact source-renderer output. */
+  renderedDataUrl?: string;
   imageScaleMode?: string;
   imageTransform?: [[number, number, number], [number, number, number]];
 }
@@ -345,6 +359,7 @@ export interface DInstance extends DNodeBase {
 export interface DUnknown extends DNodeBase {
   kind: NodeKind.Unknown;
   sourceType?: string;
+  hidden?: boolean;
   width: Size;
   height: Size;
 }
