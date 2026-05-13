@@ -1050,8 +1050,16 @@ function emitVector(n: DVector, ctx: Ctx): ast.JsxChild {
     const w = sizeToPx(n.width) ?? 0
     const h = sizeToPx(n.height) ?? 0
     if (n.svg.startsWith('data:')) {
+        ctx.usedJsxPatterns.add('styled')
+        const tag = () =>
+            f.createPropertyAccessExpression(
+                f.createIdentifier('styled'),
+                undefined,
+                f.createIdentifier('img'),
+                0 as ast.NodeFlags,
+            )
         return f.createJsxSelfClosingElement(
-            f.createIdentifier('img'),
+            tag(),
             undefined,
             f.createJsxAttributes([
                 f.createJsxAttribute(
@@ -1221,8 +1229,16 @@ function emitImage(n: DImage, ctx: Ctx): ast.JsxSelfClosingElement {
             f.createJsxAttributes([styleAttr(styles)]),
         )
     }
+    ctx.usedJsxPatterns.add('styled')
+    const tag = () =>
+        f.createPropertyAccessExpression(
+            f.createIdentifier('styled'),
+            undefined,
+            f.createIdentifier('img'),
+            0 as ast.NodeFlags,
+        )
     return f.createJsxSelfClosingElement(
-        f.createIdentifier('img'),
+        tag(),
         undefined,
         f.createJsxAttributes([
             f.createJsxAttribute(
