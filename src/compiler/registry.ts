@@ -33,14 +33,20 @@ export interface NodeBindingValue {
 /** Per-master-node-id → which figma fields are bound to which prop. */
 export type NodeBindings = Record<string, NodeBindingValue>
 
+export interface RegistryVariant {
+  key: string
+  bindings: NodeBindings
+  propsFromFigma?: (raw: unknown, children?: unknown) => Record<string, unknown>
+}
+
 export interface RegistryEntry {
   componentName: string
   dir: string
   /** Defaults the master variants render at — used by emitters to elide
    *  redundant prop emissions on instance call sites. */
   defaults?: Record<string, unknown>
-  /** Caller-side prop hydrator: figma raw → typed props record. */
-  propsFromFigma?: (raw: unknown, children?: unknown) => Record<string, unknown>
+  /** Per-variant figma raw → typed props parser. */
+  variants: Record<string, RegistryVariant>
   /** Aggregated bindings across all variants (master node id → bindings). */
   bindings: NodeBindings
   /** Per-variant raw master snapshot, keyed by variant key (cross-file
@@ -91,7 +97,7 @@ async function loadOne(dir: string, indexPath: string): Promise<LoadedEntry | nu
   if (candidates.length === 0) return null
   const comp = candidates[0]
   const componentName = String(comp.name)
-  const figma = (comp.figma as { componentSetKey?: string | string[]; propsFromFigma?: (...a: unknown[]) => Record<string, unknown> } | undefined)
+  const figma = (comp.figma as { componentSetKey?: string | string[] } | undefined)
   const csk = figma?.componentSetKey
   const keys = Array.isArray(csk) ? csk : (csk ? [csk] : [])
   if (keys.length === 0) return null
@@ -99,6 +105,7 @@ async function loadOne(dir: string, indexPath: string): Promise<LoadedEntry | nu
     ?? (comp.defaults as Record<string, unknown> | undefined)
 
   const bindings = aggregateBindings(comp.variants)
+  const variants = collectVariants(comp.variants)
   const masterSnapshot = loadMasterSnapshot(dir)
   return {
     keys,
@@ -106,11 +113,43 @@ async function loadOne(dir: string, indexPath: string): Promise<LoadedEntry | nu
       componentName,
       dir,
       defaults,
-      propsFromFigma: figma?.propsFromFigma as RegistryEntry['propsFromFigma'],
+      variants,
       bindings,
       masterSnapshot,
     },
   }
+}
+
+function collectVariants(variants: unknown): Record<string, RegistryVariant> {
+  const out: Record<string, RegistryVariant> = {}
+  if (!Array.isArray(variants)) return out
+  for (const v of variants as Array<{
+    key?: string
+    bindings?: NodeBindings
+    propsFromFigma?: (raw: unknown, children?: unknown) => Record<string, unknown>
+  }>) {
+    if (!v.key) continue
+    out[v.key] = {
+      key: v.key,
+      bindings: v.bindings ?? {},
+      propsFromFigma: v.propsFromFigma,
+    }
+  }
+  return out
+}
+
+export function resolveRegistryVariant(
+  entry: RegistryEntry,
+  key?: string,
+  variantName?: string,
+): RegistryVariant | undefined {
+  if (key && entry.variants[key]) return entry.variants[key]
+  if (!variantName) return undefined
+  const snapshotEntry = Object.entries(entry.masterSnapshot).find(
+    ([, root]) => root.name === variantName,
+  )
+  if (!snapshotEntry) return undefined
+  return entry.variants[snapshotEntry[0]]
 }
 
 function aggregateBindings(variants: unknown): NodeBindings {

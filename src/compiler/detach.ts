@@ -22,7 +22,9 @@ import type {
   RawOverride,
   RawSolidPaint,
 } from "../dumper/raw-node.ts";
-import type { RegistryEntry, NodeBindingValue } from "./registry.ts";
+import type { RegistryEntry, NodeBindingValue, RegistryVariant } from "./registry.ts";
+import { resolveRegistryVariant } from "./registry.ts";
+import { BOX_WRAPPER_FIELDS, rawForPropsFromFigma, unconsumedOverridesForProps } from "./props-context.ts";
 
 // `pluginData` is figma's per-node plugin storage — pure metadata, no visual
 // effect. `annotations` are designer comments. Both can vary between
@@ -38,15 +40,30 @@ const NON_VISUAL = new Set([
 /** Root-frame layout flags carried via the {...rest} panda spread on the
  *  Generated component root — always covered. */
 const ROOT_LAYOUT_COVERED = new Set([
-  "width",
-  "height",
-  "primaryAxisSizingMode",
-  "counterAxisSizingMode",
-  "layoutGrow",
+  ...BOX_WRAPPER_FIELDS,
   "componentProperties",
 ]);
 
-export function shouldDetach(inst: RawNode, entry: RegistryEntry): boolean {
+export function shouldDetach(
+  inst: RawNode,
+  entry: RegistryEntry,
+  variant: RegistryVariant | undefined = resolveRegistryVariant(
+    entry,
+    inst.mainComponent?.key,
+    inst.mainComponent?.name,
+  ),
+): boolean {
+  if (variant?.propsFromFigma) {
+    const raw = rawForPropsFromFigma(inst);
+    let props: Record<string, unknown> = {};
+    try {
+      props = variant.propsFromFigma(raw, []) ?? {};
+    } catch {
+      return true;
+    }
+    return unconsumedOverridesForProps(raw, props, variant.bindings).length > 0;
+  }
+
   const overrides = inst.overrides ?? [];
   if (overrides.length === 0) return false;
   // Master snapshot is required to compare resolved values. A registered
@@ -136,12 +153,6 @@ function fieldValueEquivalent(
 ): boolean {
   switch (field) {
     case "fills":
-      // VECTOR/BOOLEAN_OPERATION fills get forwarded by emitter plugins as a
-      // parent CSS color (currentColor pattern — see danah's iconCurrentColor
-      // plugin). The receiving component reads the parent color, so a fills
-      // divergence here doesn't require detaching the instance.
-      if (inst.type === "VECTOR" || inst.type === "BOOLEAN_OPERATION")
-        return true;
       return paintListEquivalent(inst.fills, master.fills);
     case "strokes":
       return paintListEquivalent(inst.strokes, master.strokes);
@@ -176,6 +187,10 @@ function fieldValueEquivalent(
       return (inst.opacity ?? 1) === (master.opacity ?? 1);
     case "rotation":
       return (inst.rotation ?? 0) === (master.rotation ?? 0);
+    case "width":
+      return inst.width === master.width;
+    case "height":
+      return inst.height === master.height;
     case "boundVariables": {
       // boundVariables is meta; the visual outcome is captured by the
       // resolved style fields above. We treat the override as equivalent

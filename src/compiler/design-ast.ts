@@ -309,6 +309,8 @@ export interface DImage extends DNodeBase {
   height: Size;
   /** `data:image/svg+xml;base64,...` URL. */
   dataUrl?: string;
+  imageScaleMode?: string;
+  imageTransform?: [[number, number, number], [number, number, number]];
 }
 
 /** Reference to a registered design-system component. Emitter resolves the

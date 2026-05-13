@@ -437,10 +437,10 @@ export interface UsageInstance {
   /** Per-text-layer override `{ <layerName>: characters }`, only for
    * descendants whose `characters` differ from master default. */
   textOverrides: Record<string, string>;
-  /** Raw figma `inst.overrides` — list of { id, fields } per overridden
-   *  descendant. init checks each instance's overrides against the
-   *  detected props; any field not covered by an exposed prop drops the
-   *  whole instance from cases.ts (the "20% rule" extended to filtering). */
+  /** Raw figma `overrides` collected from the usage instance and every
+   * descendant that exposes its own override list. init checks each override
+   * against the detected props; any field not covered by an exposed prop
+   * drops the whole instance from cases.ts. */
   overrides?: Array<{ id: string; fields: string[] }>;
   /** Per-nested-INSTANCE override `{ <layerName>: { <propKey>: value } }`,
    * only entries that diverge from the nested master's default. */
@@ -465,6 +465,10 @@ export interface UsageInstance {
   textStyleOverrides?: Record<string, string>;
   width: number;
   height: number;
+  /** Figma InstanceNode.scaleFactor. Values other than 1 mean Figma scaled
+   * the whole component instance, including descendant geometry, without
+   * surfacing descendant width/height overrides. */
+  scaleFactor?: number | null;
   /** instance.mainComponent.id — which master variant this usage maps
    * to. init nests the usecase under that variant (figmaId-matched) in
    * cases.ts. `null` if the master can't be resolved (rare detached). */
@@ -516,6 +520,8 @@ export interface ChildVariationSample {
   childComponentSetName: string | null;
   childComponentName: string | null;
   children: Array<{
+    mainKey?: string | null;
+    mainComponentName?: string | null;
     componentProperties: Record<string, unknown>;
     textOverrides: Record<string, string>;
     nestedProps: Record<string, Record<string, string | boolean>>;
@@ -528,7 +534,7 @@ export interface InitScanResult {
   nestedPropSummaries: NestedPropSummary[];
   childVariations: ChildVariationSample[];
   /** One entry per matched INSTANCE — full per-usage raw dump that init
-   * hydrates inline to emit a case row per real usage. */
+   * builds inline to emit a case row per real usage. */
   usages: UsageInstance[];
   /** Total number of INSTANCE usages of the scanned componentSetKey.
    * init divides per-summary `overrideCount` by this to apply the
@@ -598,6 +604,7 @@ const perDesc = {};      // text layer name → { samples, overrideCount, ... }
 const perNested = {};    // "<layerName>|<propKey>" → { samples, overrideCount, ... }
 const usages = [];       // per-instance raw dump for case generation
 for (const inst of matches) {
+  const mc = inst.mainComponent;
   // text descendants
   const texts = inst.findAllWithCriteria({ types: ['TEXT'] });
   const overriddenIds = new Set();
@@ -658,12 +665,79 @@ for (const inst of matches) {
       }
     }
   }
+  const rawOverrides = [];
+  const rawOverrideKeys = new Set();
+  const resolvedNodeById = {};
+  const indexResolvedNode = (node) => {
+    resolvedNodeById[node.id] = node;
+    resolvedNodeById[stripPrefix(node.id)] = node;
+    for (const c of (node.children || [])) indexResolvedNode(c);
+  };
+  indexResolvedNode(inst);
+  const masterOverrideFieldsByDesc = {};
+  const masterOverrideFieldsByInstanceSig = {};
+  const instanceSig = (node) => {
+    if (!node || node.type !== 'INSTANCE') return null;
+    const nm = node.mainComponent;
+    let np = nm; while (np && np.type !== 'COMPONENT_SET') np = np.parent;
+    const key = (np && np.key) || (nm && nm.key) || null;
+    return key ? node.name + '|' + key : null;
+  };
+  if (mc) {
+    const indexMasterOverrideFields = (node) => {
+      const descId = stripPrefix(node.id);
+      const sig = instanceSig(node);
+      for (const ov of (node.overrides || [])) {
+        const ovDescId = stripPrefix(ov.id || node.id);
+        const key = ovDescId || descId;
+        const set = masterOverrideFieldsByDesc[key] = masterOverrideFieldsByDesc[key] || new Set();
+        for (const field of (ov.overriddenFields || [])) set.add(field);
+        if (sig) {
+          const sigSet = masterOverrideFieldsByInstanceSig[sig] = masterOverrideFieldsByInstanceSig[sig] || new Set();
+          for (const field of (ov.overriddenFields || [])) sigSet.add(field);
+        }
+      }
+      for (const c of (node.children || [])) indexMasterOverrideFields(c);
+    };
+    indexMasterOverrideFields(mc);
+  }
+  const addRawOverrideFields = (id, fields) => {
+    const clean = (fields || []).filter(Boolean);
+    if (!id || clean.length === 0) return;
+    const key = id + '\\u0000' + clean.slice().sort().join('\\u0001');
+    if (rawOverrideKeys.has(key)) return;
+    rawOverrideKeys.add(key);
+    rawOverrides.push({ id, fields: clean });
+  };
+  const fieldsAfterMasterImplementation = (id, fields, fallbackNode) => {
+    const node = resolvedNodeById[id] || resolvedNodeById[stripPrefix(id || '')] || fallbackNode;
+    const descId = stripPrefix(id || (node && node.id) || '');
+    const masterFields = masterOverrideFieldsByDesc[descId];
+    const sig = instanceSig(node);
+    const sigMasterFields = sig ? masterOverrideFieldsByInstanceSig[sig] : null;
+    return (fields || []).filter((field) =>
+      !(masterFields && masterFields.has(field)) &&
+      !(sigMasterFields && sigMasterFields.has(field))
+    );
+  };
+  const addRawOverride = (ov) => {
+    const id = ov && ov.id;
+    addRawOverrideFields(id, fieldsAfterMasterImplementation(id, ov && ov.overriddenFields || [], null));
+  };
+  for (const ov of (inst.overrides || [])) addRawOverride(ov);
+  const collectDescendantOverrides = (node) => {
+    for (const ov of (node.overrides || [])) {
+      const fields = fieldsAfterMasterImplementation(ov && ov.id, ov.overriddenFields || [], node);
+      addRawOverrideFields(ov.id, fields);
+    }
+    for (const c of (node.children || [])) collectDescendantOverrides(c);
+  };
+  for (const c of (inst.children || [])) collectDescendantOverrides(c);
   const ipprops = {};
   for (const [k, v] of Object.entries(inst.componentProperties || {})) ipprops[k] = v.value;
   // Capture the master variant's intrinsic dim so init can detect when
   // a usage overrode the root sizing (instance.width != mainComponent.width
   // or similar) — only those usages need a dim-locking wrapper.
-  const mc = inst.mainComponent;
   // Capture instance autolayout values + the master's, so init can diff
   // and emit explicit padding/gap props only when they were overridden
   // (most instances inherit master values, no override needed).
@@ -684,13 +758,22 @@ for (const inst of matches) {
   // Resolved fill colors per overridden descendant. init checks if all
   // entries share one hex; if so the usage can flow through the fill prop.
   const fillOverrides = {};
-  for (const ov of (inst.overrides || [])) {
-    if (!Array.isArray(ov.overriddenFields) || ov.overriddenFields.indexOf('fills') < 0) continue;
+  const firstSolid = (node) => {
+    if (!node || !Array.isArray(node.fills)) return null;
+    return node.fills.find(p => p && p.type === 'SOLID' && p.visible !== false) || null;
+  };
+  const paintKey = (fill) => {
+    if (!fill) return null;
+    const r = Math.round(fill.color.r * 255), g = Math.round(fill.color.g * 255), b = Math.round(fill.color.b * 255);
+    const opacity = typeof fill.opacity === 'number' ? fill.opacity : 1;
+    return [r, g, b, Math.round(opacity * 1000)].join(',');
+  };
+  const recordFillOverride = async (id) => {
     try {
-      const node = await figma.getNodeByIdAsync(ov.id);
-      if (!node || !Array.isArray(node.fills)) continue;
-      const fill = node.fills.find(p => p && p.type === 'SOLID' && p.visible !== false);
-      if (!fill) continue;
+      const node = await figma.getNodeByIdAsync(id);
+      if (!node || !Array.isArray(node.fills)) return;
+      const fill = firstSolid(node);
+      if (!fill) return;
       const r = Math.round(fill.color.r * 255), g = Math.round(fill.color.g * 255), b = Math.round(fill.color.b * 255);
       const hex = '#' + [r, g, b].map(v => v.toString(16).padStart(2, '0')).join('');
       const opacity = typeof fill.opacity === 'number' ? fill.opacity : 1;
@@ -707,8 +790,49 @@ for (const inst of matches) {
         }
         p = p.parent;
       }
-      fillOverrides[stripPrefix(ov.id)] = { hex, opacity, ownerInstanceId, ownerComponentSetKey };
+      fillOverrides[stripPrefix(id)] = { hex, opacity, ownerInstanceId, ownerComponentSetKey };
     } catch (_) { /* best-effort */ }
+  };
+  for (const ov of (inst.overrides || [])) {
+    if (!Array.isArray(ov.overriddenFields) || ov.overriddenFields.indexOf('fills') < 0) continue;
+    await recordFillOverride(ov.id);
+  }
+  const sourceInstanceId = inst.id && inst.id.indexOf(';') >= 0
+    ? inst.id.substring(inst.id.lastIndexOf(';') + 1)
+    : null;
+  if (sourceInstanceId) {
+    try {
+      const sourceInst = await figma.getNodeByIdAsync(sourceInstanceId);
+      if (sourceInst && sourceInst.type === 'INSTANCE') {
+        for (const ov of (sourceInst.overrides || [])) {
+          if (!Array.isArray(ov.overriddenFields) || ov.overriddenFields.indexOf('fills') < 0) continue;
+          await recordFillOverride(ov.id);
+        }
+      }
+    } catch (_) { /* best-effort */ }
+  }
+  // Some nested library instances inherit visual overrides from a library
+  // instance used as their source. Figma's inst.overrides on the consuming
+  // proxy can omit those inherited descendants, but rendered fills still
+  // differ from the master component. Compare resolved descendants against
+  // the main component so init can still decide whether the usage is
+  // representable by promoted props.
+  if (mc && inst.children && mc.children) {
+    const masterByDesc = {};
+    const indexMaster = (node) => {
+      masterByDesc[stripPrefix(node.id)] = node;
+      for (const c of (node.children || [])) indexMaster(c);
+    };
+    for (const c of (mc.children || [])) indexMaster(c);
+    const visitResolved = async (node) => {
+      const fill = firstSolid(node);
+      const master = masterByDesc[stripPrefix(node.id)];
+      if (fill && master && paintKey(fill) !== paintKey(firstSolid(master))) {
+        await recordFillOverride(node.id);
+      }
+      for (const c of (node.children || [])) await visitResolved(c);
+    };
+    for (const c of (inst.children || [])) await visitResolved(c);
   }
   const textStyleOverrides = {};
   for (const ov of (inst.overrides || [])) {
@@ -729,16 +853,13 @@ for (const inst of matches) {
     componentProperties: ipprops,
     textOverrides: instTextOverrides,
     nestedProps: instNested,
-    // Per-instance override field list — init filters out instances whose
-    // overrides aren't covered by the detected component props (the
-    // "uncovered overrides → detach" rule). Each entry is a node id plus
-    // the figma overriddenFields that diverge from master.
-    overrides: (inst.overrides || []).map(o => ({
-      id: o.id,
-      fields: (o.overriddenFields || []).slice(),
-    })),
+    // Per-instance + descendant override field list. Pixpec normalizes these
+    // later before propsFromFigma consume tracing, so this scan intentionally
+    // preserves Figma's raw field report.
+    overrides: rawOverrides,
     width: inst.width,
     height: inst.height,
+    scaleFactor: typeof inst.scaleFactor === 'number' ? inst.scaleFactor : null,
     mainNodeId: (mc && mc.id) || null,
     // mainComponent.key — durable cross-file identifier of the master
     // VARIANT (one entry of the COMPONENT_SET). Required when an
@@ -773,9 +894,10 @@ for (const inst of matches) {
   const childSnaps = [];
   // Container detection only needs to confirm the children are uniform
   // (same componentSet); per-key variation analysis is no longer used.
-  // The parent forwards each child's hydrated props wholesale, so what
+  // The parent forwards each child's built props wholesale, so what
   // matters at codegen is the child's TS interface, not figma variation.
   for (const c of kids) {
+    const cm = c.mainComponent;
     const cprops = {};
     for (const [k, v] of Object.entries(c.componentProperties || {})) cprops[k] = v.value;
     const tov = {};
@@ -791,7 +913,13 @@ for (const inst of matches) {
         for (const [pk, pv] of Object.entries(t.componentProperties || {})) layer[pk] = pv.value;
       }
     }
-    childSnaps.push({ componentProperties: cprops, textOverrides: tov, nestedProps: cNested });
+    childSnaps.push({
+      mainKey: (cm && cm.key) || null,
+      mainComponentName: (cm && cm.name) || null,
+      componentProperties: cprops,
+      textOverrides: tov,
+      nestedProps: cNested
+    });
   }
   // Parent metadata so init can emit one case per real usage:
   // id (instance node id, stripped to a stable in-file ref), name (for

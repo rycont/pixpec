@@ -1323,8 +1323,7 @@ function emitInstance(n: DInstance, ctx: Ctx, parent: ParentCtx): ast.JsxChild {
     }
     // Don't emit layout keys that the component itself already specifies via props.
     for (const k of Object.keys(n.props)) delete layoutStyles[k]
-    if (Object.keys(layoutStyles).length)
-        attrs.push(...attrsFromObject(layoutStyles))
+    if (Object.keys(layoutStyles).length) attrs.push(...attrsFromObject(layoutStyles))
 
     return f.createJsxSelfClosingElement(
         f.createIdentifier(n.componentName),

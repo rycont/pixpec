@@ -22,12 +22,14 @@ export interface CodegenContext {
   componentName: string
   /** Resolved design-system metadata the target needs at render time:
    *    - tokens:     variable id → semantic path (e.g. `content.standard.primary`)
+   *    - tokenColors: semantic path or variable id → resolved CSS color
    *    - typography: text-style ref → typography-component name
    *    - fonts:      font-family → font registry data (Y-shift, etc.)
    *  Each target ignores the slots it doesn't care about. */
   designSystem: {
     tokens?: Record<string, string>
     tokenValues?: Record<string, number>
+    tokenColors?: Record<string, string>
     typography?: Record<string, string>
     fonts?: unknown
   }
@@ -40,6 +42,8 @@ export interface CodegenContext {
   plugins?: unknown[]
   /** Design-unit → physical-unit base. Default 16 (CSS rem base). */
   remBase?: number
+  /** Design-unit → target render-unit scale. Defaults to 1. */
+  renderScale?: number
   /** Component-owned prop keys that must not be forwarded to the rendered root. */
   propKeys?: string[]
   /** Source figma node id for target-specific comments or sidecar ids. */
@@ -73,7 +77,7 @@ export interface CodegenResult {
   fileExtension: string
   /** Optional sidecar files a target wants to drop next to the main output
    *  (e.g. target-specific config, a CSS module, etc.). */
-  sidecars?: Array<{ relativePath: string; content: string }>
+  sidecars?: Array<{ relativePath: string; content: string | Uint8Array }>
 }
 
 export type CaptureKind = 'case' | 'view'

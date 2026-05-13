@@ -12,10 +12,17 @@ import { loadConfig } from './init.ts'
 import { listFigmaTabs } from './cfigma-meta.ts'
 import { resolveConfiguredTargets } from './targets/index.ts'
 import { runGenerate } from './generate.ts'
+import { runBreakdownVerify } from './breakdown-verify.ts'
 
 export interface BreakdownOptions {
     name?: string
     target?: string
+    detachInstances?: boolean
+    verify?: boolean
+    scale?: number
+    maxBlob?: number
+    blobThreshold?: string
+    verifySourceId?: string
 }
 
 export interface BreakdownResult {
@@ -24,6 +31,7 @@ export interface BreakdownResult {
     viewPath: string
     manifestPath: string
     entryCount: number
+    verify?: { pass: number; fail: number; total: number; skipped: number }
 }
 
 interface BreakdownEntry {
@@ -62,6 +70,7 @@ export async function runBreakdown(
     const viewDir = resolve(viewRoot, viewName)
     const breakdownDir = resolve(viewDir, 'breakdown')
     const targets = opts.target ? [opts.target] : resolveConfiguredTargets(cfg)
+    const renderScale = opts.scale ?? cfg.scale
     await mkdir(breakdownDir, { recursive: true })
 
     const rootOutputs: Record<string, string> = {}
@@ -72,12 +81,14 @@ export async function runBreakdown(
             componentName: viewName,
             outputDir: outDir,
             propsFile: null,
+            detachInstances: opts.detachInstances,
+            renderScale,
         })
         rootOutputs[target] = relativeFrom(viewDir, r.outPath)
     }
 
     const entries: BreakdownEntry[] = []
-    const nodes = collectPostOrder(raw)
+    const nodes = collectPostOrder(raw, !!opts.detachInstances)
     for (let index = 0; index < nodes.length; index += 1) {
         const { node, depth } = nodes[index]
         const seq = String(index + 1).padStart(4, '0')
@@ -91,11 +102,7 @@ export async function runBreakdown(
             childCount: node.children?.length ?? 0,
             viewId,
             outputs: {},
-            captureSkip: node.type === 'TEXT'
-                ? 'text leaf'
-                : isTextOnlySubtree(node)
-                    ? 'text-only subtree'
-                    : undefined,
+            captureSkip: node.type === 'TEXT' ? 'text leaf' : undefined,
         }
         for (const target of targets) {
             try {
@@ -104,6 +111,8 @@ export async function runBreakdown(
                     componentName: `${viewName}_${seq}`,
                     outputDir: resolve(viewDir, 'impl', target, 'breakdown'),
                     propsFile: null,
+                    detachInstances: opts.detachInstances,
+                    renderScale,
                 })
                 entry.outputs[target] = relativeFrom(viewDir, r.outPath)
             } catch (e) {
@@ -149,32 +158,41 @@ export async function runBreakdown(
         )}\n`,
     )
 
+    const verify = opts.verify
+        ? await runBreakdownVerify({
+            viewDir,
+            manifestPath,
+            target: targets[0] ?? 'gpui',
+            cfg: { ...cfg, scale: renderScale },
+            maxBlob: opts.maxBlob,
+            blobThreshold: opts.blobThreshold,
+            sourceId: opts.verifySourceId,
+        })
+        : undefined
+
     return {
         viewName,
         viewDir,
         viewPath,
         manifestPath,
         entryCount: entries.length,
+        verify,
     }
 }
 
-function collectPostOrder(root: RawNode): Array<{ node: RawNode; depth: number }> {
+function collectPostOrder(
+    root: RawNode,
+    detachInstances: boolean,
+): Array<{ node: RawNode; depth: number }> {
     const out: Array<{ node: RawNode; depth: number }> = []
     const visit = (node: RawNode, depth: number) => {
-        if (node.type !== 'INSTANCE' && node.type !== 'TEXT') {
+        if ((node.type !== 'INSTANCE' || detachInstances) && node.type !== 'TEXT') {
             for (const child of node.children ?? []) visit(child, depth + 1)
         }
         out.push({ node, depth })
     }
     visit(root, 0)
     return out
-}
-
-function isTextOnlySubtree(node: RawNode): boolean {
-    const children = node.children ?? []
-    return children.length > 0 && children.every((child) =>
-        child.type === 'TEXT' || isTextOnlySubtree(child),
-    )
 }
 
 function safeFilename(s: string): string {

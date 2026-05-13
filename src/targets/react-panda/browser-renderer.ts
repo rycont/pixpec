@@ -46,13 +46,29 @@ export interface BatchSession {
   reload(): Promise<void>;
   waitMounted(expectedCount: number): Promise<void>;
   screenshot(selector: string, outPath: string): Promise<void>;
-  screenshotMany(items: { selector: string; outPath: string }[]): Promise<void>;
+  screenshotMany(
+    items: { selector: string; outPath: string; clipToElement?: boolean }[],
+  ): Promise<void>;
   navigateTo(url: string): Promise<void>;
   close(): Promise<void>;
 }
 
 const buildInitScript = (remPx: number): string =>
   `(function(){var apply=function(){if(document.documentElement)document.documentElement.style.fontSize="${remPx}px";};apply();document.addEventListener("readystatechange",apply);})();`;
+
+async function waitForFontSettle(
+  page: Awaited<ReturnType<BrowserContext["newPage"]>>,
+): Promise<void> {
+  await page
+    .evaluate(
+      async () => {
+        if ("fonts" in document)
+          await (document as Document & { fonts: FontFaceSet }).fonts.ready;
+      },
+    )
+    .catch(() => undefined);
+  await page.waitForTimeout(FONT_SETTLE_MS);
+}
 
 export class Renderer {
   private constructor(private browser: Browser) {}
@@ -89,8 +105,7 @@ export class Renderer {
       const targetSel = opts.clipSelector ?? "#pixpec-target";
       await page.locator(`${targetSel} > *`).first().waitFor();
       // @font-face load is async even with font-display:block.
-      if (opts.waitForFonts !== false)
-        await page.waitForTimeout(FONT_SETTLE_MS);
+      if (opts.waitForFonts !== false) await waitForFontSettle(page);
       // Harness post-mount work (SVG snap, Y-shift).
       await page.evaluate(
         () =>
@@ -171,16 +186,31 @@ export class Renderer {
       },
       async waitMounted(expectedCount: number) {
         if (lastError) throw lastError;
-        await page.waitForFunction(
-          (n) => {
-            if ((window as any).__pixpecError)
-              throw new Error((window as any).__pixpecError);
-            return document.querySelectorAll("[data-case]").length >= n;
-          },
-          expectedCount,
-          { timeout: 10_000 },
-        );
+        try {
+          await page.waitForFunction(
+            (n) => {
+              if ((window as any).__pixpecError)
+                throw new Error((window as any).__pixpecError);
+              return document.querySelectorAll("[data-case]").length >= n;
+            },
+            expectedCount,
+            { timeout: 60_000 },
+          );
+        } catch (e) {
+          const mounted = await page
+            .locator("[data-case]")
+            .count()
+            .catch(() => 0);
+          const pixpecError = await page
+            .evaluate(() => (window as any).__pixpecError ?? null)
+            .catch(() => null);
+          const detail = pixpecError
+            ? `\nHarness error: ${pixpecError}`
+            : `\nMounted cases: ${mounted}/${expectedCount}`;
+          throw new Error(`${(e as Error).message}${detail}`);
+        }
         // Harness post-mount.
+        await waitForFontSettle(page);
         await page.evaluate(() => (window as any).__pixpecSettle());
         if (lastError) throw lastError;
       },
@@ -188,9 +218,13 @@ export class Renderer {
         await page.locator(selector).first().screenshot({ path: outPath });
       },
       async screenshotMany(items) {
-        const selectors = items.map((it) => it.selector);
+        const specs = items.map((it) => ({
+          selector: it.selector,
+          clipToElement: !!it.clipToElement,
+        }));
+        const selectors = specs.map((it) => it.selector);
         const bounds = (await page.evaluate(`(() => {
-          const sels = ${JSON.stringify(selectors)};
+          const specs = ${JSON.stringify(specs)};
           const expandForShadow = (
             el,
             box,
@@ -218,10 +252,19 @@ export class Renderer {
             }
             return out;
           };
-          return sels.map((s) => {
-            const el = document.querySelector(s);
+          return specs.map((spec) => {
+            const el = document.querySelector(spec.selector);
             if (!el) return null;
             const rootRect = el.getBoundingClientRect();
+            if (spec.clipToElement) {
+              return {
+                x: rootRect.x,
+                y: rootRect.y,
+                w: rootRect.width,
+                h: rootRect.height,
+                overflow: false,
+              };
+            }
             const elements = [
               el,
               ...Array.from(el.querySelectorAll("*")),
@@ -331,10 +374,10 @@ export class Renderer {
           if (b.y + b.h > maxY) maxY = b.y + b.h;
         }
         const PAD = 1;
-        const clipX = minX - PAD;
-        const clipY = minY - PAD;
-        const unionW = maxX - minX + 2 * PAD;
-        const unionH = maxY - minY + 2 * PAD;
+        const clipX = Math.max(0, minX - PAD);
+        const clipY = Math.max(0, minY - PAD);
+        const unionW = maxX - clipX + PAD;
+        const unionH = maxY - clipY + PAD;
         const captureParams = {
           format: "png",
           clip: {

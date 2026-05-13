@@ -29,6 +29,12 @@ import {
 } from "./cfigma-meta.ts";
 import type { FigmaInstanceRaw } from "./types.ts";
 import type { DNode } from "./compiler/design-ast.ts";
+import type { DetachedUsageReport } from "./component-report.ts";
+import type { NodeBindings } from "./compiler/registry.ts";
+import {
+  normalizeInstanceOverrides,
+  unconsumedOverridesForProps,
+} from "./compiler/props-context.ts";
 
 export interface PixpecConfig {
   figmaFileId: string;
@@ -222,7 +228,7 @@ function definedVariantValues(values: unknown[]): string[] {
 /** Mirror walker's `pixpecSetProp`: store each componentProperty value
  * under its full ("Status#1234:0"), short ("Status"), and camelCase
  * ("status") forms so a generated propsFromFigma can read whichever
- * form it picked. Used by init when it needs to hydrate a scanned
+ * form it picked. Used by init when it needs to build a scanned
  * instance without re-running the whole walker. */
 function normalizeRawProps(
   componentProperties: Record<string, unknown>,
@@ -362,7 +368,7 @@ function generateProps(
   detectedItemsProp?: {
     propName: string;
     childComponentName: string;
-    varyingHydratedKeys: string[];
+    builtInstanceKeys: string[];
   },
   detectedNestedProps: Array<{
     propName: string;
@@ -438,10 +444,10 @@ function generateProps(
       "",
     );
     const propsTypeName = `${camelChild}Props`;
-    // Pick is computed bottom-up: init hydrated each scanned child via the
-    // child's own propsFromFigma and kept the keys whose values varied
+    // Pick is computed bottom-up: init built each scanned child instance via
+    // the child's own propsFromFigma and kept the keys whose values varied
     // across siblings. Re-init either side to refresh the surface.
-    const keys = detectedItemsProp.varyingHydratedKeys;
+    const keys = detectedItemsProp.builtInstanceKeys;
     containerImport = `import type { ${propsTypeName} } from '../${camelChild}/props.ts'\n`;
     containerLine = `  ${detectedItemsProp.propName}?: Array<Pick<${propsTypeName}, ${keys.map((k) => JSON.stringify(k)).join(" | ")}>>`;
   }
@@ -597,6 +603,8 @@ interface CaseRow {
    * key (= `inst.mainComponent.key`), used for bucketing under the
    * right variant without any per-file id translation. */
   variantKey?: string;
+  /** For variant rows only: generated variant-local zod schema const. */
+  schemaName?: string;
   /** For variant rows only: per-node bindings spec emitted as
    * `Variant.bindings` in cases.ts. generate threads this through the
    * walker so IR nodes get parametric annotations. */
@@ -622,6 +630,95 @@ interface CaseRow {
   renderLiteral?: string;
 }
 
+type DetectedNestedPropBinding = {
+  propName: string;
+  layerName: string;
+  propKey: string;
+  componentName?: string | null;
+};
+
+function buildVariantBindings(
+  meta: FigmaComponentMeta,
+  variant: FigmaVariantMeta,
+  detectedLabelProp: { name: string } | undefined,
+  detectedNestedProps: DetectedNestedPropBinding[],
+  fillBindingsByVariantKey: Map<string, Set<string>>,
+  textStyleBindingsByVariantKey: Map<string, Set<string>>,
+): NodeBindings {
+  const bindings: NodeBindings = {};
+  if (variant.textNodes) {
+    for (const tn of variant.textNodes) {
+      if (!tn.propRef) continue;
+      const propRefBare = tn.propRef.split("#")[0];
+      const propKey = propName(propRefBare);
+      if (!meta.propertyDefinitions[propRefBare]) continue;
+      bindings[tn.id] = bindings[tn.id] ?? {};
+      bindings[tn.id].node = {
+        ...(bindings[tn.id].node ?? {}),
+        content: propKey,
+      };
+    }
+  }
+  if (detectedLabelProp && variant.textNodes) {
+    for (const tn of variant.textNodes) {
+      if (tn.name !== detectedLabelProp.name) continue;
+      bindings[tn.id] = bindings[tn.id] ?? {};
+      bindings[tn.id].node = {
+        ...(bindings[tn.id].node ?? {}),
+        content: "label",
+      };
+    }
+  }
+  if (variant.nestedNodes) {
+    for (const nn of variant.nestedNodes) {
+      for (const np of detectedNestedProps) {
+        if (nn.name !== np.layerName) continue;
+        if (!(np.propKey in nn.props)) continue;
+        bindings[nn.id] = bindings[nn.id] ?? {};
+        bindings[nn.id].component = {
+          ...(bindings[nn.id].component ?? {}),
+          [propName(np.propKey)]: np.propName,
+        };
+      }
+    }
+  }
+  if (variant.visibilityNodes) {
+    for (const vn of variant.visibilityNodes) {
+      const propKey = propName(vn.propRef);
+      bindings[vn.id] = bindings[vn.id] ?? {};
+      bindings[vn.id].node = {
+        ...(bindings[vn.id].node ?? {}),
+        visible: propKey,
+      };
+    }
+  }
+  const fillNodes = variant.key
+    ? fillBindingsByVariantKey.get(variant.key)
+    : undefined;
+  if (fillNodes) {
+    for (const nodeId of fillNodes) {
+      bindings[nodeId] = bindings[nodeId] ?? {};
+      bindings[nodeId].node = {
+        ...(bindings[nodeId].node ?? {}),
+        paint: "_fill",
+      };
+    }
+  }
+  const textStyleNodes = variant.key
+    ? textStyleBindingsByVariantKey.get(variant.key)
+    : undefined;
+  if (textStyleNodes) {
+    for (const nodeId of textStyleNodes) {
+      bindings[nodeId] = bindings[nodeId] ?? {};
+      bindings[nodeId].node = {
+        ...(bindings[nodeId].node ?? {}),
+        textStyle: "_textStyle",
+      };
+    }
+  }
+  return bindings;
+}
+
 function stableSignature(
   props: Record<string, unknown>,
   width?: number,
@@ -640,6 +737,7 @@ function generateCases(
   componentName: string,
   fileKey: string,
   meta: FigmaComponentMeta,
+  schemaDefs: Record<string, FigmaPropertyDefinition>,
   usageRows: CaseRow[] = [],
   // Synthetic-prop hooks detected by usage scan — init injects each master
   // variant's actual TEXT chars / nested-INSTANCE values so master cases
@@ -652,6 +750,11 @@ function generateCases(
     propKey: string;
     componentName?: string | null;
   }> = [],
+  detectedItemsProp?: {
+    propName: string;
+    childComponentName: string;
+    builtInstanceKeys: string[];
+  },
   // Map of prop key → default value (built from augmentedDefs at the call
   // site). Variant rows drop fields equal to this map so the emitted
   // master case props stay slim — impl spreads `{...defaults, ...props}`
@@ -660,10 +763,76 @@ function generateCases(
   fillBindingsByVariantKey: Map<string, Set<string>> = new Map(),
   textStyleBindingsByVariantKey: Map<string, Set<string>> = new Map(),
 ): string {
+  const schemaForProp = (
+    _name: string,
+    def: FigmaPropertyDefinition,
+  ): string => {
+    if (def.type === "TEXT") return "z.string().optional()";
+    if (def.type === "BOOLEAN") {
+      return "z.union([z.boolean(), z.enum(['true', 'false']).transform((value) => value === 'true')]).optional()";
+    }
+    if (def.type === "INSTANCE_SWAP") return "z.undefined().optional()";
+    const options = definedVariantValues(def.variantOptions ?? []).map(
+      cleanControlValue,
+    );
+    if (options.length === 0) return "z.string().optional()";
+    return `z.enum([${options
+      .map((option) => JSON.stringify(option))
+      .join(", ")}]).optional()`;
+  };
+  const schemaForField = (
+    name: string,
+    def: FigmaPropertyDefinition,
+  ): string => {
+    if (detectedNestedProps.some((nested) => nested.propName === name))
+      return "z.unknown().optional()";
+    return schemaForProp(name, def);
+  };
+  const schemaBody = `z.object({
+${Object.entries(schemaDefs)
+  .map(([name, def]) => `  ${propsKey(name)}: ${schemaForField(name, def)},`)
+  .join("\n")}
+})`;
+  const propMappings = Object.entries(schemaDefs)
+    .flatMap(([name, def]) => {
+      const k = propsKey(name);
+      if (name === "label" && detectedLabelProp) {
+        const access = optionalPropAccess("raw.textOverrides", detectedLabelProp.name);
+        return [`      ${k}: ${access},`];
+      }
+      const nested = detectedNestedProps.find((n) => n.propName === name);
+      if (nested) {
+        const access = `${optionalPropAccess("raw.nestedProps", nested.layerName)}?.${propsKey(nested.propKey)}`;
+        return [`      ${k}: ${access},`];
+      }
+      if (def.type === "INSTANCE_SWAP") {
+        return [
+          `      ${k}: undefined, // INSTANCE_SWAP — wire to a React node lookup`,
+        ];
+      }
+      return [];
+    })
+    .join("\n");
+  let containerMapping = "";
+  if (detectedItemsProp) {
+    const pickFields = detectedItemsProp.builtInstanceKeys
+      .map((k) => `${k}: c.props[${JSON.stringify(k)}]`)
+      .join(", ");
+    containerMapping = `\n      ${detectedItemsProp.propName}: (children ?? [])
+      .filter((c) => c.kind === 'instance')
+      .map((c) => ({ ${pickFields} })),`;
+  }
+  const hasPropMapping = propMappings.length > 0 || containerMapping.length > 0;
+  const parseInput = hasPropMapping
+    ? `{
+      ...raw.props,
+${propMappings}${containerMapping}
+    }`
+    : "raw.props";
   // Master variants live in the library file (`fileKey` arg); usage rows
   // already arrived with their own `figmaId` (per-tab fileKey baked in).
   const variantRows: CaseRow[] = meta.variants.map((v) => {
-    // Build full hydrated prop set first; emit only the diff vs defaults
+    // Build the full prop set first; emit only the diff vs defaults
     // (computed below from augmentedDefs). Mirrors usecase emit so case
     // props stay minimal across both layers.
     const allProps: Record<string, unknown> = { ...v.propValues };
@@ -691,7 +860,7 @@ function generateCases(
       }
     }
     const propEntries = Object.entries(slimProps).map(([name, value]) => {
-      const def = meta.propertyDefinitions[name];
+      const def = schemaDefs[name] ?? meta.propertyDefinitions[name];
       if (!def) return `    ${name}: ${JSON.stringify(value)}`;
       return `    ${propsKey(name)}: ${literalForValue(def, value as FigmaPropValue)}`;
     });
@@ -714,102 +883,18 @@ function generateCases(
           ? `{ box: { width: ${v.renderWidth}, height: ${v.renderHeight}, paddingLeft: ${v.renderOffsetX}, paddingTop: ${v.renderOffsetY}, overflow: 'visible' } }`
           : `{ box: { width: ${v.width}, height: ${v.height} } }`
         : undefined;
-    // Per-node bindings — for each TEXT layer matching detectedLabelProp
-    // and each nested INSTANCE matching detectedNestedProps, record the
-    // figma node id with its owner-prop key. generate uses these to
-    // annotate IR nodes during walk → codegen emits {props.<key>}.
-    const bindings: Record<
-      string,
-      {
-        node?: {
-          content?: string;
-          visible?: string;
-          paint?: string;
-          textStyle?: string;
-        };
-        component?: Record<string, string>;
-      }
-    > = {};
-    // Explicit figma TEXT property — each text node whose
-    // componentPropertyReferences.characters points to a property in this
-    // component's propertyDefinitions binds to the matching prop, regardless
-    // of override frequency. The detection-threshold path below is a fallback
-    // for components that don't declare a TEXT prop in figma but vary text.
-    if (v.textNodes) {
-      for (const tn of v.textNodes) {
-        if (!tn.propRef) continue;
-        const propRefBare = tn.propRef.split("#")[0];
-        const propKey = propName(propRefBare);
-        if (!meta.propertyDefinitions[propRefBare]) continue;
-        bindings[tn.id] = bindings[tn.id] ?? {};
-        bindings[tn.id].node = {
-          ...(bindings[tn.id].node ?? {}),
-          content: propKey,
-        };
-      }
-    }
-    if (detectedLabelProp && v.textNodes) {
-      for (const tn of v.textNodes) {
-        if (tn.name === detectedLabelProp.name) {
-          bindings[tn.id] = bindings[tn.id] ?? {};
-          bindings[tn.id].node = {
-            ...(bindings[tn.id].node ?? {}),
-            content: "label",
-          };
-        }
-      }
-    }
-    if (v.nestedNodes) {
-      for (const nn of v.nestedNodes) {
-        for (const np of detectedNestedProps) {
-          if (nn.name !== np.layerName) continue;
-          if (!(np.propKey in nn.props)) continue;
-          bindings[nn.id] = bindings[nn.id] ?? {};
-          bindings[nn.id].component = {
-            ...(bindings[nn.id].component ?? {}),
-            [propName(np.propKey)]: np.propName,
-          };
-        }
-      }
-    }
-    // Visibility bindings — each node whose `visible` is bound to an owner
-    // boolean prop (e.g. an Icon hidden when leftIcon=false). codegen wraps
-    // the JSX with `{<propKey> !== false && ...}`.
-    if (v.visibilityNodes) {
-      for (const vn of v.visibilityNodes) {
-        const propKey = propName(vn.propRef);
-        bindings[vn.id] = bindings[vn.id] ?? {};
-        bindings[vn.id].node = {
-          ...(bindings[vn.id].node ?? {}),
-          visible: propKey,
-        };
-      }
-    }
-    const fillNodes = v.key ? fillBindingsByVariantKey.get(v.key) : undefined;
-    if (fillNodes) {
-      for (const nodeId of fillNodes) {
-        bindings[nodeId] = bindings[nodeId] ?? {};
-        bindings[nodeId].node = {
-          ...(bindings[nodeId].node ?? {}),
-          paint: "_fill",
-        };
-      }
-    }
-    const textStyleNodes = v.key
-      ? textStyleBindingsByVariantKey.get(v.key)
-      : undefined;
-    if (textStyleNodes) {
-      for (const nodeId of textStyleNodes) {
-        bindings[nodeId] = bindings[nodeId] ?? {};
-        bindings[nodeId].node = {
-          ...(bindings[nodeId].node ?? {}),
-          textStyle: "_textStyle",
-        };
-      }
-    }
+    const bindings = buildVariantBindings(
+      meta,
+      v,
+      detectedLabelProp,
+      detectedNestedProps,
+      fillBindingsByVariantKey,
+      textStyleBindingsByVariantKey,
+    );
     return {
       figmaId: `${fileKey}:${v.id}`,
       variantKey: v.key,
+      schemaName: `S_${`${fileKey}_${v.id}`.replace(/[^A-Za-z0-9]/g, "_")}`,
       propsLiteral: `{\n${propEntries.join(",\n")}\n    }`,
       bindings: Object.keys(bindings).length > 0 ? bindings : undefined,
       // Include w/h so two visually-identical masters with different dims
@@ -874,8 +959,10 @@ function generateCases(
     const bindingsLit = variant?.bindings
       ? `\n    bindings: ${JSON.stringify(variant.bindings, null, 2).replace(/\n/g, "\n    ")},`
       : "";
+    const schemaName = variant?.schemaName ?? "z.object({})";
+    const parserLit = `\n    propsSchema: ${schemaName},\n    propsFromFigma: (raw, children) => ${schemaName}.parse(${parseInput.replace(/\n/g, "\n    ")}),`;
     return `  {
-    key: ${JSON.stringify(variantKey)},${bindingsLit}
+    key: ${JSON.stringify(variantKey)},${bindingsLit}${parserLit}
     usecases: [
 ${us.map(renderUsecase).join(",\n")},
     ],
@@ -884,8 +971,14 @@ ${us.map(renderUsecase).join(",\n")},
   const variantKeys = variantRows
     .map((v) => v.variantKey)
     .filter((k): k is string => !!k);
-  return `import type { Variant } from 'pixpec/spec'
+  const schemaBlocks = variantRows
+    .map((v) => `const ${v.schemaName} = ${schemaBody}`)
+    .join("\n\n");
+  return `import { z } from 'pixpec/spec'
+import type { Variant } from 'pixpec/spec'
 import type { ${componentName}Props } from './props.ts'
+
+${schemaBlocks}
 
 /** Master variants — what breakdown / codegen / verify iterate. Each
  *  carries a nested usecases array of figma instance occurrences that
@@ -901,150 +994,33 @@ function generateIndex(
   componentName: string,
   componentSetKey: string | undefined,
   componentSetId: string | undefined,
-  defs: Record<string, FigmaPropertyDefinition>,
-  autoLabelLayerName?: string,
-  detectedItemsProp?: {
+  _defs: Record<string, FigmaPropertyDefinition>,
+  _autoLabelLayerName?: string,
+  _detectedItemsProp?: {
     propName: string;
     childComponentName: string;
-    varyingHydratedKeys: string[];
+    builtInstanceKeys: string[];
   },
-  detectedNestedProps: Array<{
+  _detectedNestedProps: Array<{
     propName: string;
     layerName: string;
     propKey: string;
     componentName?: string | null;
   }> = [],
 ): string {
-  // raw.props is already pre-cleaned (walker's pixpecSetProp strips control
-  // chars). Just pass through with a type cast to the prop's narrowed type.
-  // INSTANCE_SWAP needs user-supplied wiring → emit undefined as a TODO marker.
-  // The synthetic 'label' prop (if init detected the single-text-override
-  // pattern) reads walker's textOverrides[descId] map instead of raw.props
-  // — designer didn't expose the text via figma componentProperties, so
-  // walker keys it by the master descendant id instead.
-  const schemaForProp = (
-    _name: string,
-    def: FigmaPropertyDefinition,
-  ): string => {
-    if (def.type === "TEXT") return "z.string().optional()";
-    if (def.type === "BOOLEAN") {
-      return "z.union([z.boolean(), z.enum(['true', 'false']).transform((value) => value === 'true')]).optional()";
-    }
-    if (def.type === "INSTANCE_SWAP") return "z.undefined().optional()";
-    const options = definedVariantValues(def.variantOptions ?? []).map(
-      cleanControlValue,
-    );
-    if (options.length === 0) return "z.string().optional()";
-    return `z.enum([${options
-      .map((option) => JSON.stringify(option))
-      .join(", ")}]).optional()`;
-  };
-
-  const schemaName = `${componentName}PropsSchema`;
-  const nestedPropByName = new Map(
-    detectedNestedProps.map((nested) => [nested.propName, nested]),
-  );
-  const nestedSchemaImports = new Map<string, string>();
-  for (const nested of detectedNestedProps) {
-    if (!nested.componentName) continue;
-    const childComponentName = nested.componentName.replace(/[^A-Za-z0-9]/g, "");
-    if (!childComponentName || childComponentName === componentName) continue;
-    nestedSchemaImports.set(
-      childComponentName,
-      `import { ${childComponentName}PropsSchema } from '../${childComponentName}/index.ts'\n`,
-    );
-  }
-
-  const schemaForField = (
-    name: string,
-    def: FigmaPropertyDefinition,
-  ): string => {
-    const nested = nestedPropByName.get(name);
-    if (nested?.componentName) {
-      const childComponentName = nested.componentName.replace(
-        /[^A-Za-z0-9]/g,
-        "",
-      );
-      const childPropName = nested.propKey.replace(/#[^#]*$/, "");
-      if (childComponentName && childComponentName !== componentName) {
-        return objectShapeAccess(`${childComponentName}PropsSchema`, childPropName);
-      }
-    }
-    return schemaForProp(name, def);
-  };
-
-  const schemaBlock = `export const ${schemaName} = z.object({
-${Object.entries(defs)
-  .map(([name, def]) => `  ${propsKey(name)}: ${schemaForField(name, def)},`)
-  .join("\n")}
-})`;
-  const propMappings = Object.entries(defs)
-    .flatMap(([name, def]) => {
-      const k = propsKey(name);
-      if (name === "label" && autoLabelLayerName) {
-        // walker keys textOverrides by the TEXT layer NAME, which stays
-        // consistent across master variants (figma copies child names when
-        // authoring variants) — no per-variant id enumeration needed.
-        const access = optionalPropAccess("raw.textOverrides", autoLabelLayerName);
-        return [`      ${k}: ${access},`];
-      }
-      // Auto-detected nested INSTANCE prop — read from
-      // raw.nestedProps[layerName][propKey], populated by walker.
-      const nested = detectedNestedProps.find((n) => n.propName === name);
-      if (nested) {
-        const access = `${optionalPropAccess("raw.nestedProps", nested.layerName)}?.${propsKey(nested.propKey)}`;
-        return [`      ${k}: ${access},`];
-      }
-      if (def.type === "INSTANCE_SWAP") {
-        return [
-          `      ${k}: undefined, // INSTANCE_SWAP — wire to a React node lookup`,
-        ];
-      }
-      return [];
-    })
-    .join("\n");
-  // Container array prop — auto-detected. propsFromFigma filters the
-  // compiled child Design AST nodes for DInstance children (each one
-  // already hydrated by the child's own propsFromFigma at compile time)
-  // and pulls only the varying keys into a Pick<>-shaped object per child.
-  let containerMapping = "";
-  if (detectedItemsProp) {
-    const pickFields = detectedItemsProp.varyingHydratedKeys
-      .map(
-        (k) =>
-          `${k}: c.props[${JSON.stringify(k)}]`,
-      )
-      .join(", ");
-    containerMapping = `\n      ${detectedItemsProp.propName}: (children ?? [])
-      .filter((c) => c.kind === 'instance')
-      .map((c) => ({ ${pickFields} })),`;
-  }
-  const fnSig = detectedItemsProp ? "(raw, children)" : "(raw)";
-  const hasPropMapping = propMappings.length > 0 || containerMapping.length > 0;
-  const parseInput = hasPropMapping
-    ? `{
-      ...raw.props,
-${propMappings}${containerMapping}
-    }`
-    : "raw.props";
   const figmaBlock = componentSetKey
     ? `,
   figma: {
     componentSetKey: ${JSON.stringify(componentSetKey)},${componentSetId ? `\n    componentSetId: ${JSON.stringify(componentSetId)},` : ""}
-    propsFromFigma: ${fnSig} => ${schemaName}.parse(${parseInput}),
   }`
     : "";
-  const specImports = ["defineComponent", "z"].join(", ");
-  const schemaImports = [...nestedSchemaImports.values()].join("");
-  return `import { ${specImports} } from 'pixpec/spec'
-${schemaImports}import { variants } from './cases.ts'
+  return `import { defineComponent } from 'pixpec/spec'
+import { variants } from './cases.ts'
 import { defaults } from './defaults.ts'
 import type { ${componentName}Props } from './props.ts'
 
 export type { ${componentName}Props }
 export { defaults }
-
-${schemaBlock}
 
 export const ${componentName} = defineComponent<${componentName}Props>({
   name: ${JSON.stringify(componentName)},
@@ -1377,12 +1353,12 @@ export async function init(opts: {
   // array prop on the parent (`<childName>s?: Array<{...}>`) plus a
   // generated propsFromFigma that walks `node.children` in codegen.
   // Container pattern is fully bottom-up: the child component must
-  // already be init'd (its `defineComponent` exists with a propsFromFigma
-  // that knows how to map its own raw → typed Props). Init dynamically
-  // imports the child, hydrates each scanned sibling with the child's
-  // OWN propsFromFigma, then diffs the resulting typed objects to find
+  // already be init'd (its variants expose propsFromFigma, which knows how
+  // to map its own raw → typed Props). Init dynamically imports the child,
+  // builds each scanned child instance with the child's OWN propsFromFigma,
+  // then diffs the resulting typed objects to find
   // which child props vary across usages. That set becomes the parent's
-  // `Pick<ChildProps, ...>` — derived from real hydrated values, not from
+  // `Pick<ChildProps, ...>` — derived from built instance values, not from
   // figma raw keys, so child-only knowledge (label layer name, nested
   // Icon→iconType remap, etc.) flows up correctly.
   let detectedItemsProp:
@@ -1391,15 +1367,19 @@ export async function init(opts: {
         propName: string;
         childComponentName: string;
         childComponentSetKey: string;
-        /** Hydrated TS-prop keys whose values differ across at least one
-         * sibling pair within a parent. These are the keys that go into
-         * the parent's `Pick<ChildProps, ...>`. */
-        varyingHydratedKeys: string[];
+        /** Built child-instance TS-prop keys whose values differ across at
+         * least one sibling pair within a parent. These are the keys that
+         * go into the parent's `Pick<ChildProps, ...>`. */
+        builtInstanceKeys: string[];
       };
   // Captured so the post-detect case generator can reuse the same child
-  // hydrator (no need to re-import) when building usage-based cases.
-  let childPropsFromFigma:
-    | ((raw: FigmaInstanceRaw, children?: DNode[]) => Record<string, unknown>)
+  // instance builder (no need to re-import) when building usage-based cases.
+  let buildChildInstanceProps:
+    | ((
+        raw: FigmaInstanceRaw,
+        children?: DNode[],
+        variantKey?: string | null,
+      ) => Record<string, unknown>)
     | undefined;
   if (normalizedMeta.key && scanResult) {
     try {
@@ -1432,26 +1412,42 @@ export async function init(opts: {
         }
         const childExport = childMod[childComponentName] as
           | {
-              figma?: {
+              variants?: Array<{
+                key?: string;
                 propsFromFigma?: (
                   raw: FigmaInstanceRaw,
                   children?: DNode[],
                 ) => Record<string, unknown>;
-              };
+              }>;
             }
           | undefined;
-        const propsFromFigma = childExport?.figma?.propsFromFigma;
-        if (typeof propsFromFigma !== "function") {
+        const childVariants = childExport?.variants ?? [];
+        const firstParser = childVariants.find(
+          (v) => typeof v.propsFromFigma === "function",
+        )?.propsFromFigma;
+        if (typeof firstParser !== "function") {
           throw new Error(
-            `child '${childComponentName}' has no figma.propsFromFigma — re-init it`,
+            `child '${childComponentName}' has no variant propsFromFigma — re-init it`,
           );
         }
-        // Hydrate every scanned child via the child's own propsFromFigma,
-        // then diff per-parent. Aggregate varying keys across all parents.
-        const varyingHydrated = new Set<string>();
+        const propsFromFigma = (
+          raw: FigmaInstanceRaw,
+          children: DNode[] = [],
+          variantKey?: string | null,
+        ): Record<string, unknown> => {
+          const parser =
+            (variantKey
+              ? childVariants.find((v) => v.key === variantKey)?.propsFromFigma
+              : undefined) ?? firstParser;
+          return parser(raw, children);
+        };
+        // Build every scanned child instance via the child's own
+        // propsFromFigma, then diff per-parent. Aggregate varying keys
+        // across all parents.
+        const varyingBuiltInstanceKeys = new Set<string>();
         for (const s of samples) {
           if (s.children.length < 2) continue;
-          const hydrated = s.children.map((c) => {
+          const builtInstances = s.children.map((c) => {
             const raw: FigmaInstanceRaw = {
               id: "",
               name: "",
@@ -1466,23 +1462,23 @@ export async function init(opts: {
               nestedProps: c.nestedProps,
             };
             try {
-              return propsFromFigma(raw, []);
+              return propsFromFigma(raw, [], c.mainKey);
             } catch {
               return {};
             }
           });
           const allKeys = new Set<string>();
-          for (const h of hydrated)
+          for (const h of builtInstances)
             for (const k of Object.keys(h)) allKeys.add(k);
           for (const k of allKeys) {
             const vals = new Set(
-              hydrated.map((h) => JSON.stringify(h[k] ?? null)),
+              builtInstances.map((h) => JSON.stringify(h[k] ?? null)),
             );
-            if (vals.size > 1) varyingHydrated.add(k);
+            if (vals.size > 1) varyingBuiltInstanceKeys.add(k);
           }
         }
-        if (varyingHydrated.size > 0) {
-          childPropsFromFigma = propsFromFigma;
+        if (varyingBuiltInstanceKeys.size > 0) {
+          buildChildInstanceProps = propsFromFigma;
           const propName = (
             childComponentName[0].toLowerCase() +
             childComponentName.slice(1) +
@@ -1492,13 +1488,13 @@ export async function init(opts: {
             propName,
             childComponentName,
             childComponentSetKey: childKey,
-            varyingHydratedKeys: [...varyingHydrated],
+            builtInstanceKeys: [...varyingBuiltInstanceKeys],
           };
           console.log(
             `[init] detected container pattern: ${samples.length} parent instance(s), ` +
               `all children are ${childComponentName} → exposing as ` +
-              `'${propName}: Array<Pick<${childComponentName}Props, ${[...varyingHydrated].join(" | ")}>>' ` +
-              `(hydrated via ${childComponentName}.propsFromFigma)`,
+              `'${propName}: Array<Pick<${childComponentName}Props, ${[...varyingBuiltInstanceKeys].join(" | ")}>>' ` +
+              `(built via ${childComponentName}.propsFromFigma)`,
           );
         }
       }
@@ -1540,7 +1536,7 @@ export async function init(opts: {
   // init wrote into propsFromFigma (own componentProperties → camelCase,
   // auto-detected `label` from textOverrides[layerName], detected
   // nested-INSTANCE props from nestedProps[layer][propKey], and — when
-  // the component is a container — `Pick<ChildProps>` items hydrated
+  // the component is a container — `Pick<ChildProps>` items built
   // via the child's own propsFromFigma). Master variants + usages then
   // share a single dedup pass keyed by {props, width, height}.
   // Collect per-property unique values that arrive at runtime via prop
@@ -1606,82 +1602,24 @@ export async function init(opts: {
       for (const nodeId of Object.keys(u.textStyleOverrides)) nodes.add(nodeId);
     }
   }
-  // "Uncovered override → detach" rule: drop instances whose figma overrides
-  // include any field that no exposed prop can carry. Two sources of cover:
-  //
-  //   1. Per-node bindings (built below from variantRows). Each binding
-  //      maps a master node id + figma field (characters/componentProperties
-  //      /visible) to a prop key. Instance overrides on those (node, field)
-  //      pairs flow through the prop and get re-rendered correctly.
-  //
-  //   2. Root-spread layout/dim fields. Generated trees forward width/
-  //      height/padding/gap via `{...rest}` panda spread, so any override
-  //      on the root frame's layout (including figma's primaryAxisSizingMode/
-  //      counterAxisSizingMode/layoutGrow flags that toggle FIXED↔HUG) is
-  //      captured by the resulting css width/height.
-  //
-  // NON_VISUAL fields are figma bookkeeping (exportSettings, layer renames)
-  // that don't affect rendered pixels — always ignored.
-  const NON_VISUAL = new Set([
-    "exportSettings",
-    "autoRename",
-    "name",
-    "styledTextSegments",
-  ]);
-  const ROOT_LAYOUT_COVERED = new Set([
-    "width",
-    "height",
-    "primaryAxisSizingMode",
-    "counterAxisSizingMode",
-    "layoutGrow",
-    // Root inst's own componentProperties (Status, leftIcon, etc.) flow
-    // through propsFromFigma → raw.props mapping; always covered.
-    "componentProperties",
-  ]);
-  // (nodeId → set of figma fields covered by this node's bindings).
-  // Derived directly from the same FigmaVariantMeta + detected props that
-  // generateCases uses to emit Variant.bindings. Keeping the derivation
-  // here (instead of reading variantRows) avoids reaching into a function-
-  // local computed later in the pipeline.
-  const boundFieldsByNode = new Map<string, Set<string>>();
-  const addField = (nodeId: string, field: string) => {
-    let s = boundFieldsByNode.get(nodeId);
-    if (!s) {
-      s = new Set();
-      boundFieldsByNode.set(nodeId, s);
-    }
-    s.add(field);
-  };
+  const variantBindingsByKey = new Map<string, NodeBindings>();
   for (const v of normalizedMeta.variants) {
-    if (detectedLabelProp && v.textNodes) {
-      for (const tn of v.textNodes) {
-        if (tn.name === detectedLabelProp.name) addField(tn.id, "characters");
-      }
-    }
-    if (v.nestedNodes) {
-      for (const nn of v.nestedNodes) {
-        for (const np of detectedNestedProps) {
-          if (nn.name === np.layerName && np.propKey in nn.props)
-            addField(nn.id, "componentProperties");
-        }
-      }
-    }
-    if (v.visibilityNodes) {
-      for (const vn of v.visibilityNodes) addField(vn.id, "visible");
-    }
-    const fillNodes = v.key ? fillBindingsByVariantKey.get(v.key) : undefined;
-    if (fillNodes) {
-      for (const nodeId of fillNodes) addField(nodeId, "fills");
-    }
-    const textStyleNodes = v.key
-      ? textStyleBindingsByVariantKey.get(v.key)
-      : undefined;
-    if (textStyleNodes) {
-      for (const nodeId of textStyleNodes) addField(nodeId, "textStyleId");
-    }
+    if (!v.key) continue;
+    variantBindingsByKey.set(
+      v.key,
+      buildVariantBindings(
+        normalizedMeta,
+        v,
+        detectedLabelProp,
+        detectedNestedProps,
+        fillBindingsByVariantKey,
+        textStyleBindingsByVariantKey,
+      ),
+    );
   }
-  let droppedUncovered = 0;
   const usageRows: CaseRow[] = [];
+  const detachedUsages: DetachedUsageReport[] = [];
+  let droppedUnconsumed = 0;
   if (scanResult) {
     const ownPropKeys = Object.keys(normalizedMeta.propertyDefinitions);
     // Index containerVariations by parent id so non-container usages
@@ -1694,33 +1632,14 @@ export async function init(opts: {
         }
       }
     }
-    const droppedReasons: Record<string, number> = {};
+    const sourceUsageById = new Map<string, UsageInstance>();
     for (const u of scanResult.usages) {
-      // Drop instances with overrides on (node, field) pairs no exposed
-      // prop can carry. Per-node bindings cover specific descendants;
-      // root layout fields are always covered (panda spread on Generated).
-      const uncoveredFields: string[] = [];
-      for (const ov of u.overrides ?? []) {
-        const bareNodeId = stripPrefix(ov.id);
-        // Override on the inst itself → root-level (width/height/sizing
-        // mode flags). Otherwise → descendant override; cover via per-node
-        // binding map keyed by the master node id (= bareNodeId).
-        const isRoot = ov.id === u.id;
-        const nodeBound = boundFieldsByNode.get(bareNodeId);
-        for (const f of ov.fields) {
-          if (NON_VISUAL.has(f)) continue;
-          if (isRoot && ROOT_LAYOUT_COVERED.has(f)) continue;
-          if (nodeBound?.has(f)) continue;
-          uncoveredFields.push(f);
-        }
-      }
-      if (uncoveredFields.length > 0) {
-        droppedUncovered++;
-        for (const f of uncoveredFields)
-          droppedReasons[f] = (droppedReasons[f] ?? 0) + 1;
-        // TEMP: filter disabled for false-positive diagnostic
-        // continue
-      }
+      if (!u.id.includes(";")) sourceUsageById.set(u.id, u);
+    }
+    for (const u of scanResult.usages) {
+      const inheritedSourceUsage = u.id.includes(";")
+        ? sourceUsageById.get(stripPrefix(u.id))
+        : undefined;
       const rawProps = normalizeRawProps(u.componentProperties);
       const fullProps: Record<string, unknown> = {};
       for (const name of ownPropKeys) {
@@ -1746,7 +1665,7 @@ export async function init(opts: {
       // Container array prop — only for parents whose children matched
       // the container shape during scan. Non-container components and
       // container parents missing from the scan leave the field unset.
-      if (detectedItemsProp && childPropsFromFigma) {
+      if (detectedItemsProp && buildChildInstanceProps) {
         const cv = containerByParentId.get(u.id);
         if (cv) {
           const items = cv.children.map((c) => {
@@ -1763,15 +1682,15 @@ export async function init(opts: {
               textOverrides: c.textOverrides,
               nestedProps: c.nestedProps,
             };
-            let hydrated: Record<string, unknown> = {};
+            let builtInstance: Record<string, unknown> = {};
             try {
-              hydrated = childPropsFromFigma!(raw, []);
+              builtInstance = buildChildInstanceProps!(raw, [], c.mainKey);
             } catch {
               /* skip */
             }
             const picked: Record<string, unknown> = {};
-            for (const k of detectedItemsProp!.varyingHydratedKeys)
-              picked[k] = hydrated[k];
+            for (const k of detectedItemsProp!.builtInstanceKeys)
+              picked[k] = builtInstance[k];
             return picked;
           });
           fullProps[detectedItemsProp.propName] = items;
@@ -1815,6 +1734,73 @@ export async function init(opts: {
       }
       if (u.mainHeight != null && Math.abs(u.height - u.mainHeight) > 0.5) {
         fullProps.height = `${+(u.height / 16).toFixed(6)}rem`;
+      }
+      if (
+        typeof u.scaleFactor === "number" &&
+        Number.isFinite(u.scaleFactor) &&
+        Math.abs(u.scaleFactor - 1) > 0.001
+      ) {
+        detachedUsages.push({
+          figmaId: `${u.fileKey ?? explicitFileKey}:${u.id}`,
+          reason: `scaled component instance (scaleFactor=${+u.scaleFactor.toFixed(6)})`,
+          fields: ["scaleFactor"],
+          targets: [{ nodeId: u.id, fields: ["scaleFactor"] }],
+        });
+        droppedUnconsumed++;
+        continue;
+      }
+      const variantBindings = u.mainKey
+        ? variantBindingsByKey.get(u.mainKey)
+        : undefined;
+      if (variantBindings) {
+        const rawForConsumption: FigmaInstanceRaw = {
+          id: u.id,
+          name: u.name,
+          mainComponentName: "",
+          componentSetKey: normalizedMeta.key ?? "",
+          props: rawProps as Record<string, string | boolean>,
+          exposed: [],
+          textOverrides: u.textOverrides,
+          nestedProps: u.nestedProps,
+          width: u.width,
+          height: u.height,
+          mainWidth: u.mainWidth ?? undefined,
+          mainHeight: u.mainHeight ?? undefined,
+        };
+        const mergedFillOverrides = {
+          ...(inheritedSourceUsage?.fillOverrides ?? {}),
+          ...(u.fillOverrides ?? {}),
+        };
+        const rawOverridesForConsumption = [
+          ...(inheritedSourceUsage?.overrides ?? []),
+          ...(u.overrides ?? []),
+          ...Object.keys(mergedFillOverrides).map((id) => ({
+            id,
+            fields: ["fills"],
+          })),
+        ];
+        rawForConsumption.overrides = normalizeInstanceOverrides(
+          rawForConsumption,
+          u.id,
+          rawOverridesForConsumption,
+        );
+        const unconsumed = unconsumedOverridesForProps(
+          rawForConsumption,
+          fullProps,
+          variantBindings,
+        );
+        if (unconsumed.length > 0) {
+          detachedUsages.push({
+            figmaId: `${u.fileKey ?? explicitFileKey}:${u.id}`,
+            reason: "unconsumed override outside built component props",
+            fields: [...new Set(unconsumed.flatMap((ov) => ov.fields))].sort(),
+            targets: unconsumed
+              .map((ov) => ({ nodeId: ov.nodeId, fields: ov.fields }))
+              .sort((a, b) => a.nodeId.localeCompare(b.nodeId)),
+          });
+          droppedUnconsumed++;
+          continue;
+        }
       }
       // Diff against defaults — drop fields whose value matches the
       // default that defaults.ts emits + impl spreads via `{...defaults,
@@ -1883,15 +1869,11 @@ export async function init(opts: {
       });
     }
     console.log(
-      `[init] usage-based cases: ${usageRows.length} usage(s) hydrated (pre-dedup)`,
+      `[init] usage-based cases: ${usageRows.length} usage(s) built (pre-dedup)`,
     );
-    if (droppedUncovered > 0) {
-      const breakdown = Object.entries(droppedReasons)
-        .sort((a, b) => b[1] - a[1])
-        .map(([f, n]) => `${f}=${n}`)
-        .join(", ");
+    if (droppedUnconsumed > 0) {
       console.log(
-        `[init] dropped ${droppedUncovered} usage(s) with overrides on unexposed props (${breakdown})`,
+        `[init] detached ${droppedUnconsumed} usage(s) with overrides not consumed by built props`,
       );
     }
   }
@@ -1902,9 +1884,11 @@ export async function init(opts: {
         componentName,
         explicitFileKey,
         normalizedMeta,
+        augmentedDefs,
         usageRows,
         detectedLabelProp,
         detectedNestedProps,
+        detectedItemsProp,
         // Map for diff-vs-default trimming. Pulled from augmentedDefs so
         // variant + usecase emit both reference the same baseline that
         // defaults.ts itself emits.
@@ -2032,6 +2016,7 @@ export async function init(opts: {
         componentDir,
         component: component as never,
         targets: cfg.targets,
+        detachedUsages,
       });
     }
   }

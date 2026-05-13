@@ -48,6 +48,8 @@ export async function resolveTargetCaseCapturePlan(opts: {
     const captureDir = resolve(componentDir, '.pixpec', 'dst', opts.target)
     const items: TargetCaseCaptureItem[] = []
     for (const variant of component.variants) {
+      const mainRender = variant.usecases?.find((usecase) => usecase.isMainCase)?.render
+      const variantRender = variant.render ?? mainRender
       for (const usecase of variant.usecases ?? []) {
         if (!wanted.has(usecase.figmaId)) continue
         const safeId = safeCaptureId(usecase.figmaId)
@@ -55,7 +57,7 @@ export async function resolveTargetCaseCapturePlan(opts: {
         items.push({
           id: usecase.figmaId,
           safeId,
-          hasRenderBox: !!(usecase.render?.box ?? variant.render?.box),
+          hasRenderBox: !!(usecase.render?.box ?? variantRender?.box),
           pngPath,
         })
         artifacts.push({ id: usecase.figmaId, pngPath })

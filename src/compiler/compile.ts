@@ -59,7 +59,9 @@ import type {
   RawDropShadowEffect,
 } from "../dumper/raw-node.ts";
 import type { Registry } from "./registry.ts";
+import { resolveRegistryVariant } from "./registry.ts";
 import { shouldDetach } from "./detach.ts";
+import { rawForPropsFromFigma } from "./props-context.ts";
 
 export interface CompileOptions {
   /** Component registry (built by registry.ts from each component's index.ts). */
@@ -80,6 +82,9 @@ export interface CompileOptions {
    *  dropped and the AST carries the raw literal — emitters render the
    *  figma-authoritative pixel result. */
   tokenValueMap?: Record<string, number>;
+  /** Figma variable id → resolved CSS color. Color bindings are kept only
+   *  when this matches the node's effective Figma paint. */
+  tokenColorMap?: Record<string, string>;
   /** Optional callback used to fold pure-visual subtrees (non-autolayout
    *  Frame / Group / Shape with no INSTANCE / TEXT descendants) into a
    *  single DVector. The compiler hits this whenever it detects such a
@@ -87,6 +92,9 @@ export interface CompileOptions {
    *  the compiler falls back to recursing children individually (which
    *  loses absolute-position info on non-autolayout frames). */
   exportSvg?: (nodeId: string) => Promise<string>;
+  /** Compile every INSTANCE from its resolved raw subtree instead of emitting
+   *  a DInstance component reference. Intended for breakdown/debug output. */
+  detachInstances?: boolean;
 }
 
 /** Subtree predicate: every descendant (including the node itself) must
@@ -156,6 +164,7 @@ const FRAMELIKE = new Set(["FRAME", "COMPONENT", "COMPONENT_SET"]);
  *  invisible LINE on the inactive variant.) */
 function isInvisibleShape(c: RawNode): boolean {
   if (!SHAPELIKE.has(c.type)) return false;
+  if (/^bounding box$/i.test(c.name.trim())) return true;
   const hasFill =
     Array.isArray(c.fills) && c.fills.some((f) => f && f.visible !== false);
   const hasStroke =
@@ -269,6 +278,18 @@ function lookupTokenNumber(
   return undefined;
 }
 
+function lookupTokenColor(
+  varId: string | undefined,
+  tokenColorMap: Record<string, string> | undefined,
+): string | undefined {
+  if (!varId || !tokenColorMap) return undefined;
+  for (const key of tokenLookupKeys(varId)) {
+    const value = tokenColorMap[key];
+    if (typeof value === "string") return value;
+  }
+  return undefined;
+}
+
 /** Pick a `Size` value: token path when the bound variable's intrinsic
  *  numeric value matches `actual`; otherwise the raw literal. Undefined
  *  when the actual value is missing. */
@@ -299,12 +320,37 @@ function pickColor(
   if (!paint) return undefined;
   const tokenPath = lookupTokenPath(varId, opts.tokenMap);
   if (tokenPath) {
-    return { tokenPath };
+    const intrinsic = lookupTokenColor(varId, opts.tokenColorMap);
+    const actual = rgbaHex(paint.color, paint.opacity ?? 1);
+    if (intrinsic && colorsEquivalent(intrinsic, actual)) return { tokenPath };
   }
   if (paint.opacity !== undefined && paint.opacity < 0.999) {
     return { color: rgbaHex(paint.color, paint.opacity) };
   }
   return { color: rgbaHex(paint.color, paint.opacity ?? 1) };
+}
+
+function colorsEquivalent(a: string, b: string): boolean {
+  const ca = parseCssColor(a);
+  const cb = parseCssColor(b);
+  if (!ca || !cb) return false;
+  return ca.every((value, index) => Math.abs(value - cb[index]) <= 1);
+}
+
+function parseCssColor(value: string): [number, number, number, number] | undefined {
+  const hex = /^#([0-9a-fA-F]{6})$/.exec(value);
+  if (hex) {
+    const n = Number.parseInt(hex[1], 16);
+    return [(n >> 16) & 255, (n >> 8) & 255, n & 255, 255];
+  }
+  const rgba = /^rgba\((\d+),(\d+),(\d+),([0-9.]+)\)$/.exec(value);
+  if (!rgba) return undefined;
+  return [
+    Number(rgba[1]),
+    Number(rgba[2]),
+    Number(rgba[3]),
+    Math.round(Number(rgba[4]) * 255),
+  ];
 }
 
 function firstDropShadow(
@@ -449,7 +495,7 @@ function compileText(
     (seg: RawTextRun) => {
       const segFill = firstSolidFill(seg.fills);
       return {
-        text: seg.characters,
+        text: sanitizeTextContent(seg.characters),
         color: pickColor(segFill, undefined, opts),
         fontFamily: seg.fontName?.family,
         fontWeight: seg.fontWeight,
@@ -472,7 +518,7 @@ function compileText(
   const out: DText = {
     ...buildBase(n, opts, parent),
     kind: NodeKind.Text,
-    content: n.characters ?? "",
+    content: sanitizeTextContent(n.characters ?? ""),
     fontFamily: n.fontName?.family,
     fontWeight: n.fontWeight,
     fontSize,
@@ -494,11 +540,15 @@ function compileText(
   return out;
 }
 
-function compileShape(
+function sanitizeTextContent(value: string): string {
+  return value.replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g, "");
+}
+
+async function compileShape(
   n: RawNode,
   opts: CompileOptions,
   parent?: RawNode,
-): DShape | DImage {
+): Promise<DShape | DImage> {
   const imageFill = firstImageFill(n.fills);
   if (imageFill?.dataUrl) {
     return {
@@ -508,6 +558,8 @@ function compileShape(
       height:
         pickSize(n.height, varId(n.boundVariables, "height"), opts) ?? px(0),
       dataUrl: imageFill.dataUrl,
+      imageScaleMode: imageFill.scaleMode,
+      imageTransform: imageFill.imageTransform,
     };
   }
   const fill = firstSolidFill(n.fills);
@@ -616,20 +668,30 @@ function paddingFromRaw(n: RawNode, opts: CompileOptions): Padding | undefined {
   };
 }
 
-function compileVector(
+async function compileVector(
   n: RawNode,
   opts: CompileOptions,
   parent?: RawNode,
-): DVector | DImage {
+): Promise<DVector | DImage> {
   const w = pickSize(n.width, undefined, opts) ?? px(0);
   const h = pickSize(n.height, undefined, opts) ?? px(0);
-  if (n.svg) {
+  let svg = n.svg;
+  if (!svg && n.svgExportFailed) svg = svgFromVectorPaths(n);
+  if (!svg && opts.exportSvg) {
+    try {
+      svg = await exportSvgForRawNode(n, opts);
+    } catch (error) {
+      svg = svgFromVectorPaths(n);
+      if (!svg) throw error;
+    }
+  }
+  if (svg) {
     return {
       ...buildBase(n, opts, parent),
       kind: NodeKind.Vector,
       width: w,
       height: h,
-      svg: n.svg,
+      svg,
     };
   }
   return {
@@ -640,10 +702,36 @@ function compileVector(
   };
 }
 
+function svgFromVectorPaths(n: RawNode): string | undefined {
+  if (!Array.isArray(n.vectorPaths) || n.vectorPaths.length === 0) return undefined;
+  const width = n.width ?? 0;
+  const height = n.height ?? 0;
+  const fill = firstSolidFill(n.fills);
+  const stroke = firstSolidFill(n.strokes);
+  const fillAttr = fill ? ` fill="${escapeXml(rgbaHex(fill.color, fill.opacity ?? 1))}"` : ' fill="none"';
+  const strokeAttr = stroke ? ` stroke="${escapeXml(rgbaHex(stroke.color, stroke.opacity ?? 1))}"` : '';
+  const paths = n.vectorPaths
+    .map((path) => {
+      const fillRule = path.windingRule === 'EVENODD' ? ' fill-rule="evenodd"' : '';
+      return `<path d="${escapeXml(path.data)}"${fillAttr}${strokeAttr}${fillRule}/>`;
+    })
+    .join('');
+  return `<svg width="${width}" height="${height}" viewBox="0 0 ${width} ${height}" xmlns="http://www.w3.org/2000/svg">${paths}</svg>`;
+}
+
+function escapeXml(value: string): string {
+  return value
+    .replace(/&/g, '&amp;')
+    .replace(/"/g, '&quot;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
+}
+
 async function compileContainer(
   n: RawNode,
   opts: CompileOptions,
   parent?: RawNode,
+  rawSubtree = false,
 ): Promise<DFlex | DStack | DBox> {
   const direction =
     n.layoutMode === "HORIZONTAL"
@@ -657,7 +745,11 @@ async function compileContainer(
     (c) => c.visible !== false && !isInvisibleShape(c),
   );
   const children: DNode[] = [];
-  for (const c of childRaws) children.push(await compileNode(c, opts, n));
+  for (const c of childRaws) {
+    const child = await compileNode(c, opts, n, rawSubtree);
+    if (direction === "none") applyAbsoluteChildPosition(child, c, n);
+    children.push(child);
+  }
   const bgVarId =
     varId(fill?.boundVariables, "color") ?? varId(n.boundVariables, "fills");
   const strokeVarId = varId(stroke?.boundVariables, "color");
@@ -755,11 +847,41 @@ async function compileContainer(
   return { ...common, kind: NodeKind.Box };
 }
 
+function applyAbsoluteChildPosition(
+  out: DNode,
+  n: RawNode,
+  parent: RawNode,
+): void {
+  if (out.positioning === Positioning.Absolute) return;
+  out.positioning = Positioning.Absolute;
+  out.inset = { left: n.x ?? 0, top: n.y ?? 0 };
+  if (
+    typeof parent.width === "number" &&
+    typeof n.width === "number"
+  ) {
+    out.inset.right = parent.width - (n.x ?? 0) - n.width;
+  }
+  if (
+    typeof parent.height === "number" &&
+    typeof n.height === "number"
+  ) {
+    out.inset.bottom = parent.height - (n.y ?? 0) - n.height;
+  }
+  if (n.constraints) {
+    const h = anchorFromConstraint(n.constraints.horizontal);
+    const v = anchorFromConstraint(n.constraints.vertical);
+    if (h || v) out.anchor = { horizontal: h, vertical: v };
+  }
+}
+
 async function compileInstance(
   n: RawNode,
   opts: CompileOptions,
   parent?: RawNode,
+  rawSubtree = false,
 ): Promise<DNode> {
+  if (rawSubtree || opts.detachInstances) return compileContainer(n, opts, parent, true);
+
   const setKey = n.mainComponent?.parentKey ?? n.mainComponent?.key;
   const entry = setKey ? opts.registry.get(setKey) : undefined;
   if (!entry) {
@@ -769,18 +891,14 @@ async function compileInstance(
         `or detach the instance in figma.`,
     );
   }
-  if (shouldDetach(n, entry)) return compileContainer(n, opts, parent);
+  const variant = resolveRegistryVariant(
+    entry,
+    n.mainComponent?.key,
+    n.mainComponent?.name,
+  );
+  if (shouldDetach(n, entry, variant)) return compileContainer(n, opts, parent, true);
 
-  const rawForFigma = {
-    id: n.id,
-    name: n.name,
-    mainComponentName: n.mainComponent?.name ?? "",
-    componentSetKey: setKey ?? "",
-    props: extractPropsRecord(n.componentProperties),
-    exposed: (n.exposedInstances ?? []).map((i) => i.name),
-    textOverrides: collectTextOverrides(n),
-    nestedProps: collectNestedInstanceProps(n),
-  };
+  const rawForFigma = rawForPropsFromFigma(n);
   // Compile child nodes (recursively) so propsFromFigma can aggregate
   // nested-instance data — e.g. a Tab instance collects `tabItems` from
   // its compiled DInstance(TabItem) children. Most components ignore the
@@ -790,7 +908,7 @@ async function compileInstance(
     compiledChildren.push(await compileNode(c, opts, n));
   let props: Record<string, unknown> = {};
   try {
-    props = entry.propsFromFigma?.(rawForFigma, compiledChildren) ?? {};
+    props = variant?.propsFromFigma?.(rawForFigma, compiledChildren) ?? {};
   } catch {
     /* best-effort */
   }
@@ -904,6 +1022,7 @@ async function compileNode(
   n: RawNode,
   opts: CompileOptions,
   parent?: RawNode,
+  rawSubtree = false,
 ): Promise<DNode> {
   // Fold pure-visual subtrees (non-autolayout Frame/Group/Shape only, no
   // INSTANCE/TEXT inside) into a single DVector via figma SVG export. The
@@ -917,33 +1036,58 @@ async function compileNode(
     (n.children?.length ?? 0) > 0
   ) {
     const safe = allChildrenSafeToFold(n);
-    if (safe !== true) {
-      throw new Error(
-        `pixpec compile: subtree at ${n.name} (${n.id}) is pure-visual but child ${safe.node} ` +
-          `has constraints { horizontal: ${safe.horizontal}, vertical: ${safe.vertical} } — ` +
-          `single-svg fold only supports SCALE/SCALE. Per-child positioning fallback NOT IMPLEMENTED yet.`,
-      );
+    if (safe === true) {
+      try {
+        const svg = await exportSvgForRawNode(n, opts);
+        return {
+          ...buildBase(n, opts, parent),
+          kind: NodeKind.Vector,
+          width:
+            pickSize(n.width, varId(n.boundVariables, "width"), opts) ??
+            px(n.width ?? 0),
+          height:
+            pickSize(n.height, varId(n.boundVariables, "height"), opts) ??
+            px(n.height ?? 0),
+          svg,
+        };
+      } catch {
+        // Some detached-instance descendants have visible vector geometry but
+        // Figma refuses direct SVG export. Fall through to the normal
+        // container path so children remain proper vector/shape nodes.
+      }
     }
-    const bareId = stripPrefix(n.id);
-    const svg = await opts.exportSvg(bareId);
-    return {
-      ...buildBase(n, opts, parent),
-      kind: NodeKind.Vector,
-      width:
-        pickSize(n.width, varId(n.boundVariables, "width"), opts) ??
-        px(n.width ?? 0),
-      height:
-        pickSize(n.height, varId(n.boundVariables, "height"), opts) ??
-        px(n.height ?? 0),
-      svg,
-    };
   }
   if (n.type === "TEXT") return compileText(n, opts, parent);
   if (SHAPELIKE.has(n.type)) return compileShape(n, opts, parent);
   if (VECTORLIKE.has(n.type)) return compileVector(n, opts, parent);
-  if (n.type === "INSTANCE") return compileInstance(n, opts, parent);
-  if (FRAMELIKE.has(n.type)) return compileContainer(n, opts, parent);
+  if (n.type === "INSTANCE") return compileInstance(n, opts, parent, rawSubtree);
+  if (FRAMELIKE.has(n.type)) return compileContainer(n, opts, parent, rawSubtree);
   return compileUnknown(n, opts, parent);
+}
+
+async function exportSvgForRawNode(n: RawNode, opts: CompileOptions): Promise<string> {
+  if (!opts.exportSvg) throw new Error("pixpec compile: exportSvg callback is not configured");
+  const bareId = stripPrefix(n.id);
+  try {
+    return await opts.exportSvg(bareId);
+  } catch (error) {
+    if (bareId !== n.id) {
+      try {
+        return await opts.exportSvg(n.id);
+      } catch (fullError) {
+        throw new Error(
+          `pixpec compile: SVG export failed for ${n.name} (${n.id}; bare ${bareId}): ` +
+            `${fullError instanceof Error ? fullError.message : String(fullError)}`,
+          { cause: fullError },
+        );
+      }
+    }
+    throw new Error(
+      `pixpec compile: SVG export failed for ${n.name} (${n.id}): ` +
+        `${error instanceof Error ? error.message : String(error)}`,
+      { cause: error },
+    );
+  }
 }
 
 /** Compile a raw dump tree into a Design AST tree. */

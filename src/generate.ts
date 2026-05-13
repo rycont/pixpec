@@ -29,6 +29,10 @@ export interface GenerateOptions {
   propKeys?: string[]
   /** Props file for component output. Set null for view output. */
   propsFile?: string | null
+  /** Compile INSTANCE nodes as detached raw subtrees. */
+  detachInstances?: boolean
+  /** Override pixpec.toml scale for generated target code. */
+  renderScale?: number
 }
 
 export interface GenerateManyOptions extends Omit<GenerateOptions, 'target'> {
@@ -73,6 +77,7 @@ export async function runGenerate(componentId: string, opts: GenerateOptions = {
   // Load token map (figma var id → semantic path) + intrinsic numeric values.
   const tokenMap: Record<string, string> = {}
   const tokenValueMap: Record<string, number> = {}
+  const tokenColorMap: Record<string, string> = {}
   try {
     const ft = JSON.parse(await readFile(resolve(root, 'tokens/figma-tokens.json'), 'utf8')) as {
       variables: Array<{ id: string; key?: string; name: string; resolvedType: string; valuesByMode?: Record<string, unknown> }>
@@ -91,6 +96,14 @@ export async function runGenerate(componentId: string, opts: GenerateOptions = {
           tokenValueMap[tokenPath] = num
         }
       }
+      if (v.resolvedType === 'COLOR' && v.valuesByMode) {
+        const color = Object.values(v.valuesByMode).map(colorTokenToCss).find((x): x is string => !!x)
+        if (color) {
+          tokenColorMap[v.id] = color
+          if (v.key) tokenColorMap[v.key] = color
+          tokenColorMap[tokenPath] = color
+        }
+      }
     }
   } catch { /* tokens file is optional */ }
 
@@ -98,6 +111,12 @@ export async function runGenerate(componentId: string, opts: GenerateOptions = {
   let typographyMap: Record<string, string> = {}
   try {
     typographyMap = JSON.parse(await readFile(resolve(componentsDir, 'typography/figma-binding.json'), 'utf8'))
+  } catch { /* optional */ }
+
+  // Load optional font calibration metadata shared by capture/codegen targets.
+  let fontManifest: unknown
+  try {
+    fontManifest = JSON.parse(await readFile(resolve(root, 'src/fonts/__pixpec-fonts.json'), 'utf8'))
   } catch { /* optional */ }
 
   // Load codegen plugins from pixpec.config.ts (icon currentColor etc.).
@@ -127,12 +146,13 @@ export async function runGenerate(componentId: string, opts: GenerateOptions = {
   const componentName = opts.componentName ?? ownerEntry?.componentName ?? 'Generated'
 
   // Dump → compile → target codegen.
+  const targetName = opts.target
   const raw = await dump({ cfigmaBin: cfg.cfigmaBin ?? 'cfigma', tab: tab.key, nodeId })
   const ast = await compile(raw, {
-    registry, bindings: bindingsForNode, tokenMap, tokenValueMap,
+    registry, bindings: bindingsForNode, tokenMap, tokenValueMap, tokenColorMap,
     exportSvg: (id) => exportNodeSvg({ cfigmaBin: cfg.cfigmaBin ?? 'cfigma', tab: tab.key, nodeId: id }),
+    detachInstances: opts.detachInstances || targetName === 'gpui',
   })
-  const targetName = opts.target
   const target = getTarget(targetName)
   // Land in <componentsDir>/<componentName>/generated/<safeId>.<ext> unless
   // the caller delegates a different output directory.
@@ -140,12 +160,19 @@ export async function runGenerate(componentId: string, opts: GenerateOptions = {
   const outDir = opts.outputDir ?? resolve(componentsDir, componentName, 'generated')
   const result = await target.codegen(ast, {
     componentName,
-    designSystem: { tokens: tokenMap, tokenValues: tokenValueMap, typography: typographyMap },
+    designSystem: {
+      tokens: tokenMap,
+      tokenValues: tokenValueMap,
+      tokenColors: tokenColorMap,
+      typography: typographyMap,
+      fonts: fontManifest,
+    },
     registry: new Map(
       [...registry].map(([, v]) => [v.componentName, { componentName: v.componentName, dir: v.dir, hasProps: true }]),
     ),
     plugins: plugins as never,
     remBase: cfg.remBase,
+    renderScale: opts.renderScale ?? cfg.scale,
     propKeys: opts.propKeys,
     outputDir: outDir,
     rootDir: root,
@@ -177,6 +204,22 @@ export async function runGenerate(componentId: string, opts: GenerateOptions = {
     await writeFile(scPath, sc.content)
   }
   return { componentName, outPath, source }
+}
+
+function colorTokenToCss(value: unknown): string | undefined {
+  if (!value || typeof value !== 'object') return undefined
+  const c = value as { r?: unknown; g?: unknown; b?: unknown; a?: unknown }
+  if (typeof c.r !== 'number' || typeof c.g !== 'number' || typeof c.b !== 'number') return undefined
+  const r = Math.round(Math.max(0, Math.min(1, c.r)) * 255)
+  const g = Math.round(Math.max(0, Math.min(1, c.g)) * 255)
+  const b = Math.round(Math.max(0, Math.min(1, c.b)) * 255)
+  const a = typeof c.a === 'number' ? Math.max(0, Math.min(1, c.a)) : 1
+  if (a >= 1) return `#${hexByte(r)}${hexByte(g)}${hexByte(b)}`
+  return `rgba(${r},${g},${b},${+a.toFixed(6)})`
+}
+
+function hexByte(value: number): string {
+  return value.toString(16).padStart(2, '0')
 }
 
 function hasDescId(root: import('./dumper/raw-node.ts').RawNode, id: string): boolean {

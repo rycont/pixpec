@@ -1,6 +1,8 @@
+import { createHash } from 'node:crypto'
 import { existsSync } from 'node:fs'
-import { mkdir, readFile, symlink, unlink, writeFile } from 'node:fs/promises'
+import { copyFile, mkdir, readdir, readFile, rm, stat, symlink, unlink, writeFile } from 'node:fs/promises'
 import { spawn } from 'node:child_process'
+import { tmpdir } from 'node:os'
 import { resolve } from 'node:path'
 import type { CaptureRequest, CaptureResult } from '../types.ts'
 import {
@@ -12,7 +14,7 @@ import {
 export async function captureGpuiDestination(request: CaptureRequest): Promise<CaptureResult> {
   assertSupportedCaptureKind(request.kind)
   const plan = await resolveTargetCaseCapturePlan({ target: 'gpui', ids: request.ids })
-  const libDir = await ensureLinkerLibs()
+  const runtime = await prepareGpuiCaptureRuntime(plan.runtimeDir)
   for (const group of plan.groups) {
     for (const item of group.items) {
       const usecase = group.component.variants
@@ -35,21 +37,13 @@ export async function captureGpuiDestination(request: CaptureRequest): Promise<C
       const height = Math.max(1, Math.ceil(box?.height ?? group.component.viewport?.height ?? 600))
       const caseDir = resolve(plan.runtimeDir, safeCaptureId(item.id))
       await mkdir(resolve(caseDir, 'src'), { recursive: true })
-      await writeRuntimeProject({
+      await captureGpuiGeneratedWithRuntime({
+        runtime,
         caseDir,
         generatedPath,
         width,
         height,
-      })
-      await execFileStrict('cargo', ['build'], {
-        cwd: caseDir,
-        env: { ...process.env, LIBRARY_PATH: libDir },
-      })
-      await captureOneWindow({
-        cwd: caseDir,
-        libDir,
-        width,
-        height,
+        outputScale: plan.scale ?? 2,
         outPath: item.pngPath,
       })
     }
@@ -57,11 +51,59 @@ export async function captureGpuiDestination(request: CaptureRequest): Promise<C
   return { artifacts: plan.artifacts }
 }
 
-async function writeRuntimeProject(opts: {
+export interface GpuiCaptureRuntime {
+  runtimeDir: string
+  libDir: string
+  gpuiPreviewDir: string
+  fontDir?: string
+}
+
+export async function prepareGpuiCaptureRuntime(runtimeDir: string): Promise<GpuiCaptureRuntime> {
+  return {
+    runtimeDir,
+    libDir: await ensureLinkerLibs(),
+    gpuiPreviewDir: await ensurePatchedGpui(),
+    fontDir: await prepareGpuiFontDir(runtimeDir),
+  }
+}
+
+export async function captureGpuiGeneratedWithRuntime(opts: {
+  runtime: GpuiCaptureRuntime
   caseDir: string
   generatedPath: string
   width: number
   height: number
+  outputScale: number
+  outPath: string
+}): Promise<void> {
+  await mkdir(resolve(opts.caseDir, 'src'), { recursive: true })
+  await writeRuntimeProject({
+    caseDir: opts.caseDir,
+    generatedPath: opts.generatedPath,
+    gpuiPath: resolve(opts.runtime.gpuiPreviewDir, 'vendor/gpui'),
+    width: opts.width,
+    height: opts.height,
+    outputScale: opts.outputScale,
+    outPath: opts.outPath,
+  })
+  await execFileStrict('cargo', ['build'], {
+    cwd: opts.caseDir,
+    env: sharedCargoEnv(opts.runtime.runtimeDir, opts.runtime.libDir),
+  })
+  await execFileStrict(resolve(opts.runtime.runtimeDir, 'target/debug/pixpec-gpui-capture'), [], {
+    cwd: opts.caseDir,
+    env: sharedCargoEnv(opts.runtime.runtimeDir, opts.runtime.libDir, opts.runtime.fontDir),
+  })
+}
+
+async function writeRuntimeProject(opts: {
+  caseDir: string
+  generatedPath: string
+  gpuiPath: string
+  width: number
+  height: number
+  outputScale: number
+  outPath: string
 }): Promise<void> {
   await writeFile(
     resolve(opts.caseDir, 'Cargo.toml'),
@@ -71,145 +113,189 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-gpui = "0.2.2"
+anyhow = "1.0"
+gpui = { path = ${JSON.stringify(opts.gpuiPath)} }
+image = { version = "0.25.9", default-features = false, features = ["png"] }
 `,
   )
   await writeFile(
     resolve(opts.caseDir, 'src/main.rs'),
-    `use gpui::{
-    div, px, size, App, Application, Bounds, Context, IntoElement, Render, Window,
-    WindowBackgroundAppearance, WindowBounds, WindowOptions,
+    `use anyhow::Result;
+use gpui::{
+    px, point, size, App, Application, AssetSource, Bounds, SharedString, WindowBounds,
+    WindowOptions,
 };
 use gpui::prelude::*;
+use std::borrow::Cow;
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 #[path = ${JSON.stringify(opts.generatedPath)}]
 mod generated;
 
-struct CaptureRoot;
+struct CaptureAssets {
+    base: PathBuf,
+}
 
-impl Render for CaptureRoot {
-    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-        div()
-            .w(px(${float(opts.width)}))
-            .h(px(${float(opts.height)}))
-            .overflow_hidden()
-            .child(generated::Generated)
+impl AssetSource for CaptureAssets {
+    fn load(&self, path: &str) -> Result<Option<Cow<'static, [u8]>>> {
+        fs::read(self.base.join(path))
+            .map(|data| Some(Cow::Owned(data)))
+            .map_err(Into::into)
+    }
+
+    fn list(&self, path: &str) -> Result<Vec<SharedString>> {
+        fs::read_dir(self.base.join(path))
+            .map(|entries| {
+                entries
+                    .filter_map(|entry| {
+                        entry
+                            .ok()
+                            .and_then(|entry| entry.file_name().into_string().ok())
+                            .map(SharedString::from)
+                    })
+                    .collect()
+            })
+            .map_err(Into::into)
     }
 }
 
 fn main() {
-    Application::new().run(|cx: &mut App| {
-        let bounds = Bounds::centered(None, size(px(${float(opts.width)}), px(${float(opts.height)})), cx);
-        cx.open_window(
+    let generated_dir = PathBuf::from(${JSON.stringify(opts.generatedPath)})
+        .parent()
+        .expect("generated source path has parent directory")
+        .to_path_buf();
+
+    Application::new().with_assets(CaptureAssets { base: generated_dir }).run(|cx: &mut App| {
+        if let Some(font_dir) = std::env::var_os("PIXPEC_GPUI_FONT_DIR").map(PathBuf::from) {
+            let mut fonts = Vec::new();
+            collect_font_files(&font_dir, &mut fonts);
+            if !fonts.is_empty() {
+                cx.text_system().add_fonts(fonts).ok();
+            }
+        }
+
+        let bounds = Bounds::new(
+            point(px(0.0), px(0.0)),
+            size(
+                px(${float(opts.width)} * ${float(opts.outputScale)}),
+                px(${float(opts.height)} * ${float(opts.outputScale)}),
+            ),
+        );
+        let handle = cx.open_window(
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
-                window_background: WindowBackgroundAppearance::Transparent,
-                focus: true,
-                show: true,
+                focus: false,
+                show: false,
                 is_resizable: false,
                 app_id: Some("pixpec-gpui-capture".to_string()),
                 ..Default::default()
             },
-            |_, cx| cx.new(|_| CaptureRoot),
+            |_, cx| cx.new(|_| generated::Generated),
         )
         .unwrap();
-        cx.activate(true);
+
+        cx.spawn(async move |cx| {
+            cx.background_executor().timer(Duration::from_millis(750)).await;
+            let result = handle.update(cx, |_view, window, _cx| {
+                let Some((width, height, mut bgra)) = window.capture_frame() else {
+                    anyhow::bail!("GPUI capture_frame returned None");
+                };
+                let target_width = (${float(opts.width)}_f32 * ${float(opts.outputScale)}_f32).round().max(1.0) as u32;
+                let target_height = (${float(opts.height)}_f32 * ${float(opts.outputScale)}_f32).round().max(1.0) as u32;
+                let frame_scale_x = width as f32 / target_width as f32;
+                let frame_scale_y = height as f32 / target_height as f32;
+                let can_resample = width >= target_width &&
+                    height >= target_height &&
+                    (frame_scale_x - frame_scale_y).abs() < 0.02;
+                if (width != target_width || height != target_height) &&
+                    !(width >= target_width && height >= target_height) &&
+                    !can_resample {
+                    anyhow::bail!(
+                        "GPUI capture_frame returned {}x{}, expected {}x{}. The platform window was likely clamped; lower the capture scale or use tiled/offscreen rendering.",
+                        width,
+                        height,
+                        target_width,
+                        target_height,
+                    );
+                }
+                for pixel in bgra.chunks_exact_mut(4) {
+                    pixel.swap(0, 2);
+                    let alpha = pixel[3] as u16;
+                    if alpha > 0 && alpha < 255 {
+                        pixel[0] = ((pixel[0] as u16 * 255 + alpha / 2) / alpha).min(255) as u8;
+                        pixel[1] = ((pixel[1] as u16 * 255 + alpha / 2) / alpha).min(255) as u8;
+                        pixel[2] = ((pixel[2] as u16 * 255 + alpha / 2) / alpha).min(255) as u8;
+                    }
+                }
+                let image = image::RgbaImage::from_raw(width, height, bgra)
+                    .ok_or_else(|| anyhow::anyhow!("invalid GPUI frame buffer dimensions"))?;
+                let image = if width == target_width && height == target_height {
+                    image
+                } else {
+                    image::imageops::resize(
+                        &image,
+                        target_width,
+                        target_height,
+                        image::imageops::FilterType::Lanczos3,
+                    )
+                };
+                image.save(Path::new(${JSON.stringify(opts.outPath)}))?;
+                Ok::<_, anyhow::Error>(())
+            });
+            let result = result
+                .map_err(anyhow::Error::from)
+                .and_then(|inner| inner);
+            if let Err(error) = result {
+                eprintln!("{:#}", error);
+                std::process::exit(1);
+            }
+            cx.update(|cx| cx.quit())?;
+            Ok::<_, anyhow::Error>(())
+        })
+        .detach();
     });
+}
+
+fn collect_font_files(dir: &Path, out: &mut Vec<Cow<'static, [u8]>>) {
+    let Ok(entries) = fs::read_dir(dir) else { return; };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_font_files(&path, out);
+            continue;
+        }
+        let Some(ext) = path.extension().and_then(|ext| ext.to_str()).map(|ext| ext.to_ascii_lowercase()) else {
+            continue;
+        };
+        if matches!(ext.as_str(), "ttf" | "otf") {
+            if let Ok(bytes) = fs::read(path) {
+                out.push(Cow::Owned(bytes));
+            }
+        }
+    }
 }
 `,
   )
 }
 
-async function captureOneWindow(opts: {
-  cwd: string
-  libDir: string
-  width: number
-  height: number
-  outPath: string
-}): Promise<void> {
-  const before = await listXWindows()
-  const child = spawn(['./target/debug/pixpec-gpui-capture'][0]!, {
-    cwd: opts.cwd,
-    env: {
-      ...process.env,
-      LIBRARY_PATH: opts.libDir,
-      WAYLAND_DISPLAY: undefined,
-      XDG_SESSION_TYPE: 'x11',
-    },
-    stdio: ['ignore', 'pipe', 'pipe'],
-  })
-  let stderr = ''
-  child.stderr.on('data', (chunk) => {
-    stderr += String(chunk)
-  })
-  try {
-    await sleep(1_500)
-    const after = await listXWindows()
-    const beforeIds = new Set(before.map((w) => w.id))
-    const win = after.find(
-      (w) => !beforeIds.has(w.id) && w.width === opts.width && w.height === opts.height,
-    ) ?? after.find((w) => w.width === opts.width && w.height === opts.height)
-    if (!win) {
-      throw new Error(
-        `capture dst:gpui cannot find X11 window ${opts.width}x${opts.height}. stderr: ${stderr}`,
-      )
-    }
-    const xwdPath = resolve(opts.cwd, 'capture.xwd')
-    await execFileStrict('xwd', ['-silent', '-id', win.id, '-out', xwdPath], { cwd: opts.cwd })
-    await xwdToPng(xwdPath, opts.outPath)
-  } finally {
-    child.kill('SIGTERM')
-    await new Promise((resolve) => child.once('exit', resolve))
-  }
-}
+async function ensurePatchedGpui(): Promise<string> {
+  const fromEnv = process.env.PIXPEC_GPUI_PREVIEW_DIR
+  if (fromEnv && existsSync(resolve(fromEnv, 'vendor/gpui'))) return fromEnv
 
-interface XWindow {
-  id: string
-  width: number
-  height: number
-}
-
-async function listXWindows(): Promise<XWindow[]> {
-  const out = await execFileStrict('xwininfo', ['-root', '-tree'])
-  const windows: XWindow[] = []
-  const re = /^\s*(0x[0-9a-f]+)\s+.*?(\d+)x(\d+)[+-]/i
-  for (const line of out.split('\n')) {
-    const m = re.exec(line)
-    if (!m) continue
-    const width = Number(m[2])
-    const height = Number(m[3])
-    if (width <= 1 || height <= 1) continue
-    windows.push({ id: m[1]!, width, height })
+  const dir = resolve(tmpdir(), 'pixpec-gpui-preview')
+  if (!existsSync(resolve(dir, 'vendor/gpui'))) {
+    await rm(dir, { recursive: true, force: true })
+    await execFileStrict('git', [
+      'clone',
+      '--depth',
+      '1',
+      'https://github.com/Wally869/gpui-preview',
+      dir,
+    ])
   }
-  return windows
-}
-
-async function xwdToPng(xwdPath: string, pngPath: string): Promise<void> {
-  const sharp = (await import('sharp')).default
-  const buf = await readFile(xwdPath)
-  const u32 = (offset: number) => buf.readUInt32BE(offset)
-  const headerSize = u32(0)
-  const width = u32(16)
-  const height = u32(20)
-  const bitsPerPixel = u32(44)
-  const bytesPerLine = u32(48)
-  const ncolors = u32(76)
-  if (bitsPerPixel !== 32) {
-    throw new Error(`capture dst:gpui unsupported XWD bits_per_pixel=${bitsPerPixel}`)
-  }
-  const pixelOffset = headerSize + ncolors * 12
-  const raw = Buffer.alloc(width * height * 4)
-  for (let y = 0; y < height; y++) {
-    for (let x = 0; x < width; x++) {
-      const pixel = buf.readUInt32LE(pixelOffset + y * bytesPerLine + x * 4)
-      const out = (y * width + x) * 4
-      raw[out] = (pixel >> 16) & 0xff
-      raw[out + 1] = (pixel >> 8) & 0xff
-      raw[out + 2] = pixel & 0xff
-      raw[out + 3] = 0xff
-    }
-  }
-  await sharp(raw, { raw: { width, height, channels: 4 } }).png().toFile(pngPath)
+  return dir
 }
 
 async function ensureLinkerLibs(): Promise<string> {
@@ -222,6 +308,98 @@ async function ensureLinkerLibs(): Promise<string> {
     resolve(dir, 'libxkbcommon-x11.so'),
   )
   return dir
+}
+
+async function prepareGpuiFontDir(runtimeDir: string): Promise<string | undefined> {
+  const source = process.env.PIXPEC_GPUI_FONT_DIR
+  if (!source) return undefined
+  if (!existsSync(source)) return source
+
+  const files = await collectFontPaths(source)
+  if (files.length === 0) return source
+
+  const dir = resolve(runtimeDir, 'gpui-fonts')
+  await rm(dir, { recursive: true, force: true })
+  await mkdir(dir, { recursive: true })
+
+  for (const file of files) {
+    const hash = createHash('sha1').update(file).digest('hex').slice(0, 10)
+    const ext = file.split('.').pop() ?? 'ttf'
+    const base = file
+      .split(/[\\/]/)
+      .pop()
+      ?.replace(/\.[^.]+$/, '')
+      .replace(/[^A-Za-z0-9._-]/g, '_') ?? 'font'
+    let instantiated = false
+
+    if (ext.toLowerCase() === 'ttf' && (await hasSfntTable(file, 'fvar'))) {
+      for (const weight of GPUI_STATIC_FONT_WEIGHTS) {
+        const out = resolve(dir, `${base}-${hash}-wght-${weight}.ttf`)
+        try {
+          await execFileStrict(fonttoolsBin(), [
+            'varLib.instancer',
+            file,
+            `wght=${weight}`,
+            '--output',
+            out,
+          ])
+          instantiated = true
+        } catch {
+          await rm(out, { force: true }).catch(() => undefined)
+        }
+      }
+    }
+
+    if (!instantiated) {
+      await copyFile(file, resolve(dir, `${base}-${hash}.${ext}`))
+    }
+  }
+
+  return dir
+}
+
+const GPUI_STATIC_FONT_WEIGHTS = [100, 200, 300, 400, 500, 600, 700, 800, 900]
+
+function fonttoolsBin(): string {
+  return process.env.PIXPEC_FONTTOOLS_BIN || 'fonttools'
+}
+
+async function collectFontPaths(dir: string): Promise<string[]> {
+  const entries = await readdir(dir).catch(() => [])
+  const files: string[] = []
+  for (const entry of entries) {
+    const path = resolve(dir, entry)
+    const info = await stat(path).catch(() => undefined)
+    if (!info) continue
+    if (info.isDirectory()) files.push(...(await collectFontPaths(path)))
+    else if (/\.(ttf|otf)$/i.test(entry)) files.push(path)
+  }
+  return files
+}
+
+async function hasSfntTable(path: string, tag: string): Promise<boolean> {
+  const bytes = await readFile(path)
+  if (bytes.length < 12) return false
+  const tableCount = bytes.readUInt16BE(4)
+  for (let i = 0; i < tableCount; i++) {
+    const offset = 12 + i * 16
+    if (offset + 4 > bytes.length) return false
+    if (bytes.toString('ascii', offset, offset + 4) === tag) return true
+  }
+  return false
+}
+
+function sharedCargoEnv(
+  runtimeDir: string,
+  libDir: string,
+  fontDir?: string,
+): NodeJS.ProcessEnv {
+  return {
+    ...process.env,
+    CARGO_TARGET_DIR: resolve(runtimeDir, 'target'),
+    LIBRARY_PATH: libDir,
+    ...(fontDir ? { PIXPEC_GPUI_FONT_DIR: fontDir } : {}),
+  }
 }
 
 async function forceSymlink(target: string, path: string): Promise<void> {
@@ -254,10 +432,6 @@ function execFileStrict(
       else reject(new Error(`${file} ${args.join(' ')} exited ${code}\n${stderr}`))
     })
   })
-}
-
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms))
 }
 
 function float(value: number): string {

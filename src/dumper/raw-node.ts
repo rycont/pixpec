@@ -26,6 +26,7 @@ export interface RawImagePaint {
   type: "IMAGE";
   visible?: boolean;
   scaleMode?: string;
+  imageTransform?: [[number, number, number], [number, number, number]];
   imageHash?: string;
   dataUrl?: string;
 }
@@ -81,6 +82,9 @@ export interface RawNode {
   /** Bounding-box dim (post-rotation if rotation set; figma quirks). */
   width?: number;
   height?: number;
+  /** Figma InstanceNode scale factor. Present only when a component instance
+   * has been rescaled as a whole instead of directly resizing descendants. */
+  scaleFactor?: number;
   /** Position relative to parent. */
   x?: number;
   y?: number;
@@ -175,6 +179,8 @@ export interface RawNode {
   /** Set when SVG export failed (figma sometimes returns empty for
    *  invisible/clipped nodes); fallback emit needed. */
   svgExportFailed?: boolean;
+  /** Raw Figma vector path data, used when SVG export fails for a VECTOR. */
+  vectorPaths?: Array<{ windingRule?: string; data: string }>;
 
   // ---- recursion ----
   children?: RawNode[];

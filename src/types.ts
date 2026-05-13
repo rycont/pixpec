@@ -128,6 +128,15 @@ export interface Variant<
 > {
   key: string
   bindings?: NodeBindings<P, Nodes>
+  /** Variant-local runtime schema (usually a Zod object). Kept opaque so
+   * pixpec/spec stays schema-library-light at the type boundary. */
+  propsSchema?: unknown
+  /** Variant-local parser. The same semantic prop can map to different
+   * Figma node ids per variant, so props hydration lives next to bindings. */
+  propsFromFigma?: (
+    raw: FigmaInstanceRaw,
+    children?: import('./compiler/design-ast.ts').DNode[],
+  ) => P
   usecases: Case<P>[]
   /** Platform-neutral render/capture context inherited by this variant's usecases. */
   render?: CaseRenderSpec
@@ -240,8 +249,15 @@ export interface FigmaInstanceRaw {
    * overrides; init's auto-detect picks which (layer, prop) combos are
    * worth exposing as parent-level props. */
   nestedProps?: Record<string, Record<string, string | boolean>>
+  /** Component-relevant overrides after Pixpec normalization. Metadata and
+   * root layout fields are removed before propsFromFigma receives them. */
+  overrides?: FigmaOverride[]
 }
 
+export interface FigmaOverride {
+  nodeId: string
+  fields: string[]
+}
 
 export interface FigmaBinding<P> {
   /** Master ComponentSetNode.key (NOT individual variant key). Pass an array
@@ -255,16 +271,6 @@ export interface FigmaBinding<P> {
    * file identifier; this is the in-file node reference (changes if the
    * master is moved/duplicated to a new file). */
   componentSetId?: string
-  /** Pure function: serialized instance → React props. The second arg is
-   * the compiled child Design AST nodes for this instance — present when
-   * the parent contains nested INSTANCEs whose props the parent needs to
-   * aggregate (e.g. a Tab whose `tabItems: TabItemProps[]` is collected
-   * from N nested Tab_Item children). Most components ignore it. Filter
-   * by `c.kind === NodeKind.Instance` to pick out the component children. */
-  propsFromFigma: (
-    raw: FigmaInstanceRaw,
-    children?: import('./compiler/design-ast.ts').DNode[],
-  ) => P
 }
 
 /** Split a `<fileKey>:<nodeId>` figmaId into its parts. Splits on the

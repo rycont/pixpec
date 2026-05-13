@@ -27,12 +27,20 @@ export interface VerifyTargetReport {
   failed: VerifyReportRecord[];
 }
 
+export interface DetachedUsageReport {
+  figmaId: string;
+  reason: string;
+  fields: string[];
+  targets?: Array<{ nodeId: string; fields: string[] }>;
+}
+
 export async function writeComponentReport(opts: {
   componentName: string;
   componentDir: string;
   component: Component<unknown>;
   targets?: string[];
   verifyTargets?: VerifyTargetReport[];
+  detachedUsages?: DetachedUsageReport[];
 }): Promise<void> {
   const propsScheme = await readOptional(resolve(opts.componentDir, "props.ts"));
   const representative = findRepresentativeCase(opts.component);
@@ -121,7 +129,71 @@ export async function writeComponentReport(opts: {
       }
     }
   }
+  lines.push("");
+  lines.push("## Detached Usages");
+  lines.push("");
+  if (!opts.detachedUsages || opts.detachedUsages.length === 0) {
+    lines.push("_No detached usages recorded._");
+  } else {
+    lines.push(
+      "These usages contain overrides that are not represented by promoted component props. Pixpec excludes them from component cases; they should be rendered as detached raw IR when used in views.",
+    );
+    lines.push("");
+    lines.push(`Total detached usages: ${opts.detachedUsages.length}`);
+    const fieldCounts = countBy(opts.detachedUsages.flatMap((u) => u.fields));
+    const targetCounts = countBy(
+      opts.detachedUsages.flatMap((u) =>
+        (u.targets ?? []).map(
+          (t) => `${t.nodeId} (${t.fields.slice().sort().join(", ")})`,
+        ),
+      ),
+    );
+    lines.push(
+      `Fields: ${formatCountSummary(fieldCounts, (name) => `\`${name}\``)}`,
+    );
+    lines.push(`Targets: ${formatCountSummary(targetCounts, (name) => name)}`);
+    lines.push("");
+    const shown = opts.detachedUsages.slice(0, 50);
+    if (opts.detachedUsages.length > shown.length) {
+      lines.push(
+        `Showing first ${shown.length} detached usages; ${opts.detachedUsages.length - shown.length} more omitted.`,
+      );
+      lines.push("");
+    }
+    for (const usage of shown) {
+      lines.push(`- \`${usage.figmaId}\`: ${figmaLink(usage.figmaId)}`);
+      lines.push(`  - reason: ${usage.reason}`);
+      lines.push(`  - uncovered fields: ${usage.fields.map((f) => `\`${f}\``).join(", ")}`);
+      if (usage.targets && usage.targets.length > 0) {
+        lines.push(
+          `  - targets: ${usage.targets
+            .map((t) => `${t.nodeId} (${t.fields.map((f) => `\`${f}\``).join(", ")})`)
+            .join("; ")}`,
+        );
+      }
+    }
+  }
   await writeFile(resolve(opts.componentDir, "pixpec.md"), lines.join("\n") + "\n");
+}
+
+function countBy(values: string[]): Array<{ name: string; count: number }> {
+  const counts = new Map<string, number>();
+  for (const value of values) counts.set(value, (counts.get(value) ?? 0) + 1);
+  return [...counts]
+    .map(([name, count]) => ({ name, count }))
+    .sort((a, b) => b.count - a.count || a.name.localeCompare(b.name));
+}
+
+function formatCountSummary(
+  counts: Array<{ name: string; count: number }>,
+  formatName: (name: string) => string,
+): string {
+  if (counts.length === 0) return "_none_";
+  const shown = counts
+    .slice(0, 12)
+    .map((c) => `${formatName(c.name)}=${c.count}`);
+  const more = counts.length - shown.length;
+  return more > 0 ? `${shown.join(", ")}, +${more} more` : shown.join(", ");
 }
 
 export async function writeRggForFailedCases(opts: {

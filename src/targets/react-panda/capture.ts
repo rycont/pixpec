@@ -85,6 +85,7 @@ export async function captureReactPandaDestination(request: CaptureRequest): Pro
             ? `[data-case="${item.safeId}"]`
             : `[data-case="${item.safeId}"] > *`,
           outPath: item.pngPath,
+          clipToElement: item.hasRenderBox,
         }))
         await session.screenshotMany(items)
         const tShots = Date.now()
@@ -235,9 +236,88 @@ async function tryImport(path: string): Promise<any> {
 
 await tryImport(\`\${ROOT_DIR}/src/fonts/__pixpec-fonts.css\`)
 await tryImport(\`\${ROOT_DIR}/styled-system/styles.css\`)
+const fontManifestMod = await tryImport(\`\${ROOT_DIR}/src/fonts/__pixpec-fonts.json\`)
+const fontManifest = (fontManifestMod?.default ?? fontManifestMod ?? {}) as {
+  fonts?: Array<{
+    family?: string
+    yShift?: Record<string, number>
+    xShift?: Record<string, number>
+  }>
+}
+
+function lookupFontShift(map: Record<string, number> | undefined, fontSize: number): number {
+  if (!map) return 0
+  const rounded = Math.round(fontSize)
+  const direct = map[String(rounded)]
+  if (typeof direct === 'number') return direct
+  let best: { distance: number; value: number } | null = null
+  for (const [key, value] of Object.entries(map)) {
+    if (typeof value !== 'number') continue
+    const distance = Math.abs(Number(key) - fontSize)
+    if (distance <= 0.5 && (!best || distance < best.distance)) best = { distance, value }
+  }
+  return best?.value ?? 0
+}
+
+function textLeaves(): HTMLElement[] {
+  const walker = document.createTreeWalker(
+    document.querySelector('#pixpec-target') ?? document.body,
+    NodeFilter.SHOW_TEXT,
+  )
+  const seen = new Set<HTMLElement>()
+  const elements: HTMLElement[] = []
+  while (walker.nextNode()) {
+    const node = walker.currentNode
+    if (!node.textContent?.trim()) continue
+    const el = node.parentElement
+    if (!el || seen.has(el)) continue
+    seen.add(el)
+    elements.push(el)
+  }
+  return elements
+}
+
+function applyTextWidthSnap() {
+  for (const el of textLeaves()) {
+    const className = String(el.getAttribute('class') ?? '')
+    const hasExplicitWidth =
+      !!el.style.width ||
+      /\b(?:w|width)_/.test(className) ||
+      /\b(?:min-w|minWidth|max-w|maxWidth)_/.test(className)
+    el.style.display = el.style.display || 'inline-block'
+    el.style.verticalAlign = el.style.verticalAlign || 'top'
+    if (!hasExplicitWidth) {
+      el.style.width = 'calc-size(max-content, round(up, size, 0.0625rem))'
+    }
+  }
+}
+
+function applyFontShifts() {
+  const fonts = fontManifest.fonts ?? []
+  if (fonts.length === 0) return
+  const elements = textLeaves()
+  for (const el of elements) {
+    const style = window.getComputedStyle(el)
+    const font = fonts.find((f) => f.family && style.fontFamily.includes(f.family))
+    if (!font) continue
+    const fontSize = Number.parseFloat(style.fontSize)
+    if (!Number.isFinite(fontSize)) continue
+    const x = lookupFontShift(font.xShift, fontSize)
+    const y = lookupFontShift(font.yShift, fontSize)
+    if (x === 0 && y === 0) continue
+    const base = el.dataset.pixpecTransformBase ?? el.style.transform
+    el.dataset.pixpecTransformBase = base
+    el.style.transformOrigin = 'center center'
+    el.style.transform = [base, \`translate(\${x}px, \${y}px)\`].filter(Boolean).join(' ')
+  }
+}
 
 ;(window as any).__pixpecSettle = async () => {
   await new Promise((resolve) => requestAnimationFrame(() => resolve(undefined)))
+  await new Promise((resolve) => requestAnimationFrame(() => resolve(undefined)))
+  applyTextWidthSnap()
+  await new Promise((resolve) => requestAnimationFrame(() => resolve(undefined)))
+  applyFontShifts()
   await new Promise((resolve) => requestAnimationFrame(() => resolve(undefined)))
 }
 
@@ -310,7 +390,9 @@ async function render() {
     const comps = await Promise.all(usecases.map((c) => resolveComponentFor(c.figmaId)))
     const variantRenderByCaseId = new Map<string, RegistryEntry['variants'][number]['usecases'][number]['render']>()
     for (const v of comp.variants) {
-      for (const u of v.usecases ?? []) variantRenderByCaseId.set(u.figmaId, (v as any).render)
+      const mainRender = (v.usecases ?? []).find((u) => u.isMainCase)?.render
+      const variantRender = (v as any).render ?? mainRender
+      for (const u of v.usecases ?? []) variantRenderByCaseId.set(u.figmaId, variantRender)
     }
     const px2rem = (v: number) => \`\${+(v / 16).toFixed(6)}rem\`
     const boxStyle = (box: NonNullable<RegistryEntry['variants'][number]['usecases'][number]['render']>['box']) => {

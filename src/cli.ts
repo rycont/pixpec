@@ -54,19 +54,32 @@ async function main() {
     case 'breakdown': {
       const figmaId = rest[0]
       if (!figmaId || !figmaId.includes(':')) {
-        console.error('usage: pixpec breakdown <fileKey>:<nodeId> [--target NAME] [--name ViewName]')
+        console.error('usage: pixpec breakdown <fileKey>:<nodeId> [--target NAME] [--name ViewName] [--detach-instances] [--scale N] [--verify] [--verify-source-id ID] [--max-blob N] [--blob-threshold X]')
         process.exit(2)
       }
       const targetIdx = rest.indexOf('--target')
       const nameIdx = rest.indexOf('--name')
+      const scaleIdx = rest.indexOf('--scale')
+      const mbIdx = rest.indexOf('--max-blob')
+      const btIdx = rest.indexOf('--blob-threshold')
+      const vsiIdx = rest.indexOf('--verify-source-id')
       const r = await runBreakdown(figmaId, {
         target: targetIdx >= 0 ? rest[targetIdx + 1] : undefined,
         name: nameIdx >= 0 ? rest[nameIdx + 1] : undefined,
+        detachInstances: rest.includes('--detach-instances'),
+        verify: rest.includes('--verify'),
+        scale: scaleIdx >= 0 ? Number(rest[scaleIdx + 1]) : undefined,
+        maxBlob: mbIdx >= 0 ? Number(rest[mbIdx + 1]) : undefined,
+        blobThreshold: btIdx >= 0 ? rest[btIdx + 1] : undefined,
+        verifySourceId: vsiIdx >= 0 ? rest[vsiIdx + 1] : undefined,
       })
       console.log(
         `[breakdown] ${r.viewName} → ${r.viewDir} ` +
         `(${r.entryCount} nodes)`,
       )
+      if (r.verify) {
+        console.log(`[breakdown:verify] ${r.verify.pass} passed, ${r.verify.skipped} skipped / ${r.verify.total} DFS entries`)
+      }
       break
     }
     case 'capture': {
@@ -121,7 +134,7 @@ async function main() {
       console.log('commands:')
       console.log('  init <fileKey>:<nodeId>        scaffold/refresh a component dir from Figma')
       console.log('  generate <fileKey>:<nodeId>    generate one node via src dump → compiler → target')
-      console.log('  breakdown <fileKey>:<nodeId>   emit src/view output plus DFS subtrees')
+      console.log('  breakdown <fileKey>:<nodeId>   emit src/view output plus DFS subtrees [--detach-instances] [--scale N] [--verify]')
       console.log('  capture src <Component>        capture source artifacts [--backend figma]')
       console.log('  capture dst <Component>        capture destination artifacts [--backend target]')
       console.log('  verify <Component>             capture + pixel-verify src vs dst [--target name]')

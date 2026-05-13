@@ -196,6 +196,7 @@ async function dumpNode(node) {
     y: node.y,
   };
   if (typeof node.rotation === 'number' && Math.abs(node.rotation) >= 0.01) out.rotation = node.rotation;
+  if (node.type === 'INSTANCE' && typeof node.scaleFactor === 'number') out.scaleFactor = node.scaleFactor;
   if (typeof node.opacity === 'number' && node.opacity < 0.999) out.opacity = node.opacity;
   if (node.layoutPositioning) out.layoutPositioning = node.layoutPositioning;
   if (node.constraints) out.constraints = { horizontal: node.constraints.horizontal, vertical: node.constraints.vertical };
@@ -324,6 +325,12 @@ async function dumpNode(node) {
       out.svg = bytes;
     } catch (_) {
       out.svgExportFailed = true;
+    }
+    if (node.type === 'VECTOR' && Array.isArray(node.vectorPaths)) {
+      out.vectorPaths = clean(node.vectorPaths.map((p) => ({
+        windingRule: p.windingRule,
+        data: p.data,
+      })));
     }
     // Surface fills/strokes so the compiler can compute effectiveFill for
     // currentColor-style components (e.g. <Icon>) that need their tint
