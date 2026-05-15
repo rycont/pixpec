@@ -23,6 +23,7 @@ import { fileURLToPath } from 'node:url'
 import type { CodegenPlugin } from '../../types.ts'
 import type {
     DNode,
+    DDataScope,
     DFlex,
     DStack,
     DBox,
@@ -36,6 +37,10 @@ import type {
     Color,
     CornerRadii,
     Shadow,
+    Value,
+    ExpressionValue,
+    LiteralValue,
+    DataScopeBinding,
 } from '../../compiler/design-ast.ts'
 import {
     NodeKind,
@@ -88,6 +93,7 @@ const callExpression = (
     f.createCallExpression(e, undefined, undefined, args, 0 as ast.NodeFlags)
 
 function valueToExpr(v: unknown): ast.Expression {
+    if (isExpressionNode(v)) return v
     if (v === null) return keywordExpression(ast.SyntaxKind.NullKeyword)
     if (v === undefined) return f.createIdentifier('undefined')
     if (typeof v === 'boolean')
@@ -112,11 +118,28 @@ function valueToExpr(v: unknown): ast.Expression {
     return stringLiteral(String(v))
 }
 
+function expressionPropName<T>(value: Value<T> | undefined): string | undefined {
+    return value?.kind === 'expression' && value.type === 'prop'
+        ? value.name
+        : undefined
+}
+
+function literalValue<T>(value: Value<T> | undefined): T | undefined {
+    return value?.kind === 'literal' && value.source === 'raw'
+        ? value.value
+        : undefined
+}
+
+function valuePropExpression<T>(value: Value<T> | undefined): ast.JsxExpression | undefined {
+    const name = expressionPropName(value)
+    return name ? propExpression(name) : undefined
+}
+
 // JSX attribute strings don't support `\"` escape — `prop="\"x\""` parses as
 // invalid. Strings containing `"` must use expression form `prop={"\"x\""}`
 // so the inner quote is a JS string escape, not JSX.
 function jsxStringInitializer(v: string): ast.JsxAttributeValue {
-    return v.includes('"')
+    return v.includes('"') || /[^\x00-\x7F]/.test(v)
         ? f.createJsxExpression(undefined, valueToExpr(v))
         : stringLiteral(v)
 }
@@ -127,7 +150,9 @@ function attrsFromObject(obj: Record<string, unknown>): ast.JsxAttributeLike[] {
         if (v === undefined) continue
         if (IDENT_RE.test(k)) {
             const initializer: ast.JsxAttributeValue =
-                typeof v === 'string'
+                isJsxExpressionValue(v)
+                    ? v
+                    : typeof v === 'string'
                     ? jsxStringInitializer(v)
                     : f.createJsxExpression(undefined, valueToExpr(v))
             inline.push(
@@ -140,6 +165,14 @@ function attrsFromObject(obj: Record<string, unknown>): ast.JsxAttributeLike[] {
     if (Object.keys(rest).length)
         inline.push(f.createJsxSpreadAttribute(valueToExpr(rest)))
     return inline
+}
+
+function isJsxExpressionValue(value: unknown): value is ast.JsxExpression {
+    return (
+        !!value &&
+        typeof value === 'object' &&
+        (value as { kind?: unknown }).kind === ast.SyntaxKind.JsxExpression
+    )
 }
 
 function normalizeJsxProps(obj: Record<string, unknown>): Record<string, unknown> {
@@ -214,14 +247,43 @@ function isLitSize(s: Size | undefined): s is { value: number; unit: 'px' } {
 /** Size → panda atomic-prop value. Tokens emit the dot path; literals
  *  emit a rem string (panda passes through literal CSS values). */
 function sizeToProp(
-    s: Size | undefined,
+    s: Size | Value<Size> | undefined,
     remBase: number,
-): string | number | undefined {
+): string | number | ast.Expression | undefined {
     if (!s) return undefined
+    if (isExpressionValue(s)) return propExpressionNode(s.name)
+    if (isLiteralValue<Size>(s)) {
+        if (s.source === 'token') return s.path
+        return sizeToProp(s.value, remBase)
+    }
     if (isTokenSize(s)) return s.tokenPath
     // Zero stays as `0` for slimmer atomic class output.
     if (s.value === 0) return 0
     return px2rem(s.value, remBase)
+}
+
+function isExpressionValue(value: unknown): value is ExpressionValue {
+    return (
+        !!value &&
+        typeof value === 'object' &&
+        (value as { kind?: unknown }).kind === 'expression'
+    )
+}
+
+function isExpressionNode(value: unknown): value is ast.Expression {
+    return (
+        !!value &&
+        typeof value === 'object' &&
+        typeof (value as { kind?: unknown }).kind === 'number'
+    )
+}
+
+function isLiteralValue<T>(value: unknown): value is LiteralValue<T> {
+    return (
+        !!value &&
+        typeof value === 'object' &&
+        (value as { kind?: unknown }).kind === 'literal'
+    )
 }
 
 /** Numeric value (for non-px props like flex, opacity). */
@@ -239,7 +301,12 @@ function sizeToPxWithTokens(
     return s.value
 }
 
-function colorToProp(c: Color | undefined): string | undefined {
+function colorToProp(c: Color | Value<Color> | undefined): string | undefined {
+    if (c && 'kind' in c) {
+        if (c.kind === 'expression') return undefined
+        if (c.source === 'raw') return colorToProp(c.value)
+        return c.path
+    }
     if (!c) return undefined
     if ('tokenPath' in c) return c.tokenPath
     if (c.opacity !== undefined && c.opacity < 0.999) {
@@ -256,6 +323,24 @@ function colorToCss(c: Color | undefined): string {
         return `var(--colors-${prop.replace(/\./g, '-')})`
     }
     return prop
+}
+
+function cssColorLiteral(value: string): string {
+    if (
+        value === 'transparent' ||
+        value.startsWith('#') ||
+        value.startsWith('rgb') ||
+        value.includes('gradient(')
+    ) {
+        return value
+    }
+    return `var(--colors-${value.replace(/\./g, '-')})`
+}
+
+function cssBackgroundLayer(value: string): string {
+    return value.includes('gradient(')
+        ? value
+        : `linear-gradient(${value}, ${value})`
 }
 
 function tokenCssVar(tokenPath: string, ctx: Ctx): string {
@@ -380,10 +465,11 @@ const ROOT_PARENT: ParentCtx = { dir: 'none', mainSizing: Sizing.Fixed }
 // inside JSX, so we emit a marker identifier and rewrite in post-process
 // string substitution at the end of buildSource (see PIXPEC_PROP_ regex).
 function propExpression(key: string): ast.JsxExpression {
-    return f.createJsxExpression(
-        undefined,
-        f.createIdentifier(`PIXPEC_PROP_${key}`),
-    )
+    return f.createJsxExpression(undefined, propExpressionNode(key))
+}
+
+function propExpressionNode(key: string): ast.Expression {
+    return f.createIdentifier(`PIXPEC_PROP_${key}`)
 }
 
 function propExpressionWithFallback(key: string, fallback: unknown): ast.JsxExpression {
@@ -411,6 +497,58 @@ function fillBackgroundStyleExpression(key: string): ast.JsxExpression {
         undefined,
         f.createIdentifier(`PIXPEC_FILL_BACKGROUND_STYLE_${key}`),
     )
+}
+
+function boxShadowStyleExpression(key: string): ast.JsxExpression {
+    return f.createJsxExpression(
+        undefined,
+        f.createIdentifier(`PIXPEC_BOX_SHADOW_STYLE_${key}`),
+    )
+}
+
+function boxShadowAppendStyleExpression(base: string, key: string): ast.JsxExpression {
+    return f.createJsxExpression(
+        undefined,
+        f.createIdentifier(`PIXPEC_BOX_SHADOW_APPEND_${encodeMarkerString(base)}__${key}`),
+    )
+}
+
+function staticBorderPaintStyleExpression(
+    background: string,
+    paint: string,
+    baseShadow?: string,
+): ast.JsxExpression {
+    const shadowSuffix = baseShadow ? `__${encodeMarkerString(baseShadow)}` : ''
+    return f.createJsxExpression(
+        undefined,
+        f.createIdentifier(
+            `PIXPEC_STATIC_BORDER_PAINT_STYLE_${encodeMarkerString(background)}__${encodeMarkerString(paint)}${shadowSuffix}`,
+        ),
+    )
+}
+
+function borderPaintStyleExpression(
+    key: string,
+    background: string,
+    shadowKey?: string,
+    baseShadow?: string,
+): ast.JsxExpression {
+    const shadowSuffix = shadowKey ? `__${shadowKey}` : ''
+    const baseSuffix = baseShadow ? `__${encodeMarkerString(baseShadow)}` : ''
+    return f.createJsxExpression(
+        undefined,
+        f.createIdentifier(
+            `PIXPEC_BORDER_PAINT_STYLE_${key}__${encodeMarkerString(background)}${shadowSuffix}${baseSuffix}`,
+        ),
+    )
+}
+
+function encodeMarkerString(value: string): string {
+    return Buffer.from(value, 'utf8').toString('hex')
+}
+
+function decodeMarkerString(value: string): string {
+    return Buffer.from(value, 'hex').toString('utf8')
 }
 
 function encodeMarkerNumber(value: number): string {
@@ -508,10 +646,7 @@ function emitContainer(
             flex.gap !== undefined &&
             !isTokenSize(flex.gap) &&
             (flex.gap as { value: number }).value === 0
-        if (
-            flex.justify !== Justify.SpaceBetween &&
-            (!gapIsZeroLiteral || direction === 'column')
-        ) {
+        if (!gapIsZeroLiteral || direction === 'column') {
             if (gap !== undefined) styles.gap = gap
         }
         if (flex.wrap) {
@@ -584,20 +719,34 @@ function emitContainer(
         if (bg !== undefined) styles.background = bg
     }
     if (n.opacity !== undefined) styles.opacity = n.opacity
-    if (n.positioning !== Positioning.Absolute && n.renderBoundsOffset) {
+    if (
+        n.positioning !== Positioning.Absolute &&
+        n.renderBoundsOffset &&
+        !isRenderBoundsFromAbsoluteChild(n)
+    ) {
         styles.transform = `translate(${px2rem(-n.renderBoundsOffset.x, ctx.remBase)}, ${px2rem(-n.renderBoundsOffset.y, ctx.remBase)})`
     }
 
     // border (uniform-only path; per-side via boxShadow inset)
+    const borderPaintProp = expressionPropName(
+        n.border?.paint as unknown as Value<Color>,
+    )
+    let staticBorderPaintStyle:
+        | { background: string; paint: string; baseShadow?: string }
+        | undefined
     if (n.border) {
         const w = n.border.width
         const colorStr = colorToProp(n.border.paint)
         const colorRef = colorStr
-            ? colorStr.startsWith('#') || colorStr.startsWith('rgb')
-                ? colorStr
-                : `var(--colors-${String(colorStr).replace(/\./g, '-')})`
+            ? cssColorLiteral(colorStr)
             : '#000'
-        if ('top' in w) {
+        const gradientBorder = Boolean(colorStr?.includes('gradient('))
+        if (borderPaintProp) {
+            const wPx = 'top' in w ? undefined : sizeToPx(w)
+            if (wPx !== undefined) {
+                styles.border = `${px2rem(wPx, ctx.remBase)} solid transparent`
+            }
+        } else if ('top' in w) {
             // mixed per-side
             const shadows: string[] = []
             const wt = sizeToPx(w.top),
@@ -623,7 +772,13 @@ function emitContainer(
             if (shadows.length) styles.boxShadow = shadows.join(', ')
         } else {
             const wPx = sizeToPx(w)
-            if (wPx !== undefined && n.border.align === StrokeAlign.Outside) {
+            if (wPx !== undefined && gradientBorder) {
+                styles.border = `${px2rem(wPx, ctx.remBase)} solid transparent`
+                staticBorderPaintStyle = {
+                    background: 'transparent',
+                    paint: colorRef,
+                }
+            } else if (wPx !== undefined && n.border.align === StrokeAlign.Outside) {
                 styles.boxShadow = `0 0 0 ${px2rem(wPx, ctx.remBase)} ${colorRef}`
             } else if (wPx !== undefined && n.border.align === StrokeAlign.Center) {
                 styles.boxShadow = `0 0 0 ${px2rem(wPx / 2, ctx.remBase)} ${colorRef}, inset 0 0 0 ${px2rem(wPx / 2, ctx.remBase)} ${colorRef}`
@@ -634,11 +789,23 @@ function emitContainer(
             }
         }
     }
-    if (n.shadow) {
+    const shadowProp = expressionPropName(n.shadow as unknown as Value<Shadow>)
+    if (!shadowProp && n.shadow) {
         const shadow = shadowToCss(n.shadow, ctx.remBase)
         styles.boxShadow = styles.boxShadow
             ? `${styles.boxShadow}, ${shadow}`
             : shadow
+    }
+    if (staticBorderPaintStyle) {
+        staticBorderPaintStyle.background =
+            typeof styles.background === 'string'
+                ? cssColorLiteral(styles.background)
+                : 'transparent'
+        if (typeof styles.boxShadow === 'string') {
+            staticBorderPaintStyle.baseShadow = styles.boxShadow
+            delete styles.boxShadow
+        }
+        delete styles.background
     }
 
     // corner radius
@@ -695,19 +862,54 @@ function emitContainer(
             ),
         )
     }
-    if (n.fillBinding) {
-        ctx.usedPropBindings.add(n.fillBinding)
+    const backgroundProp = expressionPropName(n.background)
+    let styleAttrAdded = false
+    if (staticBorderPaintStyle) {
+        attrs.push(
+            f.createJsxAttribute(
+                f.createIdentifier('style'),
+                staticBorderPaintStyleExpression(
+                    staticBorderPaintStyle.background,
+                    staticBorderPaintStyle.paint,
+                    staticBorderPaintStyle.baseShadow,
+                ),
+            ),
+        )
+        styleAttrAdded = true
+    } else if (borderPaintProp) {
+        ctx.usedPropBindings.add(borderPaintProp)
+        const shadowKey = shadowProp
+        if (shadowKey) ctx.usedPropBindings.add(shadowKey)
+        const background =
+            typeof styles.background === 'string' ? styles.background : 'transparent'
+        const baseShadow =
+            typeof styles.boxShadow === 'string' ? styles.boxShadow : undefined
+        attrs.push(
+            f.createJsxAttribute(
+                f.createIdentifier('style'),
+                borderPaintStyleExpression(
+                    borderPaintProp,
+                    background,
+                    shadowKey,
+                    baseShadow,
+                ),
+            ),
+        )
+        styleAttrAdded = true
+    } else if (backgroundProp) {
+        ctx.usedPropBindings.add(backgroundProp)
         attrs.push(
             f.createJsxAttribute(
                 f.createIdentifier('style'),
                 squircleHook
                     ? squircleFillBackgroundStyleExpression(
-                          n.fillBinding,
+                          backgroundProp,
                           squircleHook.id,
                       )
-                    : fillBackgroundStyleExpression(n.fillBinding),
+                    : fillBackgroundStyleExpression(backgroundProp),
             ),
         )
+        styleAttrAdded = true
     } else if (squircleHook) {
         attrs.push(
             f.createJsxAttribute(
@@ -715,6 +917,22 @@ function emitContainer(
                 squircleStyleExpression(squircleHook.id),
             ),
         )
+        styleAttrAdded = true
+    }
+    if (!borderPaintProp && shadowProp) {
+        ctx.usedPropBindings.add(shadowProp)
+        const baseShadow =
+            typeof styles.boxShadow === 'string' ? styles.boxShadow : undefined
+        if (baseShadow) delete styles.boxShadow
+        attrs.push(
+            f.createJsxAttribute(
+                f.createIdentifier('style'),
+                baseShadow
+                    ? boxShadowAppendStyleExpression(baseShadow, shadowProp)
+                    : boxShadowStyleExpression(shadowProp),
+            ),
+        )
+        styleAttrAdded = true
     }
     const open = f.createJsxOpeningElement(
         f.createIdentifier(tag),
@@ -736,18 +954,23 @@ function emitContainer(
     return f.createJsxElement(open, children, close)
 }
 
+function isRenderBoundsFromAbsoluteChild(n: DFlex | DStack | DBox): boolean {
+    return n.children.some((child) => child.positioning === Positioning.Absolute)
+}
+
 function emitRepetitionChildren(
     n: DFlex | DStack | DBox,
     ctx: Ctx,
     childParent: ParentCtx,
 ): ast.JsxChild[] | undefined {
-    const cfg = ctx.viewConfig[n.sourceId]?.repetition
+    const sourceId = nodeSourceId(n)
+    const cfg = ctx.viewConfig[sourceId]?.repetition
     if (!cfg) return undefined
     if (n.children.length === 0) {
-        throw new Error(`pixpec react-panda: repetition container ${n.sourceId} has no children`)
+        throw new Error(`pixpec react-panda: repetition container ${sourceId} has no children`)
     }
     const name = cfg.childComponent.name
-    const rows = analyzeRepetitionRows(n.sourceId, name, n.children)
+    const rows = analyzeRepetitionRows(sourceId, name, n.children)
     const template = applyRepetitionBindings(rows.template, rows.bindings)
     const jsx = emitNode(template, ctx, childParent)
     const marker = `PIXPEC_REPETITION_${ctx.repetitionCounter++}`
@@ -803,10 +1026,10 @@ function analyzeRepetitionRows(
             const node = nodeAtPath(template, path)
             if (!node) continue
             candidates.push({
-                binding: {
-                    path,
-                    kind: 'visibility',
-                    propName: uniquePropName(showPropName(node.sourceName), candidates),
+                    binding: {
+                        path,
+                        kind: 'visibility',
+                    propName: uniquePropName(showPropName(nodeSourceName(node)), candidates),
                 },
                 values: alignments.map((a) => !a.missingPaths.some((missing) => samePath(missing, path))),
             })
@@ -818,13 +1041,13 @@ function analyzeRepetitionRows(
         const present = nodes as DNode[]
         const sample = present[0]
         if (sample.kind === NodeKind.Text) {
-            const values = present.map((n) => (n as DText).content)
+            const values = present.map((n) => literalValue((n as DText).content))
             if (hasVariation(values)) {
                 candidates.push({
                     binding: {
                         path,
                         kind: 'textContent',
-                        propName: uniquePropName(propName(sample.sourceName), candidates),
+                        propName: uniquePropName(propName(nodeSourceName(sample)), candidates),
                     },
                     values,
                 })
@@ -835,7 +1058,7 @@ function analyzeRepetitionRows(
                     binding: {
                         path,
                         kind: 'textFill',
-                        propName: uniquePropName(`${propName(sample.sourceName)}Fill`, candidates),
+                        propName: uniquePropName(`${propName(nodeSourceName(sample))}Fill`, candidates),
                     },
                     values: colors,
                 })
@@ -853,7 +1076,7 @@ function analyzeRepetitionRows(
                         path,
                         kind: 'instanceProp',
                         key,
-                        propName: uniquePropName(nestedPropName(sample.sourceName, key), candidates),
+                        propName: uniquePropName(nestedPropName(nodeSourceName(sample), key), candidates),
                     },
                     values,
                 })
@@ -865,7 +1088,7 @@ function analyzeRepetitionRows(
                     binding: {
                         path,
                         kind: 'containerFill',
-                        propName: uniquePropName(`${propName(sample.sourceName)}Fill`, candidates),
+                        propName: uniquePropName(`${propName(nodeSourceName(sample))}Fill`, candidates),
                     },
                     values,
                 })
@@ -1048,19 +1271,74 @@ function applyRepetitionBindings(root: DNode, bindings: RepetitionBinding[]): DN
         const node = nodeAtPath(clone, binding.path)
         if (!node) continue
         if (binding.kind === 'textContent' && node.kind === NodeKind.Text) {
-            ;(node as DText).contentBinding = binding.propName
+            ;(node as DText).content = { kind: 'expression', type: 'prop', name: binding.propName }
         } else if (binding.kind === 'textFill' && node.kind === NodeKind.Text) {
-            ;(node as DText).fillBinding = binding.propName
+            ;(node as DText).color = { kind: 'expression', type: 'prop', name: binding.propName }
         } else if (binding.kind === 'instanceProp' && node.kind === NodeKind.Instance && binding.key) {
             const inst = node as DInstance
             inst.instancePropBindings = { ...(inst.instancePropBindings ?? {}), [binding.key]: binding.propName }
         } else if (binding.kind === 'containerFill' && isContainerNode(node)) {
-            node.fillBinding = binding.propName
+            node.background = { kind: 'expression', type: 'prop', name: binding.propName }
         } else if (binding.kind === 'visibility') {
-            node.visibilityBinding = binding.propName
+            node.visible = { kind: 'expression', type: 'prop', name: binding.propName }
         }
     }
     return clone
+}
+
+function applyDataScopeBindings(root: DNode, bindings: DataScopeBinding[]): DNode {
+    const clone = cloneNode(root)
+    const nodes = indexNodesBySourceId(clone)
+    for (const binding of bindings) {
+        const node = nodes.get(stripSourcePrefix(binding.sourceId))
+        if (!node) continue
+        if (binding.field.startsWith('component.') && node.kind === NodeKind.Instance) {
+            const key = binding.field.slice('component.'.length)
+            const inst = node as DInstance
+            inst.instancePropBindings = {
+                ...(inst.instancePropBindings ?? {}),
+                [key]: binding.prop,
+            }
+            continue
+        }
+        writePath(node as unknown as Record<string, unknown>, binding.field, {
+            kind: 'expression',
+            type: 'prop',
+            name: binding.prop,
+        })
+    }
+    return clone
+}
+
+function writePath(target: Record<string, unknown>, path: string, value: unknown): void {
+    const parts = path.split('.').filter(Boolean)
+    let current = target
+    for (const part of parts.slice(0, -1)) {
+        const next = current[part]
+        if (!next || typeof next !== 'object') return
+        current = next as Record<string, unknown>
+    }
+    const last = parts.at(-1)
+    if (last) current[last] = value
+}
+
+function indexNodesBySourceId(root: DNode): Map<string, DNode> {
+    const out = new Map<string, DNode>()
+    const visit = (node: DNode) => {
+        if (node.kind === NodeKind.DataScope) {
+            visit((node as DDataScope).child)
+            return
+        }
+        if (node.sourceId) out.set(stripSourcePrefix(node.sourceId), node)
+        if (isContainerNode(node)) node.children.forEach(visit)
+    }
+    visit(root)
+    out.set('$root', root.kind === NodeKind.DataScope ? (root as DDataScope).child : root)
+    return out
+}
+
+function stripSourcePrefix(id: string): string {
+    return id.includes(';') ? id.slice(id.lastIndexOf(';') + 1) : id
 }
 
 function cloneNode<T extends DNode>(node: T): T {
@@ -1123,8 +1401,9 @@ function emitText(n: DText, ctx: Ctx, parent: ParentCtx): ast.JsxElement {
     // single `textStyle="body.strong"` prop — Panda expands the rest. Pure
     // sugar over Panda's own textStyle utility, lookup just needs the
     // figma id our compiler stamped on each DText.
-    const textStyleToken = n.textStyleRef
-        ? lookupTypoByPrefix(n.textStyleRef, ctx.typographyMap)
+    const textStyleRef = literalValue(n.textStyleRef)
+    const textStyleToken = textStyleRef
+        ? lookupTypoByPrefix(textStyleRef, ctx.typographyMap)
         : undefined
     const isHug = n.autoResize === TextAutoResize.Hug
     const parentDir = parent.dir
@@ -1139,12 +1418,13 @@ function emitText(n: DText, ctx: Ctx, parent: ParentCtx): ast.JsxElement {
         !isHug && !fillMain && !fillCross && !collapsedFill
             ? n.width
             : undefined
-    const hasExplicitLineBreak = /[\n\r\u2028\u2029]/.test(n.content)
+    const contentLiteral = literalValue(n.content) ?? ''
+    const hasExplicitLineBreak = /[\n\r\u2028\u2029]/.test(contentLiteral)
 
     ctx.usedJsxPatterns.add('styled')
     const styles: Record<string, unknown> = {}
     if (textStyleToken) {
-        if (!n.textStyleBinding) styles.textStyle = textStyleToken
+        styles.textStyle = textStyleToken
     } else {
         styles.fontSize = sizeToProp(n.fontSize, ctx.remBase)
         styles.lineHeight = sizeToProp(n.lineHeight, ctx.remBase)
@@ -1181,32 +1461,33 @@ function emitText(n: DText, ctx: Ctx, parent: ParentCtx): ast.JsxElement {
             0 as ast.NodeFlags,
         )
     const attrs = attrsFromObject(styles)
-    if (n.textStyleBinding) {
-        ctx.usedPropBindings.add(n.textStyleBinding)
+    const textStyleProp = expressionPropName(n.textStyleRef)
+    if (textStyleProp) {
+        ctx.usedPropBindings.add(textStyleProp)
         attrs.push(
             f.createJsxAttribute(
                 f.createIdentifier('textStyle'),
-                textStyleExpression(n.textStyleBinding, textStyleToken),
+                propExpression(textStyleProp),
             ),
         )
     }
-    if (n.fillBinding) {
-        ctx.usedPropBindings.add(n.fillBinding)
+    const colorProp = expressionPropName(n.color)
+    if (colorProp) {
+        ctx.usedPropBindings.add(colorProp)
         attrs.push(
             f.createJsxAttribute(
                 f.createIdentifier('style'),
-                fillStyleExpression(n.fillBinding),
+                fillStyleExpression(colorProp),
             ),
         )
     }
-    const boundKey = n.contentBinding
-    if (boundKey) ctx.usedPropBindings.add(boundKey)
-    const children: ast.JsxChild[] = boundKey
-        ? [propExpression(boundKey)]
+    const contentPropExpr = valuePropExpression(n.content)
+    const children: ast.JsxChild[] = contentPropExpr
+        ? [contentPropExpr]
         : [
               f.createJsxExpression(
                   undefined,
-                  stringLiteral(normalizeTextLineBreaks(n.content)),
+                  stringLiteral(normalizeTextLineBreaks(contentLiteral)),
               ),
           ]
     const renderedChildren: ast.JsxChild[] = wrapsUnderlineRun
@@ -1507,8 +1788,9 @@ function emitVector(n: DVector, ctx: Ctx): ast.JsxChild {
     // Wrap the svgr-imported component in an inline-sized element. Breakdown
     // generated files are not part of Panda's static extraction set, so
     // arbitrary width/height must not depend on generated utility classes.
-    const sidecarKey = assetSidecarPath(ctx, sidecarFilename(n.sourceId))
-    const alias = sidecarAlias(n.sourceId)
+    const sourceId = nodeSourceId(n)
+    const sidecarKey = assetSidecarPath(ctx, sidecarFilename(sourceId))
+    const alias = sidecarAlias(sourceId)
     const normalizedSvg = n.svg
     if (!ctx.svgSidecars.has(sidecarKey)) {
         ctx.svgSidecars.set(sidecarKey, {
@@ -1517,21 +1799,16 @@ function emitVector(n: DVector, ctx: Ctx): ast.JsxChild {
             importPath: assetImportPath(sidecarKey, '?react'),
         })
     }
-    ctx.usesTinting = true
+    const fillProp = expressionPropName(n.fill)
+    if (fillProp) ctx.usedPropBindings.add(fillProp)
     // preserveAspectRatio="none" matches figma's behaviour: a resized
     // instance stretches the master svg anisotropically to fill the box,
-    // rather than svgr's default "xMidYMid meet" letterbox. The conditional
-    // `filter` engages the SVG tint trick (see filter <defs> wired in by the
-    // top-level FC builder) when the caller passes a `color` Panda CSS prop.
-    // Two-svg recolor strategy: `Svg_X` keeps the figma master fills,
-    // `SvgC_X` is the same svg with every `fill="#XXXXXX"` replaced by
-    // `fill="currentColor"`. At runtime we render whichever matches the
-    // caller's `color` Panda prop. The conditional ternary is emitted as a
-    // marker JSX element here; post-process in buildSource() rewrites it
-    // to a real `{rootProps.color ? <SvgC/> : <Svg/>}` (tsgo's printer
-    // panics on factory-built JSX-child conditionals).
-    const tintedKey = assetSidecarPath(ctx, sidecarFilenameTinted(n.sourceId))
-    const tintedAlias = sidecarAliasTinted(n.sourceId)
+    // rather than svgr's default "xMidYMid meet" letterbox. When the vector
+    // fill is declared as a prop expression, a second currentColor sidecar
+    // lets that specific prop drive the SVG fill without relying on unrelated
+    // target style conventions.
+    const tintedKey = assetSidecarPath(ctx, sidecarFilenameTinted(sourceId))
+    const tintedAlias = sidecarAliasTinted(sourceId)
     if (!ctx.svgSidecars.has(tintedKey)) {
         ctx.svgSidecars.set(tintedKey, {
             alias: tintedAlias,
@@ -1554,6 +1831,10 @@ function emitVector(n: DVector, ctx: Ctx): ast.JsxChild {
                     undefined,
                     f.createIdentifier(tintedAlias),
                 ),
+            ),
+            f.createJsxAttribute(
+                f.createIdentifier('fillProp'),
+                stringLiteral(fillProp ?? ''),
             ),
         ]),
     )
@@ -1623,7 +1904,7 @@ function assetSidecarPath(ctx: Ctx, filename: string): string {
 }
 function assetImportPath(relativePath: string, suffix = ''): string {
     const rel = relativePath.replace(/\\/g, '/')
-    return `${rel.startsWith('.') ? rel : `./${rel}`}${suffix}`
+    return `${rel.startsWith('./') || rel.startsWith('../') ? rel : `./${rel}`}${suffix}`
 }
 function imageFilename(sourceId: string, mime: string): string | undefined {
     const ext = extensionForImageMime(mime)
@@ -1649,7 +1930,7 @@ function imageAssetUrlMarker(n: DImage, ctx: Ctx): string | undefined {
     const match = /^data:([^;,]+);base64,(.*)$/s.exec(n.dataUrl)
     if (!match) return undefined
     const mime = match[1] ?? ''
-    const filename = imageFilename(n.sourceId, mime)
+    const filename = imageFilename(nodeSourceId(n), mime)
     if (!filename) return undefined
     const relativePath = assetSidecarPath(ctx, filename)
     if (!ctx.imageSidecars.has(relativePath)) {
@@ -1901,7 +2182,15 @@ function emitInstance(n: DInstance, ctx: Ctx, parent: ParentCtx): ast.JsxChild {
         if (parent.dir === 'column' && sizingV === Sizing.Fixed)
             layoutStyles.flexShrink = 0
     }
-    if (
+    const absoluteStretchH =
+        n.positioning === Positioning.Absolute &&
+        n.anchor?.horizontal === Anchor.Stretch
+    const absoluteStretchV =
+        n.positioning === Positioning.Absolute &&
+        n.anchor?.vertical === Anchor.Stretch
+    if (absoluteStretchH) {
+        layoutStyles.width = '100%'
+    } else if (
         sizingH === Sizing.Fill &&
         parent.dir === 'row' &&
         parent.mainSizing !== Sizing.Hug
@@ -1914,7 +2203,9 @@ function emitInstance(n: DInstance, ctx: Ctx, parent: ParentCtx): ast.JsxChild {
         layoutStyles.alignSelf = 'stretch'
         layoutStyles.width = '100%'
     }
-    if (
+    if (absoluteStretchV) {
+        layoutStyles.height = '100%'
+    } else if (
         sizingV === Sizing.Fill &&
         parent.dir === 'column' &&
         parent.mainSizing !== Sizing.Hug
@@ -1940,11 +2231,11 @@ function emitInstance(n: DInstance, ctx: Ctx, parent: ParentCtx): ast.JsxChild {
     // — when the parent (e.g. a Badge variant) has resized the instance off its
     // master dim. Without this, Icon falls back to its master 1.5rem and the
     // Badge slot mismatch makes the icon overflow / render at the wrong scale.
-    if (sizingH === Sizing.Fixed && n.width) {
+    if (!absoluteStretchH && sizingH === Sizing.Fixed && n.width) {
         const wv = sizeToProp(n.width, ctx.remBase)
         if (wv !== undefined) layoutStyles.width = wv
     }
-    if (sizingV === Sizing.Fixed && n.height) {
+    if (!absoluteStretchV && sizingV === Sizing.Fixed && n.height) {
         const hv = sizeToProp(n.height, ctx.remBase)
         if (hv !== undefined) layoutStyles.height = hv
     }
@@ -2138,14 +2429,15 @@ function wrapVisibility(
     ctx: Ctx,
     parent: ParentCtx,
 ): ast.JsxChild {
-    if (!n.visibilityBinding || parent.dir === 'none') return jsx
-    ctx.usedPropBindings.add(n.visibilityBinding)
+    const visibleProp = expressionPropName(n.visible)
+    if (!visibleProp || parent.dir === 'none') return jsx
+    ctx.usedPropBindings.add(visibleProp)
     // Same `PIXPEC_PROP_<key>` marker as propExpression — post-process rewrites
     // to `(props as ...)["<key>"]` so we don't shadow component imports when
     // the visibility prop key collides with one (e.g. boolean `Icon` toggle).
     const cond = f.createBinaryExpression(
         undefined,
-        f.createIdentifier(`PIXPEC_PROP_${n.visibilityBinding}`),
+        f.createIdentifier(`PIXPEC_PROP_${visibleProp}`),
         undefined,
         f.createToken(ast.SyntaxKind.ExclamationEqualsEqualsToken),
         keywordExpression(ast.SyntaxKind.FalseKeyword),
@@ -2161,6 +2453,10 @@ function wrapVisibility(
 }
 
 function emitNode(n: DNode, ctx: Ctx, parent: ParentCtx): ast.JsxChild {
+    if (n.kind === NodeKind.DataScope) {
+        const scoped = n as DDataScope
+        return emitNode(applyDataScopeBindings(scoped.child, scoped.bindings), ctx, parent)
+    }
     let jsx: ast.JsxChild
     switch (n.kind) {
         case NodeKind.Flex:
@@ -2220,6 +2516,8 @@ interface ReactPandaCtxExt {
 
 function rootPropsType(root: DNode): string {
     switch (root.kind) {
+        case NodeKind.DataScope:
+            return rootPropsType((root as DDataScope).child)
         case NodeKind.Flex:
             return 'FlexProps'
         case NodeKind.Stack:
@@ -2240,6 +2538,32 @@ function relativeImport(
     return rel
 }
 
+function nodeSourceId(n: DNode): string {
+    if (n.kind === NodeKind.DataScope) return nodeSourceId((n as DDataScope).child)
+    return n.sourceId ?? 'node'
+}
+
+function nodeSourceName(n: DNode): string {
+    if (n.kind === NodeKind.DataScope) return nodeSourceName((n as DDataScope).child)
+    return n.sourceName ?? n.kind
+}
+
+function ensureSourceMeta(root: DNode): DNode {
+    const visit = (node: DNode, path: number[]) => {
+        if (node.kind === NodeKind.DataScope) {
+            visit((node as DDataScope).child, path)
+            return
+        }
+        node.sourceId ??= path.length === 0 ? 'root' : `n${path.join('_')}`
+        node.sourceName ??= node.kind
+        if (isContainerNode(node)) {
+            node.children.forEach((child, index) => visit(child, [...path, index]))
+        }
+    }
+    visit(root, [])
+    return root
+}
+
 function buildSource(
     root: DNode,
     ctx: Ctx,
@@ -2257,12 +2581,14 @@ function buildSource(
         const componentFile = nodePath.resolve(
             ctx.componentsDir ?? '',
             componentName,
-            'impl.tsx',
+            'impl',
+            'react-panda',
+            'index.tsx',
         )
         const importPath = relativeImport(
             ctx.outputDir,
             componentFile,
-            `../../${componentName}/impl.tsx`,
+            `../../${componentName}/impl/react-panda/index.tsx`,
         )
         return f.createImportDeclaration(
             undefined,
@@ -2614,6 +2940,55 @@ function buildSource(
         /PIXPEC_FILL_BACKGROUND_STYLE_([A-Za-z_$][A-Za-z0-9_$]*)/g,
         (_m, key) => `{ background: props.${key} }`,
     )
+    printed = printed.replace(
+        /PIXPEC_BOX_SHADOW_STYLE_([A-Za-z_$][A-Za-z0-9_$]*)/g,
+        (_m, key) => `{ boxShadow: props.${key} }`,
+    )
+    printed = printed.replace(
+        /PIXPEC_BOX_SHADOW_APPEND_([0-9a-f]+)__([A-Za-z_$][A-Za-z0-9_$]*)/g,
+        (_m, base, key) => {
+            const decoded = decodeMarkerString(base)
+            return `{ boxShadow: props.${key} ? \`${decoded}, \${props.${key}}\` : ${JSON.stringify(decoded)} }`
+        },
+    )
+    printed = printed.replace(
+        /PIXPEC_STATIC_BORDER_PAINT_STYLE_([0-9a-f]+)__([0-9a-f]+)(?:__([0-9a-f]+))?/g,
+        (_m, encodedBackground, encodedPaint, encodedBaseShadow) => {
+            const background = cssBackgroundLayer(decodeMarkerString(encodedBackground))
+            const paint = cssBackgroundLayer(decodeMarkerString(encodedPaint))
+            const baseShadow = encodedBaseShadow
+                ? decodeMarkerString(encodedBaseShadow)
+                : undefined
+            const entries = [
+                `background: ${JSON.stringify(`${background} padding-box, ${paint} border-box`)}`,
+            ]
+            if (baseShadow) entries.push(`boxShadow: ${JSON.stringify(baseShadow)}`)
+            return `{ ${entries.join(', ')} }`
+        },
+    )
+    printed = printed.replace(
+        /PIXPEC_BORDER_PAINT_STYLE_([A-Za-z_$][A-Za-z0-9_$]*)__([0-9a-f]+)(?:__([A-Za-z_$][A-Za-z0-9_$]*))?(?:__([0-9a-f]+))?/g,
+        (_m, borderKey, encodedBackground, shadowKey, encodedBaseShadow) => {
+            const background = cssBackgroundLayer(decodeMarkerString(encodedBackground))
+            const cssBackground = background.replace(/[`$]/g, '\\$&')
+            const baseShadow = encodedBaseShadow
+                ? decodeMarkerString(encodedBaseShadow)
+                : undefined
+            const entries = [
+                `background: \`${cssBackground} padding-box, \${String(props.${borderKey} ?? 'transparent').includes('gradient(') ? props.${borderKey} : \`linear-gradient(\${props.${borderKey} ?? 'transparent'}, \${props.${borderKey} ?? 'transparent'})\`} border-box\``,
+            ]
+            if (shadowKey && baseShadow) {
+                entries.push(
+                    `boxShadow: props.${shadowKey} ? \`${baseShadow}, \${props.${shadowKey}}\` : ${JSON.stringify(baseShadow)}`,
+                )
+            } else if (shadowKey) {
+                entries.push(`boxShadow: props.${shadowKey}`)
+            } else if (baseShadow) {
+                entries.push(`boxShadow: ${JSON.stringify(baseShadow)}`)
+            }
+            return `{ ${entries.join(', ')} }`
+        },
+    )
     const decodeMarkerNumber = (value: string) =>
         Number(value.replace(/m/g, '-').replace(/p/g, '.'))
     printed = printed.replace(
@@ -2647,29 +3022,21 @@ function buildSource(
         printed = printed.replaceAll(marker, source)
     }
     if (ctx.usesTinting) {
-        // Rewrite the `<PIXPEC_TINT_SWAP normal={X} tinted={Y}/>` marker into
-        // a real conditional. Two `?react` imports are already in scope; the
-        // tinted variant has every literal fill swapped to `currentColor`, so
-        // setting CSS color on the parent (via Panda style props) tints the
-        // whole svg silhouette. Done as a string substitution because tsgo's
-        // printer panics on factory-built JSX-child ternaries.
-        const tintedStyle =
-            'style={{ display: "block", width: "100%", height: "100%" }}'
-        const fillTintedStyle =
-            'style={{ display: "block", width: "100%", height: "100%", color: props._fill }}'
+        // Rewrite the `<PIXPEC_TINT_SWAP .../>` marker into a real
+        // conditional. Two `?react` imports are already in scope; the tinted
+        // variant has every literal fill swapped to `currentColor`.
         printed = printed.replace(
-            /<PIXPEC_TINT_SWAP\s+normal=\{(\w+)\}\s+tinted=\{(\w+)\}\s*\/>/g,
-            (_m, normal, tinted) => {
-                if (ctx.usedPropBindings.has('_fill')) {
-                    return `{props._fill ` +
-                        `? <${tinted} preserveAspectRatio="none" shapeRendering="geometricPrecision" ${fillTintedStyle}/> ` +
-                        `: cssProps.color ` +
-                        `? <${tinted} preserveAspectRatio="none" shapeRendering="geometricPrecision" ${tintedStyle}/> ` +
+            /<PIXPEC_TINT_SWAP\s+normal=\{(\w+)\}\s+tinted=\{(\w+)\}(?:\s+fillProp="([^"]*)")?\s*\/>/g,
+            (_m, normal, tinted, fillProp) => {
+                if (fillProp) {
+                    const prop = `props.${fillProp}`
+                    const propTintedStyle =
+                        `style={{ display: "block", width: "100%", height: "100%", color: ${prop} }}`
+                    return `{${prop} ` +
+                        `? <${tinted} preserveAspectRatio="none" shapeRendering="geometricPrecision" ${propTintedStyle}/> ` +
                         `: <${normal} preserveAspectRatio="none" shapeRendering="geometricPrecision" style={{ display: "block", width: "100%", height: "100%" }}/>}`
                 }
-                return `{cssProps.color ` +
-                    `? <${tinted} preserveAspectRatio="none" shapeRendering="geometricPrecision" ${tintedStyle}/> ` +
-                    `: <${normal} preserveAspectRatio="none" shapeRendering="geometricPrecision" style={{ display: "block", width: "100%", height: "100%" }}/>}`
+                return `<${normal} preserveAspectRatio="none" shapeRendering="geometricPrecision" style={{ display: "block", width: "100%", height: "100%" }}/>`
             },
         )
     }
@@ -2677,6 +3044,7 @@ function buildSource(
 }
 
 export function codegenReactPanda(root: DNode, ctx: CodegenContext): CodegenResult {
+        const normalizedRoot = ensureSourceMeta(root)
         const ext = ctx as CodegenContext & ReactPandaCtxExt
         const plugins = (ext.plugins ??
             (ctx.plugins as CodegenPlugin[] | undefined) ??
@@ -2710,7 +3078,7 @@ export function codegenReactPanda(root: DNode, ctx: CodegenContext): CodegenResu
             usesTinting: false,
             tintFilterId: '',
         }
-        const sourceId = ext.sourceId ?? root.sourceId
+        const sourceId = ext.sourceId ?? nodeSourceId(normalizedRoot)
 
         let printNode = ext.printNode
         let api: API | undefined
@@ -2739,7 +3107,7 @@ export function codegenReactPanda(root: DNode, ctx: CodegenContext): CodegenResu
                     )
                 printNode = (node: ast.Node) => proj.emitter.printNode(node)
             }
-            source = buildSource(root, cgCtx, printNode, sourceId)
+            source = buildSource(normalizedRoot, cgCtx, printNode, sourceId)
         } finally {
             if (api) api.close()
         }

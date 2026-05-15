@@ -4,19 +4,20 @@ import { div } from './chain.ts'
 import type { GpuiEmitContext } from './context.ts'
 import { addNodeLayout } from './layout.ts'
 import { num, str } from './rust.ts'
-import { colorExpr, rawPx, scaledPx, sizeExpr, sizeValue } from './values.ts'
+import { colorExpr, literalValue, rawPx, scaledPx, sizeExpr, sizeValue } from './values.ts'
 
 export function emitText(n: DText, ctx: GpuiEmitContext, indent: number): string {
   const shift = textShift(n, ctx)
+  const content = literalValue(n.content) ?? ''
   const chain = div(indent)
-    .child(str(n.content))
+    .child(str(content))
     .method('w', scaledPx(n.width, ctx))
     .method('text_color', colorExpr(n.color, ctx))
     .method('text_size', sizeExpr(n.fontSize, ctx))
     .method('line_height', sizeExpr(n.lineHeight, ctx))
   addNodeLayout(chain, n, ctx, shift)
 
-  if (n.autoResize === TextAutoResize.Hug && !n.content.includes('\n')) {
+  if (n.autoResize === TextAutoResize.Hug && !content.includes('\n')) {
     chain.method('whitespace_nowrap')
   }
   if (n.fontFamily) chain.method('font_family', str(n.fontFamily))

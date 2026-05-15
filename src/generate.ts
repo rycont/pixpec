@@ -10,10 +10,12 @@ import { existsSync } from 'node:fs'
 import { mkdir, readFile, writeFile } from 'node:fs/promises'
 import { dirname, join, resolve } from 'node:path'
 import { dump, exportNodeSvg } from './dumper/index.ts'
-import { compile, loadRegistry } from './compiler/index.ts'
+import type { RawNode } from './dumper/raw-node.ts'
+import { compile, loadRegistry, type Registry } from './compiler/index.ts'
+import { NodeKind, type DataScopeBinding, type DNode } from './compiler/design-ast.ts'
 import { getTarget, resolveConfiguredTargets } from './targets/index.ts'
 import { loadConfig } from './init.ts'
-import { listFigmaTabs } from './cfigma-meta.ts'
+import { findComponentSetSourceByKey, listFigmaTabs } from './cfigma-meta.ts'
 import type { ViewCodegenConfig } from './targets/types.ts'
 
 export interface GenerateOptions {
@@ -36,6 +38,11 @@ export interface GenerateOptions {
   renderScale?: number
   /** Normalized view.config.json data for view-level semantic codegen. */
   viewConfig?: ViewCodegenConfig
+  /** Non-rendering prop bindings to scope into the generated component AST. */
+  dataScopeBindings?: DataScopeBinding[]
+  /** Already-compiled Design AST. Used by init so target codegen consumes the
+   * exact IR it just wrote, instead of redumping/recompiling the Figma node. */
+  ast?: DNode
 }
 
 export interface GenerateManyOptions extends Omit<GenerateOptions, 'target'> {
@@ -132,33 +139,44 @@ export async function runGenerate(componentId: string, opts: GenerateOptions = {
     }
   } catch { /* optional */ }
 
-  const registry = await loadRegistry(componentsDir)
+  let registry = await loadRegistry(componentsDir)
 
   // Owning component: prefer caller-provided --name; otherwise the entry
-  // whose master-snapshot contains nodeId. Bindings carry variant content
-  // / visibility / instance-prop wiring needed for the parametric tree.
+  // whose variant AST contains nodeId.
   let ownerEntry = opts.componentName
     ? [...registry.values()].find((e) => e.componentName === opts.componentName)
     : undefined
   if (!ownerEntry) {
     ownerEntry = [...registry.values()].find((e) =>
-      Object.values(e.masterSnapshot).some((root) => root && (root.id === nodeId || hasDescId(root, nodeId))),
+      Object.values(e.variants).some((variant) => variant.ast && hasDNodeSourceId(variant.ast, nodeId)),
     )
   }
-  const bindingsForNode = ownerEntry?.bindings
   const componentName = opts.componentName ?? ownerEntry?.componentName ?? 'Generated'
 
   // Dump → compile → target codegen.
   const targetName = opts.target
-  const raw = await dump({ cfigmaBin: cfg.cfigmaBin ?? 'cfigma', tab: tab.key, nodeId })
-  const ast = await compile(raw, {
-    registry, bindings: bindingsForNode, tokenMap, tokenValueMap, tokenColorMap,
-    exportSvg: (id) => exportNodeSvg({ cfigmaBin: cfg.cfigmaBin ?? 'cfigma', tab: tab.key, nodeId: id }),
-    detachInstances: opts.detachInstances || targetName === 'gpui',
-  })
+  let ast = opts.ast
+  if (!ast) {
+    const raw = await dump({ cfigmaBin: cfg.cfigmaBin ?? 'cfigma', tab: tab.key, nodeId })
+    registry = await ensureRegistryForRaw(raw, {
+      registry,
+      componentsDir,
+      cfigmaBin: cfg.cfigmaBin,
+      cwd: root,
+    })
+    ast = await compile(raw, {
+      registry, tokenMap, tokenValueMap, tokenColorMap,
+      exportSvg: (id) => exportNodeSvg({ cfigmaBin: cfg.cfigmaBin ?? 'cfigma', tab: tab.key, nodeId: id }),
+      detachInstances: opts.detachInstances || targetName === 'gpui',
+      detachUnregisteredInstances: true,
+    })
+  }
+  if (!opts.ast && opts.dataScopeBindings?.length) {
+    ast = { kind: NodeKind.DataScope, bindings: opts.dataScopeBindings, child: ast }
+  }
   const target = getTarget(targetName)
-  // Land in <componentsDir>/<componentName>/generated/<safeId>.<ext> unless
-  // the caller delegates a different output directory.
+  // Land in the caller's outputDir, or a legacy generated dir when invoked
+  // directly.
   const safeId = (fileKey + '_' + nodeId).replace(/[^A-Za-z0-9]/g, '_')
   const outDir = opts.outputDir ?? resolve(componentsDir, componentName, 'generated')
   const result = await target.codegen(ast, {
@@ -183,10 +201,12 @@ export async function runGenerate(componentId: string, opts: GenerateOptions = {
     viewConfig: opts.viewConfig,
     propsFile: opts.propsFile === null
       ? undefined
-      : opts.propsFile ?? resolve(componentsDir, componentName, 'props.ts'),
+      : opts.propsFile ?? resolve(componentsDir, componentName, 'schema.ts'),
   })
 
-  const outName = opts.outName ?? `${safeId}.${result.fileExtension}`
+  const outName = opts.outName
+    ? opts.outName.includes('.') ? opts.outName : `${opts.outName}.${result.fileExtension}`
+    : `${safeId}.${result.fileExtension}`
   await mkdir(outDir, { recursive: true })
   const outPath = join(outDir, outName)
   let source = result.source
@@ -210,6 +230,66 @@ export async function runGenerate(componentId: string, opts: GenerateOptions = {
   return { componentName, outPath, source }
 }
 
+export async function ensureRegistryForRaw(
+  raw: RawNode,
+  opts: {
+    registry: Registry
+    componentsDir: string
+    cfigmaBin?: string
+    cwd: string
+  },
+): Promise<Registry> {
+  let registry = opts.registry
+  const initialized = new Set<string>()
+  for (let pass = 0; pass < 12; pass += 1) {
+    const missing = collectMissingComponentSetKeys(raw, registry).filter(
+      (key) => !initialized.has(key),
+    )
+    if (missing.length === 0) return registry
+    for (const key of missing) {
+      const source = await findComponentSetSourceByKey({
+        componentSetKey: key,
+        cfigmaBin: opts.cfigmaBin,
+      })
+      if (!source) {
+        initialized.add(key)
+        console.warn(
+          `pixpec generate: INSTANCE references unregistered component key ${key}, ` +
+            `but no open non-remote COMPONENT/COMPONENT_SET with that key was found; ` +
+            `falling back to detached raw subtree output.`,
+        )
+        continue
+      }
+      initialized.add(key)
+      console.log(
+        `[generate] auto-init dependency ${source.name} (${source.fileKey}:${source.nodeId})`,
+      )
+      const { init } = await import('./init.ts')
+      await init({
+        componentId: `${source.fileKey}:${source.nodeId}`,
+        cwd: opts.cwd,
+        skipExisting: true,
+        skipVerify: true,
+      })
+      registry = await loadRegistry(opts.componentsDir)
+    }
+  }
+  throw new Error('pixpec generate: recursive component init exceeded 12 passes')
+}
+
+function collectMissingComponentSetKeys(raw: RawNode, registry: Registry): string[] {
+  const out = new Set<string>()
+  const visit = (node: RawNode) => {
+    if (node.type === 'INSTANCE') {
+      const key = node.mainComponent?.parentKey ?? node.mainComponent?.key
+      if (key && !registry.has(key)) out.add(key)
+    }
+    for (const child of node.children ?? []) visit(child)
+  }
+  visit(raw)
+  return [...out]
+}
+
 function colorTokenToCss(value: unknown): string | undefined {
   if (!value || typeof value !== 'object') return undefined
   const c = value as { r?: unknown; g?: unknown; b?: unknown; a?: unknown }
@@ -226,9 +306,10 @@ function hexByte(value: number): string {
   return value.toString(16).padStart(2, '0')
 }
 
-function hasDescId(root: import('./dumper/raw-node.ts').RawNode, id: string): boolean {
-  if (root.id === id) return true
-  if (!root.children) return false
-  for (const c of root.children) if (hasDescId(c, id)) return true
+function hasDNodeSourceId(root: import('./compiler/design-ast.ts').DNode, id: string): boolean {
+  if (root.sourceId === id) return true
+  const children = (root as { children?: unknown }).children
+  if (!Array.isArray(children)) return false
+  for (const c of children as import('./compiler/design-ast.ts').DNode[]) if (hasDNodeSourceId(c, id)) return true
   return false
 }

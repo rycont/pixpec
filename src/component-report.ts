@@ -42,7 +42,7 @@ export async function writeComponentReport(opts: {
   verifyTargets?: VerifyTargetReport[];
   detachedUsages?: DetachedUsageReport[];
 }): Promise<void> {
-  const propsScheme = await readOptional(resolve(opts.componentDir, "props.ts"));
+  const propsScheme = await readOptional(resolve(opts.componentDir, "schema.ts"));
   const representative = findRepresentativeCase(opts.component);
   const targetNames =
     opts.targets ??
@@ -75,7 +75,7 @@ export async function writeComponentReport(opts: {
     lines.push(propsScheme.trimEnd());
     lines.push("```");
   } else {
-    lines.push("_No props.ts found._");
+    lines.push("_No schema.ts found._");
   }
   lines.push("");
   lines.push("## Figma Links");

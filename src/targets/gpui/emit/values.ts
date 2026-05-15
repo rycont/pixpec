@@ -1,4 +1,4 @@
-import type { Color, Size } from '../../../compiler/design-ast.ts'
+import type { Color, Size, Value } from '../../../compiler/design-ast.ts'
 import type { GpuiEmitContext } from './context.ts'
 import { hex, num } from './rust.ts'
 
@@ -27,7 +27,16 @@ export function rawPx(value: number): string {
   return `px(${num(value)})`
 }
 
-export function colorExpr(color: Color, ctx: GpuiEmitContext): string {
+export function literalValue<T>(value: Value<T>): T {
+  return value.kind === 'literal' && value.source === 'raw' ? value.value : (undefined as T)
+}
+
+export function colorExpr(color: Color | Value<Color>, ctx: GpuiEmitContext): string {
+  if ('kind' in color) {
+    if (color.kind === 'expression') return 'rgb(0x000000)'
+    if (color.source === 'token') return colorExprFromCss(ctx.tokenColorMap[color.path]) ?? 'rgb(0x000000)'
+    return colorExpr(color.value, ctx)
+  }
   if ('tokenPath' in color) {
     const resolved = colorExprFromCss(ctx.tokenColorMap[color.tokenPath])
     return resolved ?? 'rgb(0x000000)'

@@ -31,9 +31,21 @@ export interface RawImagePaint {
   dataUrl?: string;
 }
 
+export interface RawGradientPaint {
+  type: "GRADIENT_LINEAR";
+  visible?: boolean;
+  opacity?: number;
+  gradientStops?: Array<{
+    color: { r: number; g: number; b: number; a?: number };
+    position: number;
+  }>;
+  gradientTransform?: [[number, number, number], [number, number, number]];
+}
+
 export type RawPaint =
   | RawSolidPaint
   | RawImagePaint
+  | RawGradientPaint
   | { type: string; visible?: boolean };
 
 export interface RawDropShadowEffect {
@@ -73,6 +85,13 @@ export interface RawComponentProperty {
   boundVariables?: Record<string, unknown>;
 }
 
+export interface RawComponentPropertyDefinition {
+  type: "BOOLEAN" | "TEXT" | "VARIANT" | "INSTANCE_SWAP";
+  defaultValue?: unknown;
+  variantOptions?: string[];
+  preferredValues?: unknown[];
+}
+
 export interface RawNode {
   // ---- common to every node ----
   id: string;
@@ -106,6 +125,10 @@ export interface RawNode {
   componentPropertyReferences?: Record<string, string>;
   /** Variable bindings on per-property style values. */
   boundVariables?: Record<string, unknown>;
+  /** Durable Figma key. Present on COMPONENT / COMPONENT_SET nodes. */
+  key?: string;
+  /** Whether the source node is remote library content. */
+  remote?: boolean;
 
   // ---- FRAME / COMPONENT / INSTANCE ----
   layoutMode?: "NONE" | "HORIZONTAL" | "VERTICAL";
@@ -147,6 +170,11 @@ export interface RawNode {
   maxWidth?: number;
   minHeight?: number;
   maxHeight?: number;
+
+  // ---- COMPONENT / COMPONENT_SET only ----
+  componentPropertyDefinitions?: Record<string, RawComponentPropertyDefinition>;
+  /** COMPONENT variant prop values, as supplied by Figma for set children. */
+  variantProperties?: Record<string, string>;
 
   // ---- INSTANCE only ----
   mainComponent?: {

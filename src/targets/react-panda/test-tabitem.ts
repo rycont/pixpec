@@ -20,22 +20,6 @@ import {
 } from '../../compiler/design-ast.ts'
 import { codegenReactPanda } from './codegen.ts'
 import type { CodegenContext } from '../types.ts'
-import type { CodegenPlugin } from '../../types.ts'
-
-// Mirror danah's iconCurrentColor plugin (emitWrap half — Icon → adds color attr).
-const iconCurrentColor: CodegenPlugin = {
-  name: 'icon-current-color',
-  emitWrap: (n, jsx, ctx) => {
-    if (n.kind !== 'instance') return jsx
-    const inst = n as { componentName?: string; effectiveFill?: string; effectiveFillTokenId?: string }
-    if (inst.componentName !== 'Icon') return jsx
-    const fill = inst.effectiveFill
-    if (!fill) return jsx
-    const tokenId = inst.effectiveFillTokenId
-    const tokenPath = ctx.resolveTokenPath(tokenId)
-    return ctx.appendJsxAttr(jsx, ctx.jsxAttr('color', tokenPath ?? fill))
-  },
-}
 
 // Synthetic TabItem b master AST.
 const root: DNode = {
@@ -66,24 +50,20 @@ const root: DNode = {
       props: { Type: 'check' },
       defaultProps: { Type: 'check' },
       sizing: { horizontal: Sizing.Fixed, vertical: Sizing.Fixed },
-      visibilityBinding: 'leftIcon',
-      // extension: instance prop bindings (Type → owner.iconType)
-      instancePropBindings: { Type: 'iconType' },
-      // extension: legacy plugin payload — emulates iconCurrentColor walkExtend.
-      effectiveFill: '#262626',
-      effectiveFillTokenId: 'VariableID:icon-color',
+      visible: { kind: 'expression', type: 'prop', name: 'leftIcon' },
+      // extension: instance prop bindings.
+      instancePropBindings: { Type: 'iconType', _fill: 'iconFill' },
     } as DNode,
     // Label text
     {
       kind: NodeKind.Text,
       sourceId: '2127:1820',
       sourceName: 'Label',
-      content: 'Tab',
-      contentBinding: 'label',
+      content: { kind: 'expression', type: 'prop', name: 'label' },
       fontSize: { value: 14, unit: 'px' },
       lineHeight: { value: 20, unit: 'px' },
-      color: { tokenPath: 'content.standard.primary' },
-      textStyleRef: 'S:body-regular,',
+      color: { kind: 'literal', source: 'token', path: 'content.standard.primary' },
+      textStyleRef: { kind: 'literal', source: 'raw', value: 'S:body-regular,' },
       width: 24,
       autoResize: TextAutoResize.Hug,
     },
@@ -117,7 +97,7 @@ const ctx: CodegenContext = {
     ['Icon', { componentName: 'Icon', dir: '/danah/src/components/Icon' }],
   ]),
   remBase: 16,
-  plugins: [iconCurrentColor],
+  plugins: [],
 }
 
 const result = await codegenReactPanda(root, ctx)

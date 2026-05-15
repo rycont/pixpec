@@ -3,8 +3,8 @@
  *
  * Walks a `RawNode` tree DFS and classifies each node into a `DNode` of the
  * appropriate kind. Stateless apart from the per-call `CompileOptions`
- * registry (used to resolve `INSTANCE` nodes against registered components
- * and to apply per-node prop bindings). No figma calls — purely a transform
+ * registry (used to resolve `INSTANCE` nodes against registered components).
+ * No figma calls — purely a transform
  * over the raw dump produced by `pixpec/src/dumper`.
  *
  * Detach decision (step 8) lives in `detach.ts`; this module imports it and
@@ -19,6 +19,7 @@
 
 import type {
   DNode,
+  DDataScope,
   DFlex,
   DStack,
   DBox,
@@ -35,6 +36,7 @@ import type {
   Size,
   Color,
   Shadow,
+  Value,
 } from "./design-ast.ts";
 import {
   NodeKind,
@@ -54,6 +56,7 @@ import {
 import type {
   RawNode,
   RawSolidPaint,
+  RawGradientPaint,
   RawImagePaint,
   RawConstraints,
   RawTextRun,
@@ -61,18 +64,12 @@ import type {
 } from "../dumper/raw-node.ts";
 import type { Registry } from "./registry.ts";
 import { resolveRegistryVariant } from "./registry.ts";
-import { shouldDetach } from "./detach.ts";
-import { rawForPropsFromFigma } from "./props-context.ts";
+import { indexDNodeClasses, materializeDNode, materializeDNodes } from "./nodes/index.ts";
+import type { DNodeClass } from "./nodes/index.ts";
 
 export interface CompileOptions {
   /** Component registry (built by registry.ts from each component's index.ts). */
   registry: Registry;
-  /** Variant bindings spec — per-master-node-id { attr.text/visible,
-   *  component } map. Walker stamps matching descendants with
-   *  contentBinding/visibilityBinding so the emitter renders prop-driven
-   *  trees. Keyed by stripPrefix(node.id) so nested-instance overrides
-   *  match the master node ids in cases.ts. */
-  bindings?: import("./registry.ts").NodeBindings;
   /** Figma variable id → semantic token path (e.g. "VariableID:..." →
    *  "content.standard.primary"). */
   tokenMap?: Record<string, string>;
@@ -96,6 +93,15 @@ export interface CompileOptions {
   /** Compile every INSTANCE from its resolved raw subtree instead of emitting
    *  a DInstance component reference. Intended for breakdown/debug output. */
   detachInstances?: boolean;
+  /** When a dependency cannot be resolved from the registry but the raw dump
+   *  contains the instance's resolved children, keep compiling by expanding
+   *  that subtree. Intended for remote visual dependencies whose source
+   *  library tab is not open. */
+  detachUnregisteredInstances?: boolean;
+  /** Internal compile context: instance override fields keyed by bare
+   * descendant node id. Used to represent SVG paint overrides without
+   * treating the SVG's baked-in original fill as a DVector override. */
+  overrideFields?: Map<string, Set<string>>;
 }
 
 /** Subtree predicate: every descendant (including the node itself) must
@@ -199,6 +205,15 @@ function firstSolidFill(fills?: RawNode["fills"]): RawSolidPaint | null {
   for (const f of fills) {
     if (f && f.type === "SOLID" && f.visible !== false)
       return f as RawSolidPaint;
+  }
+  return null;
+}
+
+function firstGradientFill(fills?: RawNode["fills"]): RawGradientPaint | null {
+  if (!Array.isArray(fills)) return null;
+  for (const f of fills) {
+    if (f && f.type === "GRADIENT_LINEAR" && f.visible !== false)
+      return f as RawGradientPaint;
   }
   return null;
 }
@@ -365,6 +380,29 @@ function pickColor(
   return { color: rgbaHex(paint.color, paint.opacity ?? 1) };
 }
 
+function gradientPaintToColor(paint: RawGradientPaint | null | undefined): Color | undefined {
+  if (!paint?.gradientStops?.length) return undefined;
+  const stops = [...paint.gradientStops]
+    .sort((a, b) => a.position - b.position)
+    .map((stop) => {
+      const color = rgbaHex(
+        { r: stop.color.r, g: stop.color.g, b: stop.color.b },
+        (stop.color.a ?? 1) * (paint.opacity ?? 1),
+      );
+      return `${color} ${+(stop.position * 100).toFixed(3)}%`;
+    });
+  return { color: `linear-gradient(180deg, ${stops.join(", ")})` };
+}
+
+function pickPaintColor(
+  solid: RawSolidPaint | null | undefined,
+  gradient: RawGradientPaint | null | undefined,
+  varId: string | undefined,
+  opts: CompileOptions,
+): Color | undefined {
+  return pickColor(solid, varId, opts) ?? gradientPaintToColor(gradient);
+}
+
 function colorsEquivalent(a: string, b: string): boolean {
   const ca = parseCssColor(a);
   const cb = parseCssColor(b);
@@ -438,6 +476,11 @@ function buildBase(
   parent?: RawNode,
 ): DNodeBase {
   const out: DNodeBase = { sourceId: n.id, sourceName: n.name };
+  if (n.componentPropertyReferences?.visible) {
+    out.visible = propValue(publicComponentPropName(n.componentPropertyReferences.visible));
+  } else if (n.visible === false) {
+    out.visible = literalValue(false);
+  }
   if (typeof n.opacity === "number" && n.opacity < 1) out.opacity = n.opacity;
   if (typeof n.rotation === "number" && Math.abs(n.rotation) >= 0.01)
     out.rotation = n.rotation;
@@ -478,11 +521,154 @@ function buildBase(
       ),
     };
   }
-  const bareId = stripPrefix(n.id);
-  const binding = opts.bindings?.[bareId];
   out.renderBoundsOffset = renderBoundsOffsetFromRaw(n);
-  if (binding?.node?.visible) out.visibilityBinding = binding.node.visible;
   return out;
+}
+
+function literalValue<T>(value: T): Value<T> {
+  return { kind: "literal", source: "raw", value };
+}
+
+function propValue(name: string): Value<never> {
+  return { kind: "expression", type: "prop", name };
+}
+
+function publicComponentPropName(rawKey: string): string {
+  return String(rawKey).replace(/#[^#]*$/, "").replace(/\s+/g, "");
+}
+
+function directPaintBinding(n: RawNode, opts: CompileOptions): string | undefined {
+  return undefined;
+}
+
+function hasVisiblePaint(n: RawNode): boolean {
+  if (n.isMask || isInvisibleShape(n)) return false;
+  return Array.isArray(n.fills) && n.fills.some((f) => f && f.visible !== false);
+}
+
+function foldedPaintBinding(n: RawNode, opts: CompileOptions): string | undefined {
+  const direct = directPaintBinding(n, opts);
+  if (direct) return direct;
+  const props = new Set<string>();
+  let painted = 0;
+  const visit = (node: RawNode) => {
+    if (node.visible === false) return;
+    if ((SHAPELIKE.has(node.type) || VECTORLIKE.has(node.type)) && hasVisiblePaint(node)) {
+      painted += 1;
+      const prop = directPaintBinding(node, opts);
+      if (prop) props.add(prop);
+    }
+    for (const child of node.children ?? []) visit(child);
+  };
+  visit(n);
+  if (painted === 0 || props.size !== 1) return undefined;
+  const [prop] = props;
+  let boundPainted = 0;
+  const countBound = (node: RawNode) => {
+    if (node.visible === false) return;
+    if ((SHAPELIKE.has(node.type) || VECTORLIKE.has(node.type)) && hasVisiblePaint(node)) {
+      if (directPaintBinding(node, opts) === prop) boundPainted += 1;
+    }
+    for (const child of node.children ?? []) countBound(child);
+  };
+  countBound(n);
+  return boundPainted === painted ? prop : undefined;
+}
+
+function exactComponentProps(n: RawNode): Record<string, string | boolean> {
+  const out: Record<string, string | boolean> = {};
+  for (const [key, prop] of Object.entries(n.componentProperties ?? {})) {
+    if (typeof prop.value === "string" || typeof prop.value === "boolean") {
+      out[key] = prop.value;
+    }
+  }
+  return out;
+}
+
+function indexDNodes(nodes: DNode[]): Map<string, DNodeClass> {
+  return indexDNodeClasses(materializeDNodes(nodes));
+}
+
+function exposedProps(
+  raw: RawNode,
+  compiledChildren: DNode[],
+): Record<string, unknown> {
+  const byId = indexDNodes(compiledChildren);
+  const out: Record<string, unknown> = {};
+  for (const exposed of raw.exposedInstances ?? []) {
+    const node = byId.get(exposed.id);
+    const props = node?.instanceProps();
+    if (props) out[exposed.id] = props;
+  }
+  return out;
+}
+
+function fieldConsumer(compiledChildren: DNode[]) {
+  const byId = indexDNodes(compiledChildren);
+  const consumed = new Set<string>();
+  return {
+    consumed,
+    consume(nodeId: string, field: string): unknown {
+      consumed.add(`${nodeId}\0${field}`);
+      const node = byId.get(nodeId);
+      if (!node) return undefined;
+      return normalizePropValue(node.readField(field));
+    },
+  };
+}
+
+function normalizePropValue(value: unknown): unknown {
+  if (!value || typeof value !== "object") return value;
+  if (Array.isArray(value)) return value.map(normalizePropValue);
+  const record = value as Record<string, unknown>;
+  if (record.kind === "literal") {
+    if (record.source === "raw") return normalizePropValue(record.value);
+    if (record.source === "token") return record.path;
+  }
+  if (record.kind === "expression") return undefined;
+  if (typeof record.tokenPath === "string") return record.tokenPath;
+  if (typeof record.color === "string") return record.color;
+  if (typeof record.value === "number" && record.unit === "px") return record.value;
+  return value;
+}
+
+function hasUnconsumedDNodeDiff(
+  master: DNode | undefined,
+  usageChildren: DNode[],
+  consumedFields: Set<string>,
+): boolean {
+  if (!master) return usageChildren.length > 0;
+  const masterNodes = indexDNodes(containerChildren(master));
+  const usageNodes = indexDNodes(usageChildren);
+  for (const [nodeId, masterNode] of masterNodes) {
+    const usageNode = usageNodes.get(nodeId);
+    if (!usageNode || usageNode.kind !== masterNode.kind) return true;
+    for (const diff of masterNode.visualDiff(usageNode)) {
+      if (consumedFields.has(`${nodeId}\0${diff.field}`)) continue;
+      return true;
+    }
+  }
+  return false;
+}
+
+function containerChildren(node: DNode): DNode[] {
+  if (node.kind === NodeKind.DataScope) return containerChildren((node as DDataScope).child);
+  return materializeDNode(node).children().map((child) => child.toJSON());
+}
+
+function withInstanceOverrideFields(opts: CompileOptions, n: RawNode): CompileOptions {
+  if (!n.overrides?.length) return opts;
+  const overrideFields = new Map<string, Set<string>>();
+  for (const [nodeId, fields] of opts.overrideFields ?? []) {
+    overrideFields.set(nodeId, new Set(fields));
+  }
+  for (const override of n.overrides) {
+    const nodeId = stripPrefix(override.id);
+    const fields = overrideFields.get(nodeId) ?? new Set<string>();
+    for (const field of override.overriddenFields ?? []) fields.add(field);
+    if (fields.size > 0) overrideFields.set(nodeId, fields);
+  }
+  return { ...opts, overrideFields };
 }
 
 function renderBoundsOffsetFromRaw(n: RawNode): { x: number; y: number } | undefined {
@@ -569,25 +755,27 @@ function compileText(
   const out: DText = {
     ...buildBase(n, opts, parent),
     kind: NodeKind.Text,
-    content: sanitizeTextContent(n.characters ?? ""),
+    content: n.componentPropertyReferences?.characters
+      ? propValue(publicComponentPropName(n.componentPropertyReferences.characters))
+      : literalValue(sanitizeTextContent(n.characters ?? "")),
     fontFamily: n.fontName?.family,
     fontWeight: n.fontWeight,
     fontSize,
     lineHeight,
     paragraphSpacing,
-    color,
+    color: literalValue(color),
     textDecoration: decoration,
     textAlign: align,
-    textStyleRef: n.textStyleId,
+    textStyleRef: n.componentPropertyReferences?.textStyleId
+      ? propValue(publicComponentPropName(n.componentPropertyReferences.textStyleId))
+      : n.textStyleId
+        ? literalValue(n.textStyleId)
+        : undefined,
     width: n.width ?? 0,
     autoResize,
     runs,
   };
   const bareId = stripPrefix(n.id);
-  const binding = opts.bindings?.[bareId];
-  if (binding?.node?.content) out.contentBinding = binding.node.content;
-  if (binding?.node?.paint) out.fillBinding = binding.node.paint;
-  if (binding?.node?.textStyle) out.textStyleBinding = binding.node.textStyle;
   return out;
 }
 
@@ -616,6 +804,7 @@ async function compileShape(
   }
   const fill = firstSolidFill(n.fills);
   const stroke = firstSolidFill(n.strokes);
+  const gradientStroke = firstGradientFill(n.strokes);
   const fillVarId = varId(fill?.boundVariables, "color");
   const strokeVarId = varId(stroke?.boundVariables, "color");
   const strokeWidthVarId = varId(n.boundVariables, "strokeWeight");
@@ -641,9 +830,9 @@ async function compileShape(
     height:
       pickSize(nodeHeight(n), nodeHeightVar(n), opts) ?? px(0),
     fill: pickColor(fill, fillVarId, opts),
-    stroke: stroke
+    stroke: stroke || gradientStroke
       ? {
-          paint: pickColor(stroke, strokeVarId, opts) ?? {
+          paint: pickPaintColor(stroke, gradientStroke, strokeVarId, opts) ?? {
             color: "#000000",
           },
           width:
@@ -728,6 +917,31 @@ function paddingFromRaw(n: RawNode, opts: CompileOptions): Padding | undefined {
   };
 }
 
+function overriddenField(n: RawNode, opts: CompileOptions, field: string): boolean {
+  return opts.overrideFields?.get(stripPrefix(n.id))?.has(field) ?? false;
+}
+
+function solidFillOverride(n: RawNode, opts: CompileOptions): Color {
+  const visible = (n.fills ?? []).filter((paint) => paint.visible !== false);
+  if (visible.length === 0) {
+    return { color: "transparent" };
+  }
+  if (visible.length !== 1 || visible[0]?.type !== "SOLID") {
+    throw new Error(
+      `pixpec compile: SVG paint override for ${n.id} (${n.name}) is not a single solid fill`,
+    );
+  }
+  const fill = visible[0] as RawSolidPaint;
+  const fillVarId = varId(fill.boundVariables, "color");
+  const value = pickColor(fill, fillVarId, opts);
+  if (!value) {
+    throw new Error(
+      `pixpec compile: SVG paint override for ${n.id} (${n.name}) could not be resolved`,
+    );
+  }
+  return value;
+}
+
 async function compileVector(
   n: RawNode,
   opts: CompileOptions,
@@ -735,15 +949,13 @@ async function compileVector(
 ): Promise<DVector | DImage> {
   const w = pickSize(n.width, undefined, opts) ?? px(0);
   const h = pickSize(n.height, undefined, opts) ?? px(0);
+  const fillProp = directPaintBinding(n, opts);
+  const fillOverride = overriddenField(n, opts, "fills")
+    ? solidFillOverride(n, opts)
+    : undefined;
   let svg = n.svg;
-  if (!svg && n.svgExportFailed) svg = svgFromVectorPaths(n);
   if (!svg && opts.exportSvg) {
-    try {
-      svg = await exportSvgForRawNode(n, opts);
-    } catch (error) {
-      svg = svgFromVectorPaths(n);
-      if (!svg) throw error;
-    }
+    svg = await exportSvgForRawNode(n, opts);
   }
   if (svg) {
     return {
@@ -751,6 +963,11 @@ async function compileVector(
       kind: NodeKind.Vector,
       width: w,
       height: h,
+      fill: fillProp
+        ? { kind: "expression", type: "prop", name: fillProp }
+        : fillOverride
+          ? literalValue(fillOverride)
+          : undefined,
       svg,
       renderBoundsOffset: renderBoundsOffsetFromRaw(n),
     };
@@ -761,31 +978,6 @@ async function compileVector(
     width: w,
     height: h,
   };
-}
-
-function svgFromVectorPaths(n: RawNode): string | undefined {
-  if (!Array.isArray(n.vectorPaths) || n.vectorPaths.length === 0) return undefined;
-  const width = n.width ?? 0;
-  const height = n.height ?? 0;
-  const fill = firstSolidFill(n.fills);
-  const stroke = firstSolidFill(n.strokes);
-  const fillAttr = fill ? ` fill="${escapeXml(rgbaHex(fill.color, fill.opacity ?? 1))}"` : ' fill="none"';
-  const strokeAttr = stroke ? ` stroke="${escapeXml(rgbaHex(stroke.color, stroke.opacity ?? 1))}"` : '';
-  const paths = n.vectorPaths
-    .map((path) => {
-      const fillRule = path.windingRule === 'EVENODD' ? ' fill-rule="evenodd"' : '';
-      return `<path d="${escapeXml(path.data)}"${fillAttr}${strokeAttr}${fillRule}/>`;
-    })
-    .join('');
-  return `<svg width="${width}" height="${height}" viewBox="0 0 ${width} ${height}" xmlns="http://www.w3.org/2000/svg">${paths}</svg>`;
-}
-
-function escapeXml(value: string): string {
-  return value
-    .replace(/&/g, '&amp;')
-    .replace(/"/g, '&quot;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;');
 }
 
 async function compileContainer(
@@ -802,6 +994,7 @@ async function compileContainer(
         : "none";
   const fill = firstSolidFill(n.fills);
   const stroke = firstSolidFill(n.strokes);
+  const gradientStroke = firstGradientFill(n.strokes);
   const childRaws = (n.children ?? []).filter(
     (c) => c.visible !== false && !isInvisibleShape(c),
   );
@@ -819,8 +1012,6 @@ async function compileContainer(
     varId(n.boundVariables, "strokeWeight"),
     opts,
   );
-  const bareId = stripPrefix(n.id);
-  const binding = opts.bindings?.[bareId];
   const common = {
     ...buildBase(n, opts, parent),
     width: pickSize(nodeWidth(n), nodeWidthVar(n), opts),
@@ -838,11 +1029,12 @@ async function compileContainer(
       opts,
     ),
     padding: paddingFromRaw(n, opts),
-    background: pickColor(fill, bgVarId, opts),
-    fillBinding: binding?.node?.paint,
-    border: stroke
+    background: pickColor(fill, bgVarId, opts)
+      ? literalValue(pickColor(fill, bgVarId, opts)!)
+      : undefined,
+    border: stroke || gradientStroke
       ? {
-          paint: pickColor(stroke, strokeVarId, opts) ?? {
+          paint: pickPaintColor(stroke, gradientStroke, strokeVarId, opts) ?? {
             color: "#000000",
           },
           width:
@@ -959,11 +1151,15 @@ async function compileInstance(
   parent?: RawNode,
   rawSubtree = false,
 ): Promise<DNode> {
-  if (rawSubtree || opts.detachInstances) return compileContainer(n, opts, parent, true);
+  const childOpts = withInstanceOverrideFields(opts, n);
+  if (rawSubtree || opts.detachInstances) return compileContainer(n, childOpts, parent, true);
 
   const setKey = n.mainComponent?.parentKey ?? n.mainComponent?.key;
   const entry = setKey ? opts.registry.get(setKey) : undefined;
   if (!entry) {
+    if (opts.detachUnregisteredInstances && (n.children?.length ?? 0) > 0) {
+      return compileContainer(n, childOpts, parent, true);
+    }
     throw new Error(
       `pixpec compile: encountered INSTANCE ${n.id} (${n.name}) of unregistered component ` +
         `(componentSet key ${setKey ?? "<unknown>"}). Run \`pixpec init\` for that component first, ` +
@@ -975,46 +1171,27 @@ async function compileInstance(
     n.mainComponent?.key,
     n.mainComponent?.name,
   );
-  if (shouldDetach(n, entry, variant)) return compileContainer(n, opts, parent, true);
-
-  const rawForFigma = rawForPropsFromFigma(n);
-  // Compile child nodes (recursively) so propsFromFigma can aggregate
-  // nested-instance data — e.g. a Tab instance collects `tabItems` from
-  // its compiled DInstance(TabItem) children. Most components ignore the
-  // children arg; Tab-shaped containers depend on it.
   const compiledChildren: DNode[] = [];
   for (const c of n.children ?? [])
-    compiledChildren.push(await compileNode(c, opts, n));
+    compiledChildren.push(await compileNode(c, childOpts, n));
   let props: Record<string, unknown> = {};
-  try {
-    props = variant?.propsFromFigma?.(rawForFigma, compiledChildren) ?? {};
-  } catch {
-    /* best-effort */
-  }
+  const fields = fieldConsumer(compiledChildren);
+  props =
+    variant?.propsFromFigma?.(
+      exactComponentProps(n),
+      exposedProps(n, compiledChildren),
+      fields,
+    ) ?? {};
+  if (hasUnconsumedDNodeDiff(variant?.ast, compiledChildren, fields.consumed))
+    return compileContainer(n, opts, parent, true);
   const out: DInstance = {
     ...buildBase(n, opts, parent),
     kind: NodeKind.Instance,
     componentName: entry.componentName,
     props,
-    defaultProps: entry.defaults,
     width: pickSize(nodeWidth(n), nodeWidthVar(n), opts),
     height: pickSize(nodeHeight(n), nodeHeightVar(n), opts),
   };
-  // Surface per-instance-property bindings from the variant spec so the
-  // emitter can render `<Icon Type={iconType}/>` etc.
-  const bareId = stripPrefix(n.id);
-  const ipb = opts.bindings?.[bareId]?.component;
-  if (ipb && Object.keys(ipb).length > 0) out.instancePropBindings = { ...ipb };
-  const fillBinding = opts.bindings?.[bareId]?.node?.paint;
-  const childSupportsFill = Object.values(entry.bindings).some(
-    (b) => b.node?.paint === "_fill",
-  );
-  if (fillBinding && childSupportsFill) {
-    out.instancePropBindings = {
-      ...(out.instancePropBindings ?? {}),
-      _fill: fillBinding,
-    };
-  }
   const layoutOverrides: NonNullable<DInstance["layoutOverrides"]> = {};
   let any = false;
   for (const k of [
@@ -1040,47 +1217,7 @@ async function compileInstance(
     any = true;
   }
   if (any) out.layoutOverrides = layoutOverrides;
-  // currentColor extraction — find the first inner VECTOR/BOOLEAN_OPERATION
-  // and surface its effective SOLID fill so emitter plugins (e.g. danah's
-  // iconCurrentColor) can forward it as a parent CSS color attribute. This
-  // mirrors the legacy walker's `walkExtend` logic that ran inside figma.
-  const eff = findEffectiveVectorFill(n);
-  if (eff) {
-    out.effectiveFill = eff.color;
-    if (eff.tokenId) out.effectiveFillTokenId = eff.tokenId;
-  }
   return out;
-}
-
-/** Walk an INSTANCE's descendants and return the first VECTOR-like node's
- *  effective SOLID fill (color + bound-variable id). Empty/all-hidden fills
- *  are reported as transparent so the emitter can forward color suppression
- *  (matches legacy iconCurrentColor walker semantics). */
-function findEffectiveVectorFill(
-  n: RawNode,
-): { color: string; tokenId?: string } | undefined {
-  if (n.visible === false) return undefined;
-  if (n.type === "VECTOR" || n.type === "BOOLEAN_OPERATION") {
-    if (!Array.isArray(n.fills)) return undefined;
-    const f0 = n.fills[0];
-    if (f0 && f0.type === "SOLID" && (f0 as RawSolidPaint).visible !== false) {
-      const sf = f0 as RawSolidPaint;
-      const tokenId = varId(sf.boundVariables, "color");
-      return { color: rgbaHex(sf.color, sf.opacity ?? 1), tokenId };
-    }
-    if (
-      n.fills.length === 0 ||
-      n.fills.every((f) => f && f.visible === false)
-    ) {
-      return { color: "transparent" };
-    }
-    return undefined;
-  }
-  for (const c of n.children ?? []) {
-    const r = findEffectiveVectorFill(c);
-    if (r) return r;
-  }
-  return undefined;
 }
 
 function compileUnknown(
@@ -1125,6 +1262,7 @@ async function compileNode(
     if (safe === true) {
       try {
         const svg = await exportSvgForRawNode(n, opts);
+        const fillProp = foldedPaintBinding(n, opts);
         return {
           ...buildBase(n, opts, parent),
           kind: NodeKind.Vector,
@@ -1134,6 +1272,9 @@ async function compileNode(
           height:
             pickSize(n.height, varId(n.boundVariables, "height"), opts) ??
             px(n.height ?? 0),
+          fill: fillProp
+            ? { kind: "expression", type: "prop", name: fillProp }
+            : undefined,
           svg,
           renderBoundsOffset: renderBoundsOffsetFromRaw(n),
         };

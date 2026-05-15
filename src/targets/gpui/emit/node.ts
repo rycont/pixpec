@@ -17,6 +17,8 @@ export async function emitNode(
   parentDirection?: FlowDirection,
 ): Promise<string> {
   switch (n.kind) {
+    case NodeKind.DataScope:
+      return emitNode(n.child, ctx, indent, parentDirection)
     case NodeKind.Flex:
     case NodeKind.Stack:
     case NodeKind.Box:
@@ -42,7 +44,7 @@ export async function emitChildExpr(
   indent: number,
   parentDirection?: FlowDirection,
 ): Promise<string> {
-  if (!n.visibilityBinding) return emitNode(n, ctx, indent, parentDirection)
+  if (!n.visible || n.visible.kind !== 'expression') return emitNode(n, ctx, indent, parentDirection)
 
   return [
     `${pad(indent)}if true {`,

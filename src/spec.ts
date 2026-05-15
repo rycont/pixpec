@@ -13,9 +13,6 @@ export type {
   Component,
   Case,
   Variant,
-  NodeBinding,
-  NodeBindings,
-  NodeBindingSurface,
   CaseRenderSpec,
   RenderBoxSpec,
 } from "./types.ts";

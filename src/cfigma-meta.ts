@@ -355,6 +355,62 @@ export async function fetchComponentMeta(opts: {
   return cleanControlValue(JSON.parse(stdout)) as FigmaComponentMeta;
 }
 
+export interface ComponentSetSource {
+  fileKey: string;
+  nodeId: string;
+  name: string;
+}
+
+export async function findComponentSetSourceByKey(opts: {
+  componentSetKey: string;
+  cfigmaBin?: string;
+}): Promise<ComponentSetSource | undefined> {
+  const tabs = await listFigmaTabs({ cfigmaBin: opts.cfigmaBin });
+  const bin = opts.cfigmaBin ?? "cfigma";
+const code = `
+const targetKey = ${JSON.stringify(opts.componentSetKey)};
+await figma.loadAllPagesAsync();
+for (const page of figma.root.children) {
+  const sets = page.findAllWithCriteria({ types: ['COMPONENT_SET'] });
+  for (const set of sets) {
+    if (set.key === targetKey && set.remote !== true) {
+      return { nodeId: set.id, name: set.name };
+    }
+  }
+  const components = page.findAllWithCriteria({ types: ['COMPONENT'] });
+  for (const component of components) {
+    if (component.key === targetKey && component.remote !== true) {
+      return { nodeId: component.id, name: component.name };
+    }
+  }
+}
+return null;
+`;
+  for (const tab of tabs) {
+    try {
+      const { stdout } = await execFileAsync(
+        bin,
+        ["--tab", tab.key, "exec", code],
+        { encoding: "utf8", maxBuffer: 16 * 1024 * 1024 },
+      );
+      const found = cleanControlValue(JSON.parse(stdout)) as
+        | { nodeId?: string; name?: string }
+        | null;
+      if (found?.nodeId) {
+        return {
+          fileKey: tab.key,
+          nodeId: found.nodeId,
+          name: found.name ?? found.nodeId,
+        };
+      }
+    } catch {
+      // Ignore tabs that cannot be searched; the caller reports failure if
+      // no open source tab contains the requested component set key.
+    }
+  }
+  return undefined;
+}
+
 /**
  * One descendant TEXT node observed across instance usages of a component
  * set. `descId` is figma's master-relative descendant id (so the same

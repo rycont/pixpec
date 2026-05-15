@@ -10,6 +10,7 @@
  */
 
 export type DNode =
+  | DDataScope
   | DFlex
   | DStack
   | DBox
@@ -19,6 +20,14 @@ export type DNode =
   | DImage
   | DInstance
   | DUnknown;
+
+export type LiteralValue<T> =
+  | { kind: "literal"; source: "raw"; value: T }
+  | { kind: "literal"; source: "token"; path: string };
+
+export type ExpressionValue = { kind: "expression"; type: "prop"; name: string };
+
+export type Value<T> = LiteralValue<T> | ExpressionValue;
 
 /** Sizing semantic shared with auto-layout systems. */
 export enum Sizing {
@@ -112,6 +121,7 @@ export enum FlowDirection {
 
 /** Discriminator for the Design AST node union. */
 export enum NodeKind {
+  DataScope = "dataScope",
   Flex = "flex",
   Stack = "stack",
   Box = "box",
@@ -121,6 +131,20 @@ export enum NodeKind {
   Image = "image",
   Instance = "instance",
   Unknown = "unknown",
+}
+
+export interface DataScopeBinding {
+  prop: string;
+  sourceId: string;
+  field: string;
+}
+
+/** Non-rendering data boundary. Emitters must not create a GUI layer for this
+ * node; it scopes prop expressions into its child and emits the child directly. */
+export interface DDataScope extends DNodeBase {
+  kind: NodeKind.DataScope;
+  bindings: DataScopeBinding[];
+  child: DNode;
 }
 
 /**
@@ -171,13 +195,13 @@ export interface Shadow {
   color: Color;
 }
 
-/** Shared base — every AST node has a stable id, optional opacity/rotation,
- *  and may be positioned in absolute (overlay) mode. */
+/** Shared base — every AST node may carry source trace metadata, optional
+ *  opacity/rotation, and may be positioned in absolute (overlay) mode. */
 export interface DNodeBase {
   /** Source-tree identifier (figma node id today). Diagnostic only. */
-  sourceId: string;
+  sourceId?: string;
   /** Source-tree node name (figma layer name). Diagnostic only. */
-  sourceName: string;
+  sourceName?: string;
   /** Layer-level opacity. Captured only when < 1. */
   opacity?: number;
   /** Rotation in degrees CCW. */
@@ -194,9 +218,9 @@ export interface DNodeBase {
   sizing?: { horizontal?: Sizing; vertical?: Sizing };
   /** Offset from the node's design box to Figma's exported render bounds. */
   renderBoundsOffset?: { x: number; y: number };
-  /** Owner-component prop key whose boolean value gates this node's render.
-   *  Emitter wraps the rendered element with a conditional. */
-  visibilityBinding?: string;
+  /** Node visibility. When expression-valued, an owner component prop gates
+   * this node without a parallel binding field. */
+  visible?: Value<boolean>;
 }
 
 /** Container with explicit auto-layout — children laid out left-to-right
@@ -217,9 +241,7 @@ export interface DFlex extends DNodeBase {
   align?: Align;
   justify?: Justify;
   wrap?: boolean;
-  background?: Color;
-  /** Owner-component synthetic prop key for this container's fill paint. */
-  fillBinding?: string;
+  background?: Value<Color>;
   border?: Border;
   shadow?: Shadow;
   cornerRadius?: Size | CornerRadii;
@@ -261,13 +283,7 @@ export interface DTextRun {
 /** Text node. */
 export interface DText extends DNodeBase {
   kind: NodeKind.Text;
-  content: string;
-  /** Owner-component prop key for the textual content. */
-  contentBinding?: string;
-  /** Owner-component synthetic prop key for the text fill paint. */
-  fillBinding?: string;
-  /** Owner-component synthetic prop key for the textStyle token. */
-  textStyleBinding?: string;
+  content: Value<string>;
   fontFamily?: string;
   /** CSS-style numeric weight (100..900). */
   fontWeight?: number;
@@ -275,12 +291,12 @@ export interface DText extends DNodeBase {
   lineHeight: Size;
   /** Gap between paragraphs (newline-separated runs). */
   paragraphSpacing?: Size;
-  color: Color;
+  color: Value<Color>;
   textDecoration?: TextDecoration;
   textAlign?: TextAlign;
   /** Reference to an upstream typography style (e.g. figma textStyleId).
    *  Emitter may map this to a typography component wrapper. */
-  textStyleRef?: string;
+  textStyleRef?: Value<string>;
   /** Required when text needs to wrap. */
   width: number;
   autoResize: TextAutoResize;
@@ -309,6 +325,10 @@ export interface DVector extends DNodeBase {
   kind: NodeKind.Vector;
   width: Size;
   height: Size;
+  /** The vector paint source. When prop-bound, the emitter must drive the
+   *  vector from that declared prop, not from target-specific style
+   *  conventions such as CSS `color`. */
+  fill?: Value<Color>;
   /** Inline SVG (raw `<svg>` content) or `data:image/svg+xml;base64,...` URL. */
   svg: string;
 }

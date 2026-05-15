@@ -1,141 +1,138 @@
 /**
- * Component registry — loads each component's index.ts from disk and
- * builds a key → metadata map the compiler uses to resolve INSTANCE nodes.
+ * Component registry for the big-bang Pixpec layout.
  *
- * Each registered component carries:
- *   - `componentName` (PascalCase, matches the directory)
- *   - `dir` (absolute path — emitter uses it for relative imports)
- *   - `propsFromFigma` (figma raw → typed props mapper, from defineComponent)
- *   - `defaults` (master prop values — for prop-emission elision)
- *   - `bindings` (per-variant per-node binding spec from cases.ts)
- *   - `masterSnapshot` (raw figma tree of each master variant — used by
- *     detach.ts to compare instance overrides against)
- *
- * The compiler runs entirely off disk — no figma calls. Init writes
- * everything the compiler needs into the component directory.
+ * A component is discovered by `<component>/pixpec.json`. Variant-local
+ * parser functions live under `variants/<variant>/parser.ts`, and master IR
+ * lives next to them as `ast.json`.
  */
 
-import { existsSync, readFileSync, readdirSync } from 'node:fs'
-import { join, resolve } from 'node:path'
-import { pathToFileURL } from 'node:url'
-import type { RawNode } from '../dumper/raw-node.ts'
+import { existsSync, readdirSync, readFileSync } from "node:fs";
+import { join, resolve } from "node:path";
+import { pathToFileURL } from "node:url";
+import type { DNode } from "./design-ast.ts";
+import type { Case, CaseRenderSpec, Component, Variant } from "../types.ts";
 
-export interface NodeBindingValue {
-  node?: {
-    content?: string
-    visible?: string
-    paint?: string
-    textStyle?: string
-  }
-  component?: Record<string, string>
+export interface PixpecManifestVariant {
+  key: string;
+  name: string;
+  path: string;
+  figmaId: string;
+  render?: CaseRenderSpec;
 }
 
-/** Per-master-node-id → which figma fields are bound to which prop. */
-export type NodeBindings = Record<string, NodeBindingValue>
+export interface PixpecManifest {
+  name: string;
+  figma?: {
+    componentSetKey?: string | string[];
+    componentSetId?: string;
+  };
+  variants: PixpecManifestVariant[];
+}
 
 export interface RegistryVariant {
-  key: string
-  bindings: NodeBindings
-  propsFromFigma?: (raw: unknown, children?: unknown) => Record<string, unknown>
+  key: string;
+  name: string;
+  path: string;
+  figmaId: string;
+  render?: CaseRenderSpec;
+  ast?: DNode;
+  propsFromFigma?: (...args: unknown[]) => Record<string, unknown>;
+  usecases?: Case<Record<string, unknown>>[];
 }
 
 export interface RegistryEntry {
-  componentName: string
-  dir: string
-  /** Defaults the master variants render at — used by emitters to elide
-   *  redundant prop emissions on instance call sites. */
-  defaults?: Record<string, unknown>
-  /** Per-variant figma raw → typed props parser. */
-  variants: Record<string, RegistryVariant>
-  /** Aggregated bindings across all variants (master node id → bindings). */
-  bindings: NodeBindings
-  /** Per-variant raw master snapshot, keyed by variant key (cross-file
-   *  durable id). detach.ts reads these to compare an instance's overrides
-   *  against the corresponding master descendant. */
-  masterSnapshot: Record<string, RawNode>
+  componentName: string;
+  dir: string;
+  manifest: PixpecManifest;
+  variants: Record<string, RegistryVariant>;
 }
 
-export type Registry = Map<string, RegistryEntry>
+export type Registry = Map<string, RegistryEntry>;
 
-/**
- * Scan `componentsDir` and load every `index.ts` that exports a
- * `defineComponent` result. The componentSetKey from the export's
- * `figma.componentSetKey` becomes the registry key.
- */
 export async function loadRegistry(componentsDir: string): Promise<Registry> {
-  const reg: Registry = new Map()
-  if (!existsSync(componentsDir)) return reg
-  const ents = readdirSync(componentsDir, { withFileTypes: true })
-  for (const ent of ents) {
-    if (!ent.isDirectory()) continue
-    if (ent.name.startsWith('BD_')) continue // breakdown scratch dirs
-    const dir = resolve(componentsDir, ent.name)
-    const indexPath = join(dir, 'index.ts')
-    if (!existsSync(indexPath)) continue
-    const entry = await loadOne(dir, indexPath)
-    if (entry) {
-      // The index.ts may declare one or more componentSetKey strings via
-      // figma.componentSetKey (string | string[]).
-      for (const key of entry.keys) reg.set(key, entry.value)
-    }
+  const reg: Registry = new Map();
+  if (!existsSync(componentsDir)) return reg;
+  for (const ent of readdirSync(componentsDir, { withFileTypes: true })) {
+    if (!ent.isDirectory()) continue;
+    if (ent.name.startsWith("BD_")) continue;
+    const dir = resolve(componentsDir, ent.name);
+    const manifestPath = join(dir, "pixpec.json");
+    if (!existsSync(manifestPath)) continue;
+    const entry = await loadOne(dir, manifestPath);
+    if (!entry) continue;
+    for (const key of manifestKeys(entry.manifest)) reg.set(key, entry);
   }
-  return reg
+  return reg;
 }
 
-interface LoadedEntry { keys: string[]; value: RegistryEntry }
-
-async function loadOne(dir: string, indexPath: string): Promise<LoadedEntry | null> {
-  let mod: Record<string, unknown>
-  try {
-    mod = (await import(`${pathToFileURL(indexPath).href}?t=${Date.now()}`)) as Record<string, unknown>
-  } catch {
-    return null
+export async function loadComponentFromPixpec(
+  componentDir: string,
+): Promise<Component<Record<string, unknown>>> {
+  const manifest = readManifest(join(componentDir, "pixpec.json"));
+  const variants: Array<Variant<Record<string, unknown>>> = [];
+  for (const variant of manifest.variants) {
+    const variantDir = resolve(componentDir, variant.path);
+    const parser = await importFresh(resolve(variantDir, "parser.ts"));
+    const usecases = readJsonIfExists<Case<Record<string, unknown>>[]>(
+      resolve(variantDir, "usecases.json"),
+      [],
+    );
+    variants.push({
+      key: variant.key,
+      propsSchema: parser.PropsSchema,
+      propsFromFigma:
+        typeof parser.propsFromFigma === "function"
+          ? (parser.propsFromFigma as (...args: unknown[]) => Record<string, unknown>)
+          : undefined,
+      usecases,
+      render: variant.render,
+    });
   }
-  const candidates = Object.values(mod).filter((v): v is Record<string, unknown> =>
-    !!v && typeof v === 'object' && 'name' in v && 'variants' in v,
-  )
-  if (candidates.length === 0) return null
-  const comp = candidates[0]
-  const componentName = String(comp.name)
-  const figma = (comp.figma as { componentSetKey?: string | string[] } | undefined)
-  const csk = figma?.componentSetKey
-  const keys = Array.isArray(csk) ? csk : (csk ? [csk] : [])
-  if (keys.length === 0) return null
-  const defaults = (mod.defaults as Record<string, unknown> | undefined)
-    ?? (comp.defaults as Record<string, unknown> | undefined)
-
-  const bindings = aggregateBindings(comp.variants)
-  const variants = collectVariants(comp.variants)
-  const masterSnapshot = loadMasterSnapshot(dir)
+  const keys = manifestKeys(manifest);
   return {
-    keys,
-    value: {
-      componentName,
-      dir,
-      defaults,
-      variants,
-      bindings,
-      masterSnapshot,
-    },
-  }
+    name: manifest.name,
+    variants,
+    ...(keys.length > 0
+      ? {
+          figma: {
+            componentSetKey: keys.length === 1 ? keys[0] : keys,
+            componentSetId: manifest.figma?.componentSetId,
+          },
+        }
+      : {}),
+  } as Component<Record<string, unknown>>;
 }
 
-function collectVariants(variants: unknown): Record<string, RegistryVariant> {
-  const out: Record<string, RegistryVariant> = {}
-  if (!Array.isArray(variants)) return out
-  for (const v of variants as Array<{
-    key?: string
-    bindings?: NodeBindings
-    propsFromFigma?: (raw: unknown, children?: unknown) => Record<string, unknown>
-  }>) {
-    if (!v.key) continue
-    out[v.key] = {
-      key: v.key,
-      bindings: v.bindings ?? {},
-      propsFromFigma: v.propsFromFigma,
-    }
+async function loadOne(dir: string, manifestPath: string): Promise<RegistryEntry | null> {
+  const manifest = readManifest(manifestPath);
+  const variants: Record<string, RegistryVariant> = {};
+  for (const item of manifest.variants) {
+    const variantDir = resolve(dir, item.path);
+    const parserPath = resolve(variantDir, "parser.ts");
+    const parser = existsSync(parserPath) ? await importFresh(parserPath) : {};
+    variants[item.key] = {
+      key: item.key,
+      name: item.name,
+      path: item.path,
+      figmaId: item.figmaId,
+      render: item.render,
+      ast: readJsonIfExists<DNode | undefined>(resolve(variantDir, "ast.json"), undefined),
+      propsFromFigma:
+        typeof parser.propsFromFigma === "function"
+          ? (parser.propsFromFigma as (...args: unknown[]) => Record<string, unknown>)
+          : undefined,
+      usecases: readJsonIfExists<Case<Record<string, unknown>>[]>(
+        resolve(variantDir, "usecases.json"),
+        [],
+      ),
+    };
   }
-  return out
+  return {
+    componentName: manifest.name,
+    dir,
+    manifest,
+    variants,
+  };
 }
 
 export function resolveRegistryVariant(
@@ -143,37 +140,29 @@ export function resolveRegistryVariant(
   key?: string,
   variantName?: string,
 ): RegistryVariant | undefined {
-  if (key && entry.variants[key]) return entry.variants[key]
-  if (!variantName) return undefined
-  const snapshotEntry = Object.entries(entry.masterSnapshot).find(
-    ([, root]) => root.name === variantName,
-  )
-  if (!snapshotEntry) return undefined
-  return entry.variants[snapshotEntry[0]]
+  if (key && entry.variants[key]) return entry.variants[key];
+  if (!variantName) return undefined;
+  return Object.values(entry.variants).find((v) => v.name === variantName);
 }
 
-function aggregateBindings(variants: unknown): NodeBindings {
-  const out: NodeBindings = {}
-  if (!Array.isArray(variants)) return out
-  for (const v of variants as Array<{ bindings?: NodeBindings }>) {
-    if (!v.bindings) continue
-    for (const [nodeId, b] of Object.entries(v.bindings)) {
-      const cur = out[nodeId] ?? {}
-      if (b.node) cur.node = { ...(cur.node ?? {}), ...b.node }
-      if (b.component)
-        cur.component = { ...(cur.component ?? {}), ...b.component }
-      out[nodeId] = cur
-    }
-  }
-  return out
+function readManifest(path: string): PixpecManifest {
+  return JSON.parse(readFileSync(path, "utf8")) as PixpecManifest;
 }
 
-function loadMasterSnapshot(dir: string): Record<string, RawNode> {
-  const path = join(dir, 'master-snapshot.json')
-  if (!existsSync(path)) return {}
-  try {
-    return JSON.parse(readFileSync(path, 'utf8')) as Record<string, RawNode>
-  } catch {
-    return {}
-  }
+function readJsonIfExists<T>(path: string, fallback: T): T {
+  if (!existsSync(path)) return fallback;
+  return JSON.parse(readFileSync(path, "utf8")) as T;
+}
+
+async function importFresh(path: string): Promise<Record<string, unknown>> {
+  return (await import(`${pathToFileURL(path).href}?t=${Date.now()}`)) as Record<
+    string,
+    unknown
+  >;
+}
+
+function manifestKeys(manifest: PixpecManifest): string[] {
+  const key = manifest.figma?.componentSetKey;
+  if (!key) return [];
+  return Array.isArray(key) ? key : [key];
 }

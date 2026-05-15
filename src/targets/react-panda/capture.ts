@@ -2,7 +2,7 @@
  * React/Panda destination capture — materializes a Pixpec-owned Vite harness,
  * renders component cases, and screenshots each case to PNG.
  */
-import { mkdir, rm } from 'node:fs/promises'
+import { mkdir, readdir, readFile, rm } from 'node:fs/promises'
 import { spawn } from 'node:child_process'
 import { createRequire } from 'node:module'
 import { dirname, resolve } from 'node:path'
@@ -31,6 +31,7 @@ export async function captureReactPandaDestination(request: CaptureRequest): Pro
     await refreshReactPandaStyledSystem({
       runtimeDir: plan.runtimeDir,
       rootDir: plan.rootDir,
+      componentsDir: plan.componentsDir,
     })
     await writeReactPandaHarness({
       runtimeDir: plan.runtimeDir,
@@ -137,6 +138,7 @@ export async function prepareReactPandaGeneratedCaptureRuntime(opts: {
   await refreshReactPandaStyledSystem({
     runtimeDir: opts.runtimeDir,
     rootDir: opts.rootDir,
+    componentsDir: opts.rootDir,
   })
   await writeReactPandaGeneratedHarness({
     runtimeDir: opts.runtimeDir,
@@ -315,8 +317,9 @@ async function startReactPandaHarnessServer(opts: {
 async function refreshReactPandaStyledSystem(opts: {
   runtimeDir: string
   rootDir: string
+  componentsDir: string
 }): Promise<void> {
-  const { readFile, writeFile } = await import('node:fs/promises')
+  const { writeFile } = await import('node:fs/promises')
   const configPath = resolve(opts.rootDir, 'styled-system/debug/config.json')
   let config: Record<string, unknown>
   try {
@@ -328,10 +331,11 @@ async function refreshReactPandaStyledSystem(opts: {
         `  Underlying: ${(error as Error).message}`,
     )
   }
+  const staticCss = mergeStaticCss(config.staticCss, await readStaticTokenCss(opts.componentsDir))
 
   await mkdir(opts.runtimeDir, { recursive: true })
   const runtimeConfigPath = resolve(opts.runtimeDir, 'panda.config.mjs')
-  await writeFile(runtimeConfigPath, reactPandaPandaConfigSource(config), 'utf8')
+  await writeFile(runtimeConfigPath, reactPandaPandaConfigSource(config, staticCss), 'utf8')
 
   await runPandaCli(['codegen', '--config', runtimeConfigPath, '--cwd', opts.rootDir, '--silent'], opts.rootDir)
   await runPandaCli(
@@ -350,8 +354,62 @@ async function refreshReactPandaStyledSystem(opts: {
   )
 }
 
-function reactPandaPandaConfigSource(baseConfig: Record<string, unknown>): string {
+async function readStaticTokenCss(componentsDir: string): Promise<Record<string, string[]>> {
+  const out: Record<string, Set<string>> = {}
+  async function visit(dir: string): Promise<void> {
+    let entries: import('node:fs').Dirent[]
+    try {
+      entries = await readdir(dir, { withFileTypes: true })
+    } catch {
+      return
+    }
+    for (const entry of entries) {
+      const path = resolve(dir, entry.name)
+      if (entry.isDirectory()) {
+        await visit(path)
+        continue
+      }
+      if (!entry.isFile() || entry.name !== 'static-tokens.json') continue
+      const raw = JSON.parse(await readFile(path, 'utf8')) as Record<string, unknown>
+      for (const [property, values] of Object.entries(raw)) {
+        if (!Array.isArray(values)) continue
+        const bucket = (out[property] ??= new Set<string>())
+        for (const value of values) {
+          if (typeof value === 'string') bucket.add(value)
+        }
+      }
+    }
+  }
+  await visit(componentsDir)
+  return Object.fromEntries(Object.entries(out).map(([property, values]) => [property, [...values].sort()]))
+}
+
+function mergeStaticCss(base: unknown, extraProperties: Record<string, string[]>): unknown {
+  const extra = Object.fromEntries(Object.entries(extraProperties).filter(([, values]) => values.length > 0))
+  if (Object.keys(extra).length === 0) return base
+  const baseObject = isRecord(base) ? base : {}
+  const cssItems = Array.isArray(baseObject.css) ? baseObject.css : []
+  const first = cssItems[0]
+  const firstProperties = isRecord(first) && isRecord(first.properties) ? first.properties : {}
+  const mergedProperties: Record<string, string[]> = {}
+  for (const [property, values] of Object.entries(firstProperties)) {
+    if (!Array.isArray(values)) continue
+    mergedProperties[property] = values.filter((value): value is string => typeof value === 'string')
+  }
+  for (const [property, values] of Object.entries(extra)) {
+    mergedProperties[property] = [...new Set([...(mergedProperties[property] ?? []), ...values])].sort()
+  }
+  const mergedFirst = { ...(isRecord(first) ? first : {}), properties: mergedProperties }
+  return { ...baseObject, css: [mergedFirst, ...cssItems.slice(1)] }
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return !!value && typeof value === 'object' && !Array.isArray(value)
+}
+
+function reactPandaPandaConfigSource(baseConfig: Record<string, unknown>, staticCss: unknown): string {
   return `const base = ${JSON.stringify(baseConfig)}
+const staticCss = ${JSON.stringify(staticCss)}
 
 export default {
   preflight: base.preflight ?? true,
@@ -359,7 +417,7 @@ export default {
   exclude: [],
   jsxFramework: 'react',
   outdir: 'styled-system',
-  staticCss: base.staticCss,
+  staticCss,
   conditions: base.conditions,
   theme: {
     extend: {
@@ -507,7 +565,22 @@ import { createElement, Fragment, type ComponentType } from 'react'
 type RegistryEntry = {
   name: string
   variants: Array<{
+    path: string
     figmaId: string
+    render?: {
+      box?: {
+        width?: number
+        height?: number
+        padding?: number
+        paddingTop?: number
+        paddingRight?: number
+        paddingBottom?: number
+        paddingLeft?: number
+        bg?: string
+        color?: string
+        overflow?: 'hidden' | 'visible'
+      }
+    }
     usecases: Array<{
       figmaId: string
       props: Record<string, unknown>
@@ -533,8 +606,6 @@ type RegistryEntry = {
 const ROOT_DIR = ${JSON.stringify(`/@fs/${opts.rootDir}`)}
 const COMPONENTS_DIR = ${JSON.stringify(`/@fs/${opts.componentsDir}`)}
 const safeId = (figmaId: string) => figmaId.replace(/[^A-Za-z0-9]/g, '_')
-const isEntry = (v: unknown): v is RegistryEntry =>
-  !!v && typeof v === 'object' && 'name' in v && 'variants' in v
 
 async function tryImport(path: string): Promise<any> {
   try {
@@ -646,51 +717,43 @@ async function render() {
 
     const ts = Date.now()
     const componentDir = \`\${COMPONENTS_DIR}/\${compName}\`
-    const registryMod = await import(/* @vite-ignore */ \`\${componentDir}/index.ts?t=\${ts}\`) as Record<string, unknown>
-    const casesMod = await import(/* @vite-ignore */ \`\${componentDir}/cases.ts?t=\${ts}\`) as Record<string, unknown>
-    const comp = (registryMod.default ||
-      registryMod[compName] ||
-      Object.values(registryMod).find(isEntry)) as RegistryEntry
-    if (!comp || !isEntry(comp)) {
-      throw new Error(\`pixpec react-panda harness: valid component export not found for \${compName}\`)
+    const manifestMod = await import(/* @vite-ignore */ \`\${componentDir}/pixpec.json?t=\${ts}\`) as Record<string, unknown>
+    const manifest = (manifestMod.default ?? manifestMod) as {
+      name: string
+      variants: Array<{ path: string; figmaId: string; render?: RegistryEntry['variants'][number]['render'] }>
     }
-    if (Array.isArray(casesMod.variants)) comp.variants = casesMod.variants as RegistryEntry['variants']
-
-    let defaults: Record<string, unknown> = {}
-    if (sourceMode === 'generated') {
-      const defaultsMod = await tryImport(\`\${componentDir}/defaults.ts?t=\${ts}\`)
-      const d = defaultsMod?.defaults ?? defaultsMod?.default
-      if (d && typeof d === 'object') defaults = d
+    const comp: RegistryEntry = {
+      name: manifest.name,
+      variants: await Promise.all(manifest.variants.map(async (variant) => {
+        const usecasesMod = await import(/* @vite-ignore */ \`\${componentDir}/\${variant.path}/usecases.json?t=\${ts}\`) as Record<string, unknown>
+        return {
+          path: variant.path,
+          figmaId: variant.figmaId,
+          render: variant.render,
+          usecases: (usecasesMod.default ?? usecasesMod) as RegistryEntry['variants'][number]['usecases'],
+        }
+      })),
     }
 
     let Impl: ComponentType<unknown> | null = null
     if (sourceMode === 'impl') {
-      const implMod = await import(/* @vite-ignore */ \`\${componentDir}/impl.tsx?t=\${ts}\`) as Record<string, unknown>
+      const implMod = await import(/* @vite-ignore */ \`\${componentDir}/impl/react-panda/index.tsx?t=\${ts}\`) as Record<string, unknown>
       Impl = (implMod.impl ?? implMod.default) as ComponentType<unknown>
       if (typeof Impl !== 'function') {
-        throw new Error(\`pixpec react-panda harness: \${componentDir}/impl.tsx must export impl or default\`)
-      }
-    }
-
-    const variantMainByCaseId = new Map<string, string>()
-    if (sourceMode === 'generated') {
-      for (const v of comp.variants) {
-        const main = (v.usecases ?? []).find((u) => u.isMainCase)
-        if (!main) throw new Error(\`pixpec react-panda harness: variant \${v.figmaId} has no isMainCase usecase\`)
-        for (const u of v.usecases ?? []) variantMainByCaseId.set(u.figmaId, main.figmaId)
+        throw new Error(\`pixpec react-panda harness: \${componentDir}/impl/react-panda/index.tsx must export impl or default\`)
       }
     }
 
     const resolveComponentFor = async (figmaId: string): Promise<ComponentType<unknown>> => {
       if (Impl) return Impl
-      const mainId = variantMainByCaseId.get(figmaId)
-      if (!mainId) throw new Error(\`pixpec react-panda harness: no variant main case for \${figmaId}\`)
+      const variant = comp.variants.find((v) => (v.usecases ?? []).some((u) => u.figmaId === figmaId))
+      if (!variant) throw new Error(\`pixpec react-panda harness: no variant for \${figmaId}\`)
       const genMod = await import(
-        /* @vite-ignore */ \`\${componentDir}/generated/\${safeId(mainId)}.tsx?t=\${ts}\`
+        /* @vite-ignore */ \`\${componentDir}/\${variant.path}/react-panda/index.tsx?t=\${ts}\`
       ) as Record<string, unknown>
       const G = (genMod.Generated ?? genMod.impl ?? genMod.default) as ComponentType<unknown> | undefined
       if (typeof G !== 'function') {
-        throw new Error(\`pixpec react-panda harness: generated file for \${mainId} has no component export\`)
+        throw new Error(\`pixpec react-panda harness: generated file for \${variant.path} has no component export\`)
       }
       return G
     }
@@ -742,7 +805,7 @@ async function render() {
         null,
         ...usecases.map((c, i) => {
           const C = comps[i]
-          const props = sourceMode === 'generated' ? { ...defaults, ...c.props } : c.props
+          const props = c.props
           const child = createElement(C, props)
           const renderSpec = c.render ?? variantRenderByCaseId.get(c.figmaId)
           const rendered = renderSpec?.box

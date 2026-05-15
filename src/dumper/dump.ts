@@ -150,6 +150,20 @@ function normalizeComponentProperties(componentProperties) {
   }
   return clean(cp);
 }
+function normalizeComponentPropertyDefinitions(definitions) {
+  if (!definitions) return undefined;
+  const out = {};
+  for (const k of Object.keys(definitions)) {
+    const v = definitions[k];
+    out[k] = {
+      type: v.type,
+      defaultValue: v.defaultValue,
+      variantOptions: v.variantOptions,
+      preferredValues: v.preferredValues,
+    };
+  }
+  return clean(out);
+}
 async function readComponentProperties(out, node, mainComponent) {
   try {
     return normalizeComponentProperties(node.componentProperties);
@@ -218,6 +232,18 @@ async function dumpNode(node) {
   if (node.constraints) out.constraints = { horizontal: node.constraints.horizontal, vertical: node.constraints.vertical };
   if (node.componentPropertyReferences) out.componentPropertyReferences = clean(node.componentPropertyReferences);
   if (node.boundVariables && Object.keys(node.boundVariables).length) out.boundVariables = clean(node.boundVariables);
+  if ((node.type === 'COMPONENT' || node.type === 'COMPONENT_SET') && typeof node.key === 'string') out.key = node.key;
+  if ((node.type === 'COMPONENT' || node.type === 'COMPONENT_SET') && typeof node.remote === 'boolean') out.remote = node.remote;
+  const canReadComponentPropertyDefinitions =
+    node.type === 'COMPONENT_SET' ||
+    (node.type === 'COMPONENT' && (!node.parent || node.parent.type !== 'COMPONENT_SET'));
+  if (canReadComponentPropertyDefinitions) {
+    const definitions = safe(() => node.componentPropertyDefinitions, undefined);
+    if (definitions) out.componentPropertyDefinitions = normalizeComponentPropertyDefinitions(definitions);
+  }
+  if (node.type === 'COMPONENT' && node.variantProperties) {
+    out.variantProperties = clean(node.variantProperties);
+  }
 
   if (FRAMELIKE.has(node.type)) {
     out.layoutMode = node.layoutMode;

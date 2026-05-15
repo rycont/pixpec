@@ -5,6 +5,7 @@ import type { Component } from '../types.ts'
 import { captureFigmaSource } from './figma.ts'
 import { getTarget, resolveConfiguredTargets } from '../targets/index.ts'
 import { loadConfig } from '../init.ts'
+import { loadComponentFromPixpec } from '../compiler/registry.ts'
 
 export type CaptureSide = 'src' | 'dst'
 export type SourceCaptureBackend = 'figma'
@@ -57,11 +58,7 @@ export async function loadCaptureComponent(componentName: string): Promise<Loade
   if (!existsSync(componentDir)) {
     throw new Error(`pixpec capture: no component dir ${componentDir}`)
   }
-  const componentMod = (await import(resolve(componentDir, 'index.ts'))) as Record<string, unknown>
-  const component = componentMod[componentName] as Component<unknown> | undefined
-  if (!component || !Array.isArray(component.variants)) {
-    throw new Error(`Component '${componentName}' not exported from ${componentDir}/index.ts`)
-  }
+  const component = await loadComponentFromPixpec(componentDir) as Component<unknown>
   return { root, componentDir, component, cfg }
 }
 

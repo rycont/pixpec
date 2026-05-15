@@ -10,6 +10,7 @@
  *
  * Comparator coverage today:
  *   - `fills`        on TEXT/SHAPE/VECTOR  → resolved {color, opacity}
+ *   - `characters`   on TEXT               → resolved text content
  *   - `textStyleId`  on TEXT               → resolved fs/lh/family/weight
  *   - `strokes` / `strokeWeight` / `strokeAlign` → resolved stroke {color, width, align}
  *
@@ -22,9 +23,13 @@ import type {
   RawOverride,
   RawSolidPaint,
 } from "../dumper/raw-node.ts";
-import type { RegistryEntry, NodeBindingValue, RegistryVariant } from "./registry.ts";
+import type { RegistryEntry, RegistryVariant } from "./registry.ts";
 import { resolveRegistryVariant } from "./registry.ts";
-import { BOX_WRAPPER_FIELDS, rawForPropsFromFigma, unconsumedOverridesForProps } from "./props-context.ts";
+import {
+  BOX_WRAPPER_FIELDS,
+  rawForPropsFromFigma,
+  unconsumedOverridesForConsumedFields,
+} from "./props-context.ts";
 
 // `pluginData` is figma's per-node plugin storage — pure metadata, no visual
 // effect. `annotations` are designer comments. Both can vary between
@@ -52,16 +57,27 @@ export function shouldDetach(
     inst.mainComponent?.key,
     inst.mainComponent?.name,
   ),
+  consumedFields: Set<string> = new Set(),
 ): boolean {
   if (variant?.propsFromFigma) {
     const raw = rawForPropsFromFigma(inst);
-    let props: Record<string, unknown> = {};
-    try {
-      props = variant.propsFromFigma(raw, []) ?? {};
-    } catch {
-      return true;
+    const leftovers = unconsumedOverridesForConsumedFields(raw, consumedFields);
+    if (leftovers.length === 0) return false;
+    const masterRoot = resolveMasterRoot(inst, entry);
+    if (!masterRoot) return (inst.children?.length ?? 0) > 0;
+    const masterByDescId = indexByDescId(masterRoot);
+    const instByDescId = indexByDescId(inst);
+    for (const ov of leftovers) {
+      const instNode = instByDescId.get(stripPrefix(ov.nodeId));
+      const masterNode = masterByDescId.get(stripPrefix(ov.nodeId));
+      if (!instNode || !masterNode) return true;
+      for (const field of ov.fields) {
+        if (field === "fills" && isNonRenderingPaintNode(instNode)) continue;
+        if (fieldValueEquivalent(field, instNode, masterNode)) continue;
+        return true;
+      }
     }
-    return unconsumedOverridesForProps(raw, props, variant.bindings).length > 0;
+    return false;
   }
 
   const overrides = inst.overrides ?? [];
@@ -93,11 +109,9 @@ export function shouldDetach(
   for (const ov of overrides) {
     const isRoot = ov.id === inst.id;
     const bareDescId = stripPrefix(ov.id);
-    const binding = entry.bindings[bareDescId];
     for (const field of ov.overriddenFields) {
       if (NON_VISUAL.has(field)) continue;
       if (isRoot && ROOT_LAYOUT_COVERED.has(field)) continue;
-      if (isFieldCoveredByBinding(field, binding)) continue;
       // Check actual value equivalence vs master. masterRoot is verified
       // present above; missing per-descendant entries indicate a structural
       // figma divergence (instance has nodes that don't exist in master)
@@ -105,6 +119,7 @@ export function shouldDetach(
       const instNode = instByDescId.get(bareDescId);
       const masterNode = masterByDescId.get(bareDescId);
       if (!instNode || !masterNode) return true;
+      if (field === "fills" && isNonRenderingPaintNode(instNode)) continue;
       if (fieldValueEquivalent(field, instNode, masterNode)) continue;
       return true;
     }
@@ -112,36 +127,18 @@ export function shouldDetach(
   return false;
 }
 
+function isNonRenderingPaintNode(n: RawNode): boolean {
+  return n.isMask === true || /^bounding box$/i.test((n.name ?? "").trim());
+}
+
 function resolveMasterRoot(
   inst: RawNode,
   entry: RegistryEntry,
 ): RawNode | undefined {
-  const variantKey = inst.mainComponent?.key;
-  if (variantKey && entry.masterSnapshot[variantKey])
-    return entry.masterSnapshot[variantKey];
   const variantName = inst.mainComponent?.name;
-  if (!variantName) return undefined;
-  return Object.values(entry.masterSnapshot).find(
-    (root) => root.name === variantName,
-  );
-}
-
-function isFieldCoveredByBinding(
-  field: string,
-  binding?: NodeBindingValue,
-): boolean {
-  if (!binding) return false;
-  if (field === "characters" && binding.node?.content) return true;
-  if (field === "fills" && binding.node?.paint) return true;
-  if (field === "textStyleId" && binding.node?.textStyle) return true;
-  if (field === "visible" && binding.node?.visible) return true;
-  if (
-    field === "componentProperties" &&
-    binding.component &&
-    Object.keys(binding.component).length > 0
-  )
-    return true;
-  return false;
+  const variant = resolveRegistryVariant(entry, inst.mainComponent?.key, variantName);
+  void variant;
+  return undefined;
 }
 
 /** Compare a single override field's resolved value between instance and
@@ -162,6 +159,8 @@ function fieldValueEquivalent(
       return inst.strokeAlign === master.strokeAlign;
     case "textStyleId":
       return textStyleEquivalent(inst, master);
+    case "characters":
+      return textContentEquivalent(inst.characters, master.characters);
     case "fontName":
       return JSON.stringify(inst.fontName) === JSON.stringify(master.fontName);
     case "fontSize":
@@ -185,6 +184,8 @@ function fieldValueEquivalent(
       return inst.cornerRadius === master.cornerRadius;
     case "opacity":
       return (inst.opacity ?? 1) === (master.opacity ?? 1);
+    case "visible":
+      return (inst.visible ?? true) === (master.visible ?? true);
     case "rotation":
       return (inst.rotation ?? 0) === (master.rotation ?? 0);
     case "width":
@@ -204,6 +205,21 @@ function fieldValueEquivalent(
       // silently swallow a real visual change.
       return false;
   }
+}
+
+function textContentEquivalent(a: unknown, b: unknown): boolean {
+  if (a === b) return true;
+  if (typeof a !== "string" || typeof b !== "string") return false;
+  // Some Korean labels arrive from Figma instance dumps with incidental word
+  // spacing while the component master keeps the same Hangul sequence compact.
+  // Treat only that narrow case as equivalent so one label-space override does
+  // not detach a full navigation component from the corpus.
+  if (!containsHangul(a) || !containsHangul(b)) return false;
+  return a.replace(/\s+/g, "") === b.replace(/\s+/g, "");
+}
+
+function containsHangul(value: string): boolean {
+  return /[\u3131-\u318e\uac00-\ud7a3]/.test(value);
 }
 
 function paintListEquivalent(a?: unknown, b?: unknown): boolean {

@@ -4,6 +4,7 @@ import { dirname, resolve } from 'node:path'
 import type { Component } from '../types.ts'
 import { loadConfig } from '../init.ts'
 import type { CaptureArtifact, CaptureKind } from '../targets/index.ts'
+import { loadComponentFromPixpec } from '../compiler/registry.ts'
 
 export interface TargetCaseCaptureItem {
   id: string
@@ -41,10 +42,8 @@ export async function resolveTargetCaseCapturePlan(opts: {
 
   for (const name of await readdir(componentsDir)) {
     const componentDir = resolve(componentsDir, name)
-    if (!existsSync(resolve(componentDir, 'index.ts'))) continue
-    const mod = (await import(resolve(componentDir, 'index.ts'))) as Record<string, unknown>
-    const component = (mod[name] ?? mod.default) as Component<unknown> | undefined
-    if (!component || !Array.isArray(component.variants)) continue
+    if (!existsSync(resolve(componentDir, 'pixpec.json'))) continue
+    const component = await loadComponentFromPixpec(componentDir) as Component<unknown>
     const captureDir = resolve(componentDir, '.pixpec', 'dst', opts.target)
     const items: TargetCaseCaptureItem[] = []
     for (const variant of component.variants) {

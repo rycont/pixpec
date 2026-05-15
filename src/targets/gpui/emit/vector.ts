@@ -6,9 +6,10 @@ import { addNodeLayout } from './layout.ts'
 import { sizeExpr } from './values.ts'
 
 export function emitVector(n: DVector, ctx: GpuiEmitContext, indent: number): string {
+  const sourceId = n.sourceId ?? 'vector'
   const path = n.svg.startsWith('data:')
-    ? dataUrlAsset(ctx, n.sourceId, n.svg)
-    : putTextAsset(ctx, n.sourceId, 'svg', n.svg)
+    ? dataUrlAsset(ctx, sourceId, n.svg)
+    : putTextAsset(ctx, sourceId, 'svg', n.svg)
   if (!path) return div(indent).toString()
 
   const chain = image(indent, path)

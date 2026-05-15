@@ -331,8 +331,34 @@ export class Renderer {
               `screenshotMany: selector not found: ${selectors[i]}`,
             );
         }
+        const sharp = (await import("sharp")).default;
+        const captureOne = async (i: number) => {
+          const b = bounds[i]!;
+          const { data } = (await cdp.send("Page.captureScreenshot", {
+            format: "png",
+            clip: {
+              x: Math.max(0, b.x),
+              y: Math.max(0, b.y),
+              width: Math.max(1, b.w),
+              height: Math.max(1, b.h),
+              scale: dpr,
+            },
+            captureBeyondViewport: true,
+            fromSurface: true,
+            omitBackground: true,
+          } as never)) as { data: string };
+          await sharp(Buffer.from(data, "base64"), {
+            limitInputPixels: false,
+          })
+            .png()
+            .toFile(items[i].outPath);
+        };
+        const captureIndividual = async () => {
+          for (let i = 0; i < items.length; i++) {
+            await captureOne(i);
+          }
+        };
         if (bounds.some((b) => b?.overflow)) {
-          const sharp = (await import("sharp")).default;
           for (let i = 0; i < items.length; i++) {
             const b = bounds[i]!;
             const caseId = selectors[i]
@@ -358,18 +384,7 @@ export class Renderer {
               throw new Error(
                 `screenshotMany: expected one visible case for ${caseId}, got ${visibleCount}`,
               );
-            const { data } = (await cdp.send("Page.captureScreenshot", {
-              format: "png",
-              clip: { x: b.x, y: b.y, width: b.w, height: b.h, scale: dpr },
-              captureBeyondViewport: true,
-              fromSurface: true,
-              omitBackground: true,
-            } as never)) as { data: string };
-            await sharp(Buffer.from(data, "base64"), {
-              limitInputPixels: false,
-            })
-              .png()
-              .toFile(items[i].outPath);
+            await captureOne(i);
           }
           await page.evaluate(() => {
             document
@@ -409,12 +424,22 @@ export class Renderer {
           fromSurface: true,
           omitBackground: true,
         };
-        const { data } = (await cdp.send(
-          "Page.captureScreenshot",
-          captureParams as never,
-        )) as { data: string };
+        let data: string;
+        try {
+          const result = (await cdp.send(
+            "Page.captureScreenshot",
+            captureParams as never,
+          )) as { data: string };
+          data = result.data;
+        } catch (err) {
+          const msg = String(err);
+          if (msg.includes("Unable to capture screenshot")) {
+            await captureIndividual();
+            return;
+          }
+          throw err;
+        }
         const fullBuf = Buffer.from(data, "base64");
-        const sharp = (await import("sharp")).default;
         const meta = await sharp(fullBuf, {
           limitInputPixels: false,
         }).metadata();

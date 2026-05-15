@@ -1,7 +1,7 @@
 /**
  * pixpec types — the contract between framework and DS packages.
  *
- * A Component is metadata only: `{ name, variants, defaults }`. Nothing more.
+ * A Component is metadata only: `{ name, variants }`. Nothing more.
  *
  * The React implementation (`impl.tsx`) lives on disk at
  * `<componentsDir>/<name>/impl.tsx` — by convention. The Vite harness loads
@@ -62,48 +62,6 @@ export interface CaseRenderSpec {
   box?: RenderBoxSpec
 }
 
-/** Per-figma-node binding map — generate consumes this to annotate IR
- * nodes during walk so codegen emits `props.<ownerKey>` JSX expressions
- * in place of master-baked literals. Keyed by figma node id (within the
- * variant's master subtree); each entry classifies the bindings by kind
- * so future detachable-attribute additions slot in cleanly. */
-export type PropKey<P> = Extract<keyof P, string>
-
-export interface NodeBindingSurface {
-  node?: object
-  component?: object
-}
-
-type PropertyBinding<Surface extends object, P> = Partial<
-  Record<Extract<keyof Surface, string>, PropKey<P>>
->
-
-/** Per-node binding map. `node` targets the IR node's own bindable
- * properties; `component` targets the public props of a nested component
- * instance. Concrete generated type files may pass a node-id → surface map
- * to `Variant<P, Nodes>` for stricter key checking. */
-export type NodeBinding<
-  P,
-  Surface extends NodeBindingSurface = NodeBindingSurface,
-> = {
-  node?: Surface["node"] extends object
-    ? PropertyBinding<Surface["node"], P>
-    : Record<string, PropKey<P>>
-  component?: Surface["component"] extends object
-    ? PropertyBinding<Surface["component"], P>
-    : Record<string, PropKey<P>>
-}
-
-export type NodeBindings<
-  P,
-  Nodes extends Record<string, NodeBindingSurface> = Record<
-    string,
-    NodeBindingSurface
-  >,
-> = string extends keyof Nodes
-  ? Record<string, NodeBinding<P>>
-  : { [NodeId in keyof Nodes]?: NodeBinding<P, Nodes[NodeId]> }
-
 /** A master variant of a registered component — pure addressable
  *  bucket. Variant carries no render data; the master is one of the
  *  `usecases` (the entry with `isMainCase: true`). breakdown / codegen /
@@ -115,28 +73,15 @@ export type NodeBindings<
  *  globally unique and resolvable in any file via
  *  `figma.importComponentByKeyAsync(key)`, so downstream tooling never
  *  needs an extra (fileKey + nodeId) lookup to find the master.
- *
- *  `bindings` is the per-node owner-prop map init computed during scan
- *  — generate threads it through walker → codegen so the emitted
- *  per-variant tree is parametric without any post-processing pass. */
-export interface Variant<
-  P,
-  Nodes extends Record<string, NodeBindingSurface> = Record<
-    string,
-    NodeBindingSurface
-  >,
-> {
+ */
+export interface Variant<P> {
   key: string
-  bindings?: NodeBindings<P, Nodes>
   /** Variant-local runtime schema (usually a Zod object). Kept opaque so
    * pixpec/spec stays schema-library-light at the type boundary. */
   propsSchema?: unknown
   /** Variant-local parser. The same semantic prop can map to different
    * Figma node ids per variant, so props hydration lives next to bindings. */
-  propsFromFigma?: (
-    raw: FigmaInstanceRaw,
-    children?: import('./compiler/design-ast.ts').DNode[],
-  ) => P
+  propsFromFigma?: (...args: unknown[]) => P
   usecases: Case<P>[]
   /** Platform-neutral render/capture context inherited by this variant's usecases. */
   render?: CaseRenderSpec
@@ -182,20 +127,8 @@ export interface ComponentWithFigma<P> extends ComponentBase<P> {
    * them to <Component {...propsFromFigma(raw)} /> JSX.
    */
   figma: FigmaBinding<P>
-  /**
-   * Effective default props for this component. Single source of truth for
-   * BOTH:
-   *   1. Runtime: the component's impl spreads `defaults` over incoming props
-   *      so omitted keys fall back here.
-   *   2. Codegen: the generator elides any prop on an instance whose value
-   *      equals `defaults[key]` — keeping the generated JSX terse.
-   *
-   * Recommended source: `figmaDefaults(componentSetKey)` from the design-
-   * system's tokens pipeline, plus any JS-only props (e.g. `height: 24`)
-   * and exposed-instance props (e.g. `Icon: { Type: 'default' }`) that the
-   * impl needs to render correctly when the prop is omitted.
-   */
-  defaults: Partial<P>
+  /** Legacy component-level defaults. New pixpec init does not emit this. */
+  defaults?: Partial<P>
 }
 
 export interface ComponentWithoutFigma<P> extends ComponentBase<P> {
