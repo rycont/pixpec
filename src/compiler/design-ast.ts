@@ -218,8 +218,6 @@ export interface DNodeBase {
   sizing?: { horizontal?: Sizing; vertical?: Sizing };
   /** Offset from the node's design box to the exported render bounds. */
   renderBoundsOffset?: { x: number; y: number };
-  /** Exported render bounds relative to the node's design box. */
-  renderBounds?: { x: number; y: number; width: number; height: number };
   /** Node visibility. When expression-valued, an owner component prop gates
    * this node without a parallel binding field. */
   visible?: Value<boolean>;

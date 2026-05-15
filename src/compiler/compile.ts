@@ -541,7 +541,6 @@ function buildBase(
     };
   }
   out.renderBoundsOffset = renderBoundsOffsetFromRaw(n);
-  out.renderBounds = renderBoundsFromRaw(n);
   return out;
 }
 
@@ -716,23 +715,6 @@ function renderBoundsOffsetFromRaw(n: RawNode): { x: number; y: number } | undef
   const y = rb.y - bb.y;
   if (Math.abs(x) < 0.001 && Math.abs(y) < 0.001) return undefined;
   return { x, y };
-}
-
-function renderBoundsFromRaw(n: RawNode): { x: number; y: number; width: number; height: number } | undefined {
-  const bb = n.absoluteBoundingBox;
-  const rb = n.absoluteRenderBounds;
-  if (!bb || !rb) return undefined;
-  const x = rb.x - bb.x;
-  const y = rb.y - bb.y;
-  const width = rb.width;
-  const height = rb.height;
-  if (
-    Math.abs(x) < 0.001 &&
-    Math.abs(y) < 0.001 &&
-    Math.abs(width - (bb.width ?? width)) < 0.001 &&
-    Math.abs(height - (bb.height ?? height)) < 0.001
-  ) return undefined;
-  return { x, y, width, height };
 }
 
 function compileText(

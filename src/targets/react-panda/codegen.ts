@@ -854,16 +854,6 @@ function emitContainer(
     ctx.usedJsxPatterns.add(tag)
     const compact = compactPaddingStyles(styles)
     const attrs = attrsFromObject(compact)
-    if (parent.isRoot && n.renderBounds) {
-        attrs.push(
-            ...attrsFromObject({
-                'data-pixpec-render-x': n.renderBounds.x,
-                'data-pixpec-render-y': n.renderBounds.y,
-                'data-pixpec-render-width': n.renderBounds.width,
-                'data-pixpec-render-height': n.renderBounds.height,
-            }),
-        )
-    }
     const squircleRadius =
         n.cornerSmoothing &&
         n.cornerSmoothing > 0 &&
