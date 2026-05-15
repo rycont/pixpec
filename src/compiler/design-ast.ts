@@ -133,17 +133,10 @@ export enum NodeKind {
   Unknown = "unknown",
 }
 
-export interface DataScopeBinding {
-  prop: string;
-  sourceId: string;
-  field: string;
-}
-
 /** Non-rendering data boundary. Emitters must not create a GUI layer for this
  * node; it scopes prop expressions into its child and emits the child directly. */
 export interface DDataScope extends DNodeBase {
   kind: NodeKind.DataScope;
-  bindings: DataScopeBinding[];
   child: DNode;
 }
 
@@ -228,8 +221,8 @@ export interface DNodeBase {
 export interface DFlex extends DNodeBase {
   kind: NodeKind.Flex;
   direction: FlowDirection.Row;
-  width?: Size;
-  height?: Size;
+  width?: Size | ExpressionValue;
+  height?: Size | ExpressionValue;
   minWidth?: Size;
   maxWidth?: Size;
   minHeight?: Size;
@@ -298,7 +291,7 @@ export interface DText extends DNodeBase {
    *  Emitter may map this to a typography component wrapper. */
   textStyleRef?: Value<string>;
   /** Required when text needs to wrap. */
-  width: number;
+  width: number | ExpressionValue;
   autoResize: TextAutoResize;
   runs?: DTextRun[];
 }
@@ -363,8 +356,8 @@ export interface DInstance extends DNodeBase {
     paddingLeft?: Size;
     gap?: Size;
   };
-  width?: Size;
-  height?: Size;
+  width?: Size | ExpressionValue;
+  height?: Size | ExpressionValue;
   /** Per-instance-property bindings — { figmaPropKey: ownerPropKey }. The
    *  emitter passes these through as JSX attributes (e.g. `Type={iconType}`)
    *  so the parametric Generated FC swaps in the owner-component prop

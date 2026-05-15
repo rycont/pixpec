@@ -12,7 +12,7 @@ import { dirname, join, resolve } from 'node:path'
 import { dump, exportNodeSvg } from './dumper/index.ts'
 import type { RawNode } from './dumper/raw-node.ts'
 import { compile, loadRegistry, type Registry } from './compiler/index.ts'
-import { NodeKind, type DataScopeBinding, type DNode } from './compiler/design-ast.ts'
+import type { DNode } from './compiler/design-ast.ts'
 import { getTarget, resolveConfiguredTargets } from './targets/index.ts'
 import { loadConfig } from './init.ts'
 import { findComponentSetSourceByKey, listFigmaTabs } from './cfigma-meta.ts'
@@ -38,8 +38,6 @@ export interface GenerateOptions {
   renderScale?: number
   /** Normalized view.config.json data for view-level semantic codegen. */
   viewConfig?: ViewCodegenConfig
-  /** Non-rendering prop bindings to scope into the generated component AST. */
-  dataScopeBindings?: DataScopeBinding[]
   /** Already-compiled Design AST. Used by init so target codegen consumes the
    * exact IR it just wrote, instead of redumping/recompiling the Figma node. */
   ast?: DNode
@@ -170,9 +168,6 @@ export async function runGenerate(componentId: string, opts: GenerateOptions = {
       detachInstances: opts.detachInstances || targetName === 'gpui',
       detachUnregisteredInstances: true,
     })
-  }
-  if (!opts.ast && opts.dataScopeBindings?.length) {
-    ast = { kind: NodeKind.DataScope, bindings: opts.dataScopeBindings, child: ast }
   }
   const target = getTarget(targetName)
   // Land in the caller's outputDir, or a legacy generated dir when invoked

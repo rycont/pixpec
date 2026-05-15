@@ -19,7 +19,7 @@ import { listFigmaTabs, scanAllOpenTabsForInit } from "./cfigma-meta.ts";
 import { dump } from "./dumper/index.ts";
 import type { RawNode } from "./dumper/raw-node.ts";
 import { compile, loadRegistry } from "./compiler/index.ts";
-import { NodeKind, type DataScopeBinding, type DNode } from "./compiler/design-ast.ts";
+import { NodeKind, type DInstance, type DNode } from "./compiler/design-ast.ts";
 import { indexDNodeClasses, materializeDNode } from "./compiler/nodes/index.ts";
 import type { DNodeClass } from "./compiler/nodes/index.ts";
 import type { CaseRenderSpec, RenderBoxSpec } from "./types.ts";
@@ -471,10 +471,11 @@ function normalizePromotedValue(value: unknown, field: string, remBase: number):
 }
 
 function dataScopeAst(root: DNode, promotions: PromotedField[]): DNode {
-  const bindings = dataScopeBindings(promotions);
-  return bindings.length
-    ? { kind: NodeKind.DataScope, bindings, child: root }
-    : root;
+  if (promotions.length === 0) return root;
+  return {
+    kind: NodeKind.DataScope,
+    child: applyPromotedExpressions(root, promotions),
+  };
 }
 
 function indexDNodesByBareId(root: DNode): Map<string, DNodeClass> {
@@ -483,12 +484,55 @@ function indexDNodesByBareId(root: DNode): Map<string, DNodeClass> {
   return out;
 }
 
-function dataScopeBindings(promotions: PromotedField[]): DataScopeBinding[] {
-  return promotions.map((promotion) => ({
-    prop: promotion.prop,
-    sourceId: promotion.nodeId,
-    field: promotion.field,
-  }));
+function applyPromotedExpressions(root: DNode, promotions: PromotedField[]): DNode {
+  const clone = structuredClone(root) as DNode;
+  const nodes = indexDNodeObjects(clone);
+  const nodesByBareId = new Map<string, DNode>();
+  for (const [id, node] of nodes) nodesByBareId.set(stripPrefix(id), node);
+  for (const promotion of promotions) {
+    const node = promotion.nodeId === "$root"
+      ? clone
+      : nodes.get(promotion.nodeId) ?? nodesByBareId.get(stripPrefix(promotion.nodeId));
+    if (!node) continue;
+    const expression = propValue(promotion.prop);
+    if (promotion.field.startsWith("component.") && node.kind === NodeKind.Instance) {
+      const key = promotion.field.slice("component.".length);
+      (node as DInstance).props = { ...(node as DInstance).props, [key]: expression };
+      continue;
+    }
+    writePath(node as unknown as Record<string, unknown>, promotion.field, expression);
+  }
+  return clone;
+}
+
+function propValue(name: string) {
+  return { kind: "expression", type: "prop", name } as const;
+}
+
+function indexDNodeObjects(root: DNode): Map<string, DNode> {
+  const out = new Map<string, DNode>();
+  const visit = (node: DNode) => {
+    if ("sourceId" in node && node.sourceId) out.set(node.sourceId, node);
+    if (node.kind === NodeKind.DataScope) visit(node.child);
+    else if ("children" in node && Array.isArray(node.children)) {
+      for (const child of node.children) visit(child);
+    }
+  };
+  visit(root);
+  out.set("$root", root);
+  return out;
+}
+
+function writePath(target: Record<string, unknown>, path: string, value: unknown): void {
+  const parts = path.split(".").filter(Boolean);
+  let current = target;
+  for (const part of parts.slice(0, -1)) {
+    const next = current[part];
+    if (!next || typeof next !== "object") return;
+    current = next as Record<string, unknown>;
+  }
+  const last = parts.at(-1);
+  if (last) current[last] = value;
 }
 
 function normalizePropValue(value: unknown): unknown {

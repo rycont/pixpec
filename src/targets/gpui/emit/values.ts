@@ -1,17 +1,23 @@
-import type { Color, Size, Value } from '../../../compiler/design-ast.ts'
+import type { Color, ExpressionValue, Size, Value } from '../../../compiler/design-ast.ts'
 import type { GpuiEmitContext } from './context.ts'
 import { hex, num } from './rust.ts'
 
-export function sizeExpr(size: Size, ctx: GpuiEmitContext): string {
+export function sizeExpr(size: Size | ExpressionValue, ctx: GpuiEmitContext): string {
   return scaledPx(sizeValue(size, ctx), ctx)
 }
 
-export function sizeValue(size: Size, ctx: GpuiEmitContext): number {
+export function sizeValue(size: Size | ExpressionValue, ctx: GpuiEmitContext): number {
+  if (isExpressionValue(size)) {
+    throw new Error(`gpui target does not support prop expression sizes: ${size.name}`)
+  }
   if ('tokenPath' in size) return ctx.tokenValueMap[size.tokenPath] ?? 0
   return size.value
 }
 
-export function scaledPx(value: number, ctx: GpuiEmitContext): string {
+export function scaledPx(value: number | ExpressionValue, ctx: GpuiEmitContext): string {
+  if (typeof value !== 'number') {
+    throw new Error(`gpui target does not support prop expression numbers: ${value.name}`)
+  }
   return rawPx(value * ctx.renderScale)
 }
 
@@ -55,4 +61,8 @@ function colorExprFromCss(value: string | undefined): string | undefined {
   const hexMatch = /^#([0-9a-fA-F]{6})$/.exec(value)
   if (hexMatch) return `rgb(0x${hexMatch[1]})`
   return undefined
+}
+
+function isExpressionValue(value: unknown): value is ExpressionValue {
+  return !!value && typeof value === 'object' && (value as { kind?: unknown }).kind === 'expression'
 }

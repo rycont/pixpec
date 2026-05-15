@@ -40,7 +40,6 @@ import type {
     Value,
     ExpressionValue,
     LiteralValue,
-    DataScopeBinding,
 } from '../../compiler/design-ast.ts'
 import {
     NodeKind,
@@ -287,16 +286,17 @@ function isLiteralValue<T>(value: unknown): value is LiteralValue<T> {
 }
 
 /** Numeric value (for non-px props like flex, opacity). */
-function sizeToPx(s: Size | undefined): number | undefined {
-    if (!s || isTokenSize(s)) return undefined
+function sizeToPx(s: Size | ExpressionValue | undefined): number | undefined {
+    if (!s || isExpressionValue(s) || isTokenSize(s)) return undefined
     return s.value
 }
 
 function sizeToPxWithTokens(
-    s: Size | undefined,
+    s: Size | ExpressionValue | undefined,
     tokenValues: Record<string, number>,
 ): number | undefined {
     if (!s) return undefined
+    if (isExpressionValue(s)) return undefined
     if (isTokenSize(s)) return tokenValues[s.tokenPath]
     return s.value
 }
@@ -310,6 +310,15 @@ function sizeToPropMinusPx(
     const value = sizeToPx(s)
     if (value === undefined) return sizeToProp(s, remBase)
     return sizeToProp({ value: Math.max(0, value - px), unit: 'px' }, remBase)
+}
+
+function numberOrExpressionToProp(
+    value: number | ExpressionValue,
+    remBase: number,
+): string | ast.Expression {
+    return isExpressionValue(value)
+        ? propExpressionNode(value.name)
+        : px2rem(value, remBase)
 }
 
 function colorToProp(c: Color | Value<Color> | undefined): string | undefined {
@@ -1317,61 +1326,6 @@ function applyRepetitionBindings(root: DNode, bindings: RepetitionBinding[]): DN
     return clone
 }
 
-function applyDataScopeBindings(root: DNode, bindings: DataScopeBinding[]): DNode {
-    const clone = cloneNode(root)
-    const nodes = indexNodesBySourceId(clone)
-    for (const binding of bindings) {
-        const node = nodes.get(stripSourcePrefix(binding.sourceId))
-        if (!node) continue
-        if (binding.field.startsWith('component.') && node.kind === NodeKind.Instance) {
-            const key = binding.field.slice('component.'.length)
-            const inst = node as DInstance
-            inst.instancePropBindings = {
-                ...(inst.instancePropBindings ?? {}),
-                [key]: binding.prop,
-            }
-            continue
-        }
-        writePath(node as unknown as Record<string, unknown>, binding.field, {
-            kind: 'expression',
-            type: 'prop',
-            name: binding.prop,
-        })
-    }
-    return clone
-}
-
-function writePath(target: Record<string, unknown>, path: string, value: unknown): void {
-    const parts = path.split('.').filter(Boolean)
-    let current = target
-    for (const part of parts.slice(0, -1)) {
-        const next = current[part]
-        if (!next || typeof next !== 'object') return
-        current = next as Record<string, unknown>
-    }
-    const last = parts.at(-1)
-    if (last) current[last] = value
-}
-
-function indexNodesBySourceId(root: DNode): Map<string, DNode> {
-    const out = new Map<string, DNode>()
-    const visit = (node: DNode) => {
-        if (node.kind === NodeKind.DataScope) {
-            visit((node as DDataScope).child)
-            return
-        }
-        if (node.sourceId) out.set(stripSourcePrefix(node.sourceId), node)
-        if (isContainerNode(node)) node.children.forEach(visit)
-    }
-    visit(root)
-    out.set('$root', root.kind === NodeKind.DataScope ? (root as DDataScope).child : root)
-    return out
-}
-
-function stripSourcePrefix(id: string): string {
-    return id.includes(';') ? id.slice(id.lastIndexOf(';') + 1) : id
-}
-
 function cloneNode<T extends DNode>(node: T): T {
     return structuredClone(node)
 }
@@ -1477,7 +1431,8 @@ function emitText(n: DText, ctx: Ctx, parent: ParentCtx): ast.JsxElement {
             styles.textDecoration = n.textDecoration
         }
     }
-    if (fixedWidth !== undefined) styles.width = px2rem(fixedWidth, ctx.remBase)
+    if (fixedWidth !== undefined)
+        styles.width = numberOrExpressionToProp(fixedWidth, ctx.remBase)
     if (fillMain) {
         styles.flex = 1
         styles.minWidth = 0
@@ -2200,6 +2155,10 @@ function emitInstance(n: DInstance, ctx: Ctx, parent: ParentCtx): ast.JsxChild {
                         : propExpressionWithFallback(boundKey, fallback),
                 ),
             )
+        } else if (isExpressionValue(props[k])) {
+            const propName = props[k].name
+            ctx.usedPropBindings.add(propName)
+            attrs.push(f.createJsxAttribute(f.createIdentifier(k), propExpression(propName)))
         } else {
             attrs.push(...attrsFromObject({ [k]: props[k] }))
         }
@@ -2487,8 +2446,7 @@ function wrapVisibility(
 
 function emitNode(n: DNode, ctx: Ctx, parent: ParentCtx): ast.JsxChild {
     if (n.kind === NodeKind.DataScope) {
-        const scoped = n as DDataScope
-        return emitNode(applyDataScopeBindings(scoped.child, scoped.bindings), ctx, parent)
+        return emitNode((n as DDataScope).child, ctx, parent)
     }
     let jsx: ast.JsxChild
     switch (n.kind) {
