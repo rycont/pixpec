@@ -23,6 +23,11 @@ export interface DumpOptions {
   cdpPort?: string;
 }
 
+export interface DumpManyOptions extends Omit<DumpOptions, "nodeId"> {
+  /** Root node ids to walk in one Figma runtime call. */
+  nodeIds: string[];
+}
+
 export async function dump(opts: DumpOptions): Promise<RawNode> {
   const code = pluginScript(opts.nodeId);
   const { stdout } = await execFileAsync(
@@ -40,6 +45,44 @@ export async function dump(opts: DumpOptions): Promise<RawNode> {
   const parsed = JSON.parse(stdout) as RawNode | { error: string };
   if ("error" in parsed) throw new Error(`pixpec dump: ${parsed.error}`);
   return parsed;
+}
+
+export async function dumpMany(opts: DumpManyOptions): Promise<Map<string, RawNode>> {
+  if (opts.nodeIds.length === 0) return new Map();
+  const code = pluginScript(opts.nodeIds);
+  const { stdout } = await execFileAsync(
+    opts.cfigmaBin,
+    ["--tab", opts.tab, "exec", code],
+    {
+      encoding: "utf8",
+      maxBuffer: 256 * 1024 * 1024,
+      env: {
+        ...process.env,
+        CFIGMA_CDP_PORT: opts.cdpPort ?? process.env.CFIGMA_CDP_PORT ?? "9222",
+      },
+    },
+  );
+  const parsed = JSON.parse(stdout) as
+    | Array<{ id: string; node: RawNode | null; error?: string }>
+    | { error: string };
+  if (!Array.isArray(parsed)) {
+    throw new Error(`pixpec dumpMany: ${parsed.error}`);
+  }
+  const out = new Map<string, RawNode>();
+  const errors: string[] = [];
+  for (const item of parsed) {
+    if (item.error) {
+      errors.push(`${item.id}: ${item.error}`);
+    } else if (item.node) {
+      out.set(item.id, item.node);
+    } else {
+      errors.push(`${item.id}: node_not_found`);
+    }
+  }
+  if (errors.length > 0) {
+    throw new Error(`pixpec dumpMany failed:\n${errors.join("\n")}`);
+  }
+  return out;
 }
 
 /** Export a single figma node as an SVG string. Used by the compiler to
@@ -75,9 +118,9 @@ export async function exportNodeSvg(opts: DumpOptions): Promise<string> {
 
 /** Plugin script body — runs inside figma. Walks the node tree from
  *  `rootId` and returns a RawNode tree as plain JSON. */
-function pluginScript(rootId: string): string {
+function pluginScript(rootId: string | string[]): string {
   return `
-const ROOT_ID = ${JSON.stringify(rootId)};
+const ROOT_IDS = ${JSON.stringify(Array.isArray(rootId) ? rootId : [rootId])};
 const FRAMELIKE = new Set(['FRAME', 'COMPONENT', 'INSTANCE', 'COMPONENT_SET']);
 const SHAPELIKE = new Set(['RECTANGLE', 'ELLIPSE', 'POLYGON', 'STAR', 'LINE']);
 const VECTORLIKE = new Set(['VECTOR', 'BOOLEAN_OPERATION']);
@@ -393,8 +436,19 @@ async function dumpNode(node) {
   return out;
 }
 
-const root = await figma.getNodeByIdAsync(${JSON.stringify(rootId)});
-if (!root) return { error: 'node_not_found: ' + ${JSON.stringify(rootId)} };
-return await dumpNode(root);
+const results = [];
+for (const rootId of ROOT_IDS) {
+  try {
+    const root = await figma.getNodeByIdAsync(rootId);
+    if (!root) {
+      results.push({ id: rootId, node: null, error: 'node_not_found: ' + rootId });
+    } else {
+      results.push({ id: rootId, node: await dumpNode(root) });
+    }
+  } catch (e) {
+    results.push({ id: rootId, node: null, error: e && e.message || String(e) });
+  }
+}
+return ${Array.isArray(rootId) ? "results" : "results[0].node || { error: results[0].error }"};
 `;
 }

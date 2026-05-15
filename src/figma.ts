@@ -11,7 +11,8 @@
  * `--by-id`, so each file is predictable as `<sanitize(nodeId)>.<ext>`.
  */
 import { execFile } from 'node:child_process'
-import { mkdir, readdir, rm } from 'node:fs/promises'
+import { mkdir, mkdtemp, readdir, rm } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { promisify } from 'node:util'
 
@@ -109,6 +110,60 @@ export interface FigmaBatchExportOptions {
     scale?: number
     bridge?: string
     cfigmaBin?: string
+}
+
+export async function preflightCfigmaExport(opts: {
+    tabPattern: string
+    nodeId: string
+    bridge?: string
+    cfigmaBin?: string
+}): Promise<void> {
+    const bin = opts.cfigmaBin ?? 'cfigma'
+    const bridgeUrl = opts.bridge ?? 'http://127.0.0.1:9876'
+    const outDir = await mkdtemp(join(tmpdir(), 'pixpec-cfigma-preflight-'))
+    const args = [
+        '--tab',
+        opts.tabPattern,
+        'export',
+        '--ids',
+        opts.nodeId,
+        '--by-id',
+        '--out',
+        outDir,
+        '--format',
+        'PNG',
+        '--scale',
+        '1',
+        '--bridge',
+        bridgeUrl,
+    ]
+    try {
+        const { stdout } = await execFileAsync(bin, args, {
+            encoding: 'utf8',
+            maxBuffer: 64 * 1024 * 1024,
+        })
+        assertCfigmaExportSucceeded(stdout, 1, 'cfigma preflight', bridgeUrl)
+        const expected = sanitizeCfigmaFilename(opts.nodeId) + '.png'
+        const files = await readdir(outDir)
+        if (!files.includes(expected)) {
+            throw new Error(`cfigma preflight: export did not create ${expected}`)
+        }
+        console.error(`    [cfigma preflight] OK (${opts.nodeId})`)
+    } catch (e) {
+        const detail = e instanceof Error ? e.message : String(e)
+        throw new Error(
+            [
+                `pixpec init: cfigma export preflight failed for node ${opts.nodeId}.`,
+                `bridge: ${bridgeUrl}`,
+                'Make sure the cfigma bridge is running and the Figma tab has been reloaded:',
+                `  ${bin} bridge`,
+                `  ${bin} --tab ${JSON.stringify(opts.tabPattern)} reload`,
+                `cause: ${detail}`,
+            ].join('\n'),
+        )
+    } finally {
+        await rm(outDir, { recursive: true, force: true })
+    }
 }
 
 /**

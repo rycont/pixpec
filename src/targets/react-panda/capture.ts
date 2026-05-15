@@ -2,7 +2,7 @@
  * React/Panda destination capture — materializes a Pixpec-owned Vite harness,
  * renders component cases, and screenshots each case to PNG.
  */
-import { mkdir, readdir, readFile, rm } from 'node:fs/promises'
+import { mkdir, readdir, readFile, rm, writeFile } from 'node:fs/promises'
 import { spawn } from 'node:child_process'
 import { createRequire } from 'node:module'
 import { dirname, resolve } from 'node:path'
@@ -55,38 +55,105 @@ export async function captureReactPandaDestination(request: CaptureRequest): Pro
     }
     for (const group of plan.groups) {
       const comp = group.component
-      const CHUNK = comp.batchChunk ?? 500
+      const CHUNK = comp.batchChunk ?? Number(process.env.PIXPEC_CAPTURE_BATCH_CHUNK ?? 100)
       const N = group.items.length
-      const PARALLEL = comp.batchParallel ?? 2
+      const PARALLEL = comp.batchParallel ?? Number(process.env.PIXPEC_CAPTURE_BATCH_PARALLEL ?? 1)
 
       const chunks: { s: number; e: number }[] = []
       for (let s = 0; s < N; s += CHUNK) chunks.push({ s, e: Math.min(s + CHUNK, N) })
+      const caseById = new Map<
+        string,
+        {
+          figmaId: string
+          props: Record<string, unknown>
+          render?: unknown
+          variantRender?: unknown
+          variantPath: string
+        }
+      >()
+      const manifest = JSON.parse(await readFile(resolve(group.componentDir, 'pixpec.json'), 'utf8')) as {
+        variants?: Array<{ key?: string; path?: string }>
+      }
+      const variantPathByKey = new Map(
+        (manifest.variants ?? [])
+          .filter((variant): variant is { key: string; path: string } => !!variant.key && !!variant.path)
+          .map((variant) => [variant.key, variant.path]),
+      )
+      for (const variant of comp.variants) {
+        const mainRender = variant.usecases?.find((usecase) => usecase.isMainCase)?.render
+        const variantRender = variant.render ?? mainRender
+        const variantPath = variantPathByKey.get(variant.key)
+        if (!variantPath) throw new Error(`capture dst:react-panda missing variant path for ${comp.name}:${variant.key}`)
+        for (const usecase of variant.usecases ?? []) {
+          caseById.set(usecase.figmaId, {
+            figmaId: usecase.figmaId,
+            props: lowerPixpecDataForReact(usecase.props as Record<string, unknown>, plan.remBase ?? 16),
+            render: usecase.render,
+            variantRender,
+            variantPath,
+          })
+        }
+      }
+      const batchDir = resolve(plan.runtimeDir, 'batches', comp.name)
+      await rm(batchDir, { recursive: true, force: true })
+      await mkdir(batchDir, { recursive: true })
 
-      const sessions: import('./browser-renderer.ts').BatchSession[] = []
-      const runChunk = async ({ s, e }: { s: number; e: number }) => {
+      type PreparedChunk = {
+        s: number
+        e: number
+        url: string
+        items: Array<{ selector: string; outPath: string; clipToElement: boolean }>
+      }
+
+      const prepareChunk = async ({ s, e }: { s: number; e: number }): Promise<PreparedChunk> => {
         const ids = group.items.slice(s, e).map((item) => item.id)
+        const batchPath = resolve(batchDir, `${s}-${e}.json`)
+        await writeFile(
+          batchPath,
+          JSON.stringify(
+            {
+              component: comp.name,
+              cases: ids.map((id) => {
+                const item = caseById.get(id)
+                if (!item) throw new Error(`capture dst:react-panda missing case ${id}`)
+                return item
+              }),
+            },
+            null,
+            0,
+          ),
+          'utf8',
+        )
         const url =
           `${baseUrl}/index.html` +
-          `?component=${encodeURIComponent(comp.name)}&ids=${encodeURIComponent(JSON.stringify(ids))}`
-        const t0 = Date.now()
-        const session = await renderer.openBatch({
-          url,
-          viewport: comp.viewport ?? { width: 4000, height: 8000 },
-          outputScale: plan.scale ?? 2,
-          remBase: plan.remBase ?? 16,
-        })
-        sessions.push(session)
+          `?batch=${encodeURIComponent(`/@fs/${batchPath}`)}`
+        const items = group.items.slice(s, e).map((item) => ({
+          selector: item.hasRenderBox
+            ? `[data-case="${item.safeId}"]`
+            : `[data-case="${item.safeId}"] > *`,
+          outPath: item.pngPath,
+          clipToElement: item.hasRenderBox,
+        }))
+        return { s, e, url, items }
+      }
 
+      const captureChunk = async (
+        session: Awaited<ReturnType<Renderer['openBatch']>>,
+        chunk: PreparedChunk,
+        loaded: boolean,
+      ) => {
+        const t0 = Date.now()
+        if (!loaded) await session.navigateTo(chunk.url)
         const tNav = Date.now()
         const tryWait = async (isRetry = false) => {
           try {
-            await session.waitMounted(e - s)
+            await session.waitMounted(chunk.e - chunk.s)
           } catch (err) {
             const msg = String(err)
             if (!isRetry && msg.includes('component not found')) {
               await new Promise((r) => setTimeout(r, 1000))
               await session.reload()
-              await session.navigateTo(url)
+              await session.navigateTo(chunk.url)
               await tryWait(true)
               return
             }
@@ -96,38 +163,92 @@ export async function captureReactPandaDestination(request: CaptureRequest): Pro
         await tryWait()
 
         const tMount = Date.now()
-        const items = group.items.slice(s, e).map((item) => ({
-          selector: item.hasRenderBox
-            ? `[data-case="${item.safeId}"]`
-            : `[data-case="${item.safeId}"] > *`,
-          outPath: item.pngPath,
-          clipToElement: item.hasRenderBox,
-        }))
-        await session.screenshotMany(items)
+        await session.screenshotMany(chunk.items)
         const tShots = Date.now()
         console.log(
-          `  chunk [${s}..${e}) nav=${tNav - t0}ms mount=${tMount - tNav}ms shots=${tShots - tMount}ms`,
+          `  chunk [${chunk.s}..${chunk.e}) nav=${tNav - t0}ms mount=${tMount - tNav}ms shots=${tShots - tMount}ms`,
         )
       }
 
       let nextIdx = 0
       const worker = async () => {
-        while (nextIdx < chunks.length) {
-          const idx = nextIdx++
-          await runChunk(chunks[idx])
+        let session: Awaited<ReturnType<Renderer['openBatch']>> | null = null
+        try {
+          while (nextIdx < chunks.length) {
+            const idx = nextIdx++
+            const chunk = await prepareChunk(chunks[idx])
+            if (!session) {
+              session = await renderer.openBatch({
+                url: chunk.url,
+                viewport: comp.viewport ?? { width: 4000, height: 8000 },
+                outputScale: plan.scale ?? 2,
+                remBase: plan.remBase ?? 16,
+              })
+              await captureChunk(session, chunk, true)
+            } else {
+              await captureChunk(session, chunk, false)
+            }
+          }
+        } finally {
+          await session?.close()
         }
       }
-      try {
-        await Promise.all(Array.from({ length: Math.min(PARALLEL, chunks.length) }, worker))
-      } finally {
-        await Promise.all(sessions.map((session) => session.close()))
-      }
+      await Promise.all(Array.from({ length: Math.min(PARALLEL, chunks.length) }, worker))
     }
   } finally {
     await ownedServer?.close()
     await renderer.close()
   }
   return { artifacts: plan.artifacts }
+}
+
+function lowerPixpecDataForReact(
+  props: Record<string, unknown>,
+  remBase: number,
+): Record<string, unknown> {
+  return Object.fromEntries(
+    Object.entries(props).map(([key, value]) => [
+      key,
+      lowerPixpecValueForReact(value, remBase),
+    ]),
+  );
+}
+
+function lowerPixpecValueForReact(value: unknown, remBase: number): unknown {
+  if (Array.isArray(value)) return value.map((item) => lowerPixpecValueForReact(item, remBase));
+  if (!value || typeof value !== 'object') return value;
+  const record = value as Record<string, unknown>;
+  if (record.kind === 'literal') return lowerPixpecValueForReact(record.value, remBase);
+  if (typeof record.value === 'number' && record.unit === 'px') {
+    return `${+(record.value / remBase).toFixed(6)}rem`;
+  }
+  if (isColorRecord(record)) return colorRecordToCss(record);
+  return Object.fromEntries(
+    Object.entries(record).map(([key, nested]) => [
+      key,
+      lowerPixpecValueForReact(nested, remBase),
+    ]),
+  );
+}
+
+function isColorRecord(value: Record<string, unknown>): boolean {
+  return (
+    typeof value.r === 'number' &&
+    typeof value.g === 'number' &&
+    typeof value.b === 'number' &&
+    (value.a === undefined || typeof value.a === 'number')
+  );
+}
+
+function colorRecordToCss(value: Record<string, unknown>): string {
+  const r = Number(value.r);
+  const g = Number(value.g);
+  const b = Number(value.b);
+  const a = value.a === undefined ? 1 : Number(value.a);
+  if (a >= 1) {
+    return `#${[r, g, b].map((channel) => channel.toString(16).padStart(2, '0')).join('')}`;
+  }
+  return `rgba(${r},${g},${b},${+a.toFixed(6)})`;
 }
 
 export async function prepareReactPandaGeneratedCaptureRuntime(opts: {
@@ -560,6 +681,7 @@ async function runPandaCli(args: string[], cwd: string): Promise<void> {
 
 function reactPandaHarnessEntry(opts: { rootDir: string; componentsDir: string }): string {
   return `import { createRoot } from 'react-dom/client'
+import { flushSync } from 'react-dom'
 import { createElement, Fragment, type ComponentType } from 'react'
 
 type RegistryEntry = {
@@ -600,6 +722,17 @@ type RegistryEntry = {
       }
       isMainCase?: boolean
     }>
+  }>
+}
+
+type BatchEntry = {
+  component: string
+  cases: Array<{
+    figmaId: string
+    props: Record<string, unknown>
+    render?: RegistryEntry['variants'][number]['usecases'][number]['render']
+    variantRender?: RegistryEntry['variants'][number]['usecases'][number]['render']
+    variantPath: string
   }>
 }
 
@@ -709,30 +842,40 @@ const root = createRoot(target)
 async function render() {
   try {
     const url = new URL(window.location.href)
-    const compName = url.searchParams.get('component')
+    const batchUrl = url.searchParams.get('batch')
+    const batch = batchUrl
+      ? (await fetch(batchUrl).then((res) => {
+          if (!res.ok) throw new Error(\`pixpec react-panda harness: failed to load batch \${batchUrl}: HTTP \${res.status}\`)
+          return res.json()
+        })) as BatchEntry
+      : null
+    const compName = batch?.component ?? url.searchParams.get('component')
     const sourceMode = url.searchParams.get('source') === 'generated' ? 'generated' : 'impl'
     const idsParam = url.searchParams.get('ids')
-    const ids = idsParam ? new Set(JSON.parse(idsParam) as string[]) : null
+    const ids = !batch && idsParam ? new Set(JSON.parse(idsParam) as string[]) : null
     if (!compName) return
 
     const ts = Date.now()
     const componentDir = \`\${COMPONENTS_DIR}/\${compName}\`
-    const manifestMod = await import(/* @vite-ignore */ \`\${componentDir}/pixpec.json?t=\${ts}\`) as Record<string, unknown>
-    const manifest = (manifestMod.default ?? manifestMod) as {
-      name: string
-      variants: Array<{ path: string; figmaId: string; render?: RegistryEntry['variants'][number]['render'] }>
-    }
-    const comp: RegistryEntry = {
-      name: manifest.name,
-      variants: await Promise.all(manifest.variants.map(async (variant) => {
-        const usecasesMod = await import(/* @vite-ignore */ \`\${componentDir}/\${variant.path}/usecases.json?t=\${ts}\`) as Record<string, unknown>
-        return {
-          path: variant.path,
-          figmaId: variant.figmaId,
-          render: variant.render,
-          usecases: (usecasesMod.default ?? usecasesMod) as RegistryEntry['variants'][number]['usecases'],
-        }
-      })),
+    let comp: RegistryEntry | null = null
+    if (!batch) {
+      const manifestMod = await import(/* @vite-ignore */ \`\${componentDir}/pixpec.json?t=\${ts}\`) as Record<string, unknown>
+      const manifest = (manifestMod.default ?? manifestMod) as {
+        name: string
+        variants: Array<{ path: string; figmaId: string; render?: RegistryEntry['variants'][number]['render'] }>
+      }
+      comp = {
+        name: manifest.name,
+        variants: await Promise.all(manifest.variants.map(async (variant) => {
+          const usecasesMod = await import(/* @vite-ignore */ \`\${componentDir}/\${variant.path}/usecases.json?t=\${ts}\`) as Record<string, unknown>
+          return {
+            path: variant.path,
+            figmaId: variant.figmaId,
+            render: variant.render,
+            usecases: (usecasesMod.default ?? usecasesMod) as RegistryEntry['variants'][number]['usecases'],
+          }
+        })),
+      }
     }
 
     let Impl: ComponentType<unknown> | null = null
@@ -746,8 +889,10 @@ async function render() {
 
     const resolveComponentFor = async (figmaId: string): Promise<ComponentType<unknown>> => {
       if (Impl) return Impl
-      const variant = comp.variants.find((v) => (v.usecases ?? []).some((u) => u.figmaId === figmaId))
-      if (!variant) throw new Error(\`pixpec react-panda harness: no variant for \${figmaId}\`)
+      const variant = batch
+        ? { path: batch.cases.find((c) => c.figmaId === figmaId)?.variantPath }
+        : comp?.variants.find((v) => (v.usecases ?? []).some((u) => u.figmaId === figmaId))
+      if (!variant?.path) throw new Error(\`pixpec react-panda harness: no variant for \${figmaId}\`)
       const genMod = await import(
         /* @vite-ignore */ \`\${componentDir}/\${variant.path}/react-panda/index.tsx?t=\${ts}\`
       ) as Record<string, unknown>
@@ -758,14 +903,18 @@ async function render() {
       return G
     }
 
-    const allUsecases = comp.variants.flatMap((v) => v.usecases ?? [])
+    const allUsecases = batch?.cases ?? comp?.variants.flatMap((v) => v.usecases ?? []) ?? []
     const usecases = ids ? allUsecases.filter((u) => ids.has(u.figmaId)) : allUsecases
     const comps = await Promise.all(usecases.map((c) => resolveComponentFor(c.figmaId)))
     const variantRenderByCaseId = new Map<string, RegistryEntry['variants'][number]['usecases'][number]['render']>()
-    for (const v of comp.variants) {
-      const mainRender = (v.usecases ?? []).find((u) => u.isMainCase)?.render
-      const variantRender = (v as any).render ?? mainRender
-      for (const u of v.usecases ?? []) variantRenderByCaseId.set(u.figmaId, variantRender)
+    if (batch) {
+      for (const item of batch.cases) variantRenderByCaseId.set(item.figmaId, item.variantRender)
+    } else if (comp) {
+      for (const v of comp.variants) {
+        const mainRender = (v.usecases ?? []).find((u) => u.isMainCase)?.render
+        const variantRender = (v as any).render ?? mainRender
+        for (const u of v.usecases ?? []) variantRenderByCaseId.set(u.figmaId, variantRender)
+      }
     }
     const px2rem = (v: number) => \`\${+(v / 16).toFixed(6)}rem\`
     const boxStyle = (box: NonNullable<RegistryEntry['variants'][number]['usecases'][number]['render']>['box']) => {
@@ -799,42 +948,45 @@ async function render() {
       if (box?.height !== undefined) style.height = px2rem(box.height)
       return style
     }
-    root.render(
-      createElement(
-        Fragment,
-        null,
-        ...usecases.map((c, i) => {
-          const C = comps[i]
-          const props = c.props
-          const child = createElement(C, props)
-          const renderSpec = c.render ?? variantRenderByCaseId.get(c.figmaId)
-          const rendered = renderSpec?.box
-            ? createElement('div', { style: boxStyle(renderSpec.box) }, child)
-            : child
-          return createElement(
-            'div',
-            {
-              key: c.figmaId,
-              'data-case': safeId(c.figmaId),
-              style: {
-                display: 'inline-block',
-                verticalAlign: 'top',
-                margin: '0 32px 32px 0',
-                fontSize: 0,
-                lineHeight: 0,
-              },
+    const nextTree = createElement(
+      Fragment,
+      null,
+      ...usecases.map((c, i) => {
+        const C = comps[i]
+        const props = c.props
+        const child = createElement(C, props)
+        const renderSpec = c.render ?? variantRenderByCaseId.get(c.figmaId)
+        const rendered = renderSpec?.box
+          ? createElement('div', { style: boxStyle(renderSpec.box) }, child)
+          : child
+        return createElement(
+          'div',
+          {
+            key: c.figmaId,
+            'data-case': safeId(c.figmaId),
+            style: {
+              display: 'inline-block',
+              verticalAlign: 'top',
+              margin: '0 32px 32px 0',
+              fontSize: 0,
+              lineHeight: 0,
             },
-            rendered,
-          )
-        }),
-      ),
+          },
+          rendered,
+        )
+      }),
     )
+    flushSync(() => {
+      root.render(nextTree)
+    })
+    target.dataset.pixpecBatch = batchUrl ?? ''
   } catch (e) {
     ;(window as any).__pixpecError = e instanceof Error ? e.stack || e.message : String(e)
     console.error(e)
   }
 }
 
+;(window as any).__pixpecRender = render
 void render()
 `
 }

@@ -101,7 +101,14 @@ export async function writeComponentReport(opts: {
       }
       lines.push(`Failed ${target.failed.length}/${target.records.length} cases. Max blob threshold: ${target.maxBlob}.`);
       lines.push("");
-      for (const record of target.failed) {
+      const shownFailures = target.failed.slice(0, 50);
+      if (target.failed.length > shownFailures.length) {
+        lines.push(
+          `Showing first ${shownFailures.length} failures; full machine-readable results are in \`.pixpec/verify/figma__${target.target}/results.json\`.`,
+        );
+        lines.push("");
+      }
+      for (const record of shownFailures) {
         lines.push(`#### \`${record.case}\``);
         lines.push("");
         lines.push(`- Figma: ${figmaLinkFromSafeCase(record.case)}`);
@@ -118,13 +125,6 @@ export async function writeComponentReport(opts: {
         lines.push(imageBlock("Figma", rel(opts.componentDir, record.artifacts.figma)));
         lines.push("");
         lines.push(imageBlock("Destination", rel(opts.componentDir, record.artifacts.impl)));
-        lines.push("");
-        const rggBase = `.pixpec/verify/figma__${target.target}/rgg/${record.case}`;
-        lines.push(imageBlock("RGG hue", `${rggBase}/rgg-h.png`));
-        lines.push("");
-        lines.push(imageBlock("RGG saturation", `${rggBase}/rgg-s.png`));
-        lines.push("");
-        lines.push(imageBlock("RGG value", `${rggBase}/rgg-v.png`));
         lines.push("");
       }
     }

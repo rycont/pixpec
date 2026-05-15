@@ -2801,6 +2801,34 @@ interface ReactPandaCtxExt {
   sourceId?: string;
 }
 
+interface SharedPrinter {
+  api: API;
+  printNode: (node: ast.Node) => string;
+}
+
+const sharedPrinters = new Map<string, SharedPrinter>();
+
+function getSharedPrintNode(cwd: string): (node: ast.Node) => string {
+  const cached = sharedPrinters.get(cwd);
+  if (cached) return cached.printNode;
+
+  const api = new API({ cwd });
+  const here = nodePath.dirname(fileURLToPath(import.meta.url));
+  const tsconfigCandidates = [
+    nodePath.resolve(cwd, "tsconfig.json"),
+    nodePath.resolve(here, "../../../tsconfig.json"),
+  ];
+  const tsconfig = tsconfigCandidates.find((p) => existsSync(p));
+  if (!tsconfig)
+    throw new Error("[react-panda target] tsgo: no tsconfig.json found");
+  const snap = api.updateSnapshot({ openProject: tsconfig });
+  const proj = snap.getProjects()[0];
+  if (!proj) throw new Error("[react-panda target] tsgo: no project loaded");
+  const printNode = (node: ast.Node) => proj.emitter.printNode(node);
+  sharedPrinters.set(cwd, { api, printNode });
+  return printNode;
+}
+
 function rootPropsType(root: DNode): string {
   switch (root.kind) {
     case NodeKind.DataScope:
@@ -3327,33 +3355,8 @@ export function codegenReactPanda(
   };
   const sourceId = ext.sourceId ?? nodeSourceId(normalizedRoot);
 
-  let printNode = ext.printNode;
-  let api: API | undefined;
-  let source: string;
-  try {
-    if (!printNode) {
-      const cwd = process.cwd();
-      api = new API({ cwd });
-      // tsgo wants a tsconfig path; use the cwd's if present, otherwise
-      // pixpec's own tsconfig (we know it exists relative to this file).
-      const here = nodePath.dirname(fileURLToPath(import.meta.url));
-      const tsconfigCandidates = [
-        nodePath.resolve(cwd, "tsconfig.json"),
-        nodePath.resolve(here, "../../../tsconfig.json"),
-      ];
-      const tsconfig = tsconfigCandidates.find((p) => existsSync(p));
-      if (!tsconfig)
-        throw new Error("[react-panda target] tsgo: no tsconfig.json found");
-      const snap = api.updateSnapshot({ openProject: tsconfig });
-      const proj = snap.getProjects()[0];
-      if (!proj)
-        throw new Error("[react-panda target] tsgo: no project loaded");
-      printNode = (node: ast.Node) => proj.emitter.printNode(node);
-    }
-    source = buildSource(normalizedRoot, cgCtx, printNode, sourceId);
-  } finally {
-    if (api) api.close();
-  }
+  const printNode = ext.printNode ?? getSharedPrintNode(process.cwd());
+  const source = buildSource(normalizedRoot, cgCtx, printNode, sourceId);
   const sidecars = [
     ...[...cgCtx.svgSidecars.entries()].map(([relativePath, { content }]) => ({
       relativePath,

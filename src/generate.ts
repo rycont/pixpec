@@ -41,10 +41,56 @@ export interface GenerateOptions {
   /** Already-compiled Design AST. Used by init so target codegen consumes the
    * exact IR it just wrote, instead of redumping/recompiling the Figma node. */
   ast?: DNode
+  /** Preloaded component registry. Init passes this so per-variant generation
+   * does not repeatedly load the component tree it is currently writing. */
+  registry?: Registry
+  /** Format TypeScript output with Prettier. Defaults to true for CLI output;
+   * init disables it for hundreds of generated variant files. */
+  format?: boolean
+}
+
+export interface GenerateContext {
+  cfg: Awaited<ReturnType<typeof loadConfig>>['cfg']
+  root: string
+  componentsDir: string
+  tokenMap: Record<string, string>
+  tokenValueMap: Record<string, number>
+  tokenColorMap: Record<string, string>
+  typographyMap: Record<string, string>
+  fontManifest?: unknown
+  plugins: unknown[]
+  registry: Registry
+  targetRegistry: Map<string, { componentName: string; dir: string; hasProps: boolean }>
 }
 
 export interface GenerateManyOptions extends Omit<GenerateOptions, 'target'> {
   target?: string
+}
+
+export async function prepareGenerateContext(opts: {
+  cwd?: string
+  registry?: Registry
+} = {}): Promise<GenerateContext> {
+  const { cfg, root } = await loadConfig(opts.cwd)
+  const componentsDir = resolve(root, cfg.componentsDir ?? 'src/components')
+  const { tokenMap, tokenValueMap, tokenColorMap } = await loadTokenMaps(root)
+  const typographyMap = await loadTypographyMap(componentsDir)
+  const fontManifest = await loadFontManifest(root)
+  const plugins = await loadPlugins(root)
+  const registry = opts.registry ?? await loadRegistry(componentsDir)
+  return {
+    cfg,
+    root,
+    componentsDir,
+    tokenMap,
+    tokenValueMap,
+    tokenColorMap,
+    typographyMap,
+    fontManifest,
+    plugins,
+    registry,
+    targetRegistry: toTargetRegistry(registry),
+  }
 }
 
 export async function runGenerateTargets(
@@ -66,78 +112,30 @@ export async function runGenerate(componentId: string, opts: GenerateOptions = {
   outPath: string
   source: string
 }> {
+  const context = await prepareGenerateContext({ registry: opts.registry })
+  return runGeneratePrepared(componentId, opts, context)
+}
+
+export async function runGeneratePrepared(
+  componentId: string,
+  opts: GenerateOptions = {},
+  context: GenerateContext,
+): Promise<{
+  componentName: string
+  outPath: string
+  source: string
+}> {
   if (!opts.target) {
     throw new Error('pixpec generate: target is required; use runGenerateTargets for configured targets')
   }
-  const { cfg, root } = await loadConfig()
-  const componentsDir = resolve(root, cfg.componentsDir ?? 'src/components')
+  const { cfg, root, componentsDir } = context
 
   const firstColon = componentId.indexOf(':')
   if (firstColon < 0) throw new Error(`pixpec generate: componentId must be <fileKey>:<nodeId>; got ${componentId}`)
   const fileKey = componentId.slice(0, firstColon)
   const nodeId = componentId.slice(firstColon + 1)
 
-  // Resolve tab from fileKey.
-  const tabs = await listFigmaTabs({ cfigmaBin: cfg.cfigmaBin })
-  const tab = tabs.find((t) => t.key === fileKey)
-  if (!tab) throw new Error(`pixpec generate: no open figma tab matches fileKey ${fileKey}`)
-
-  // Load token map (figma var id → semantic path) + intrinsic numeric values.
-  const tokenMap: Record<string, string> = {}
-  const tokenValueMap: Record<string, number> = {}
-  const tokenColorMap: Record<string, string> = {}
-  try {
-    const ft = JSON.parse(await readFile(resolve(root, 'tokens/figma-tokens.json'), 'utf8')) as {
-      variables: Array<{ id: string; key?: string; name: string; resolvedType: string; valuesByMode?: Record<string, unknown> }>
-    }
-    for (const v of ft.variables) {
-      const tokenPath = v.name.replace(/[\x00-\x1f]/g, '')
-        .split('/').map((s) => s.replace(/\s+/g, '').replace(/^./, (c) => c.toLowerCase()))
-        .join('.')
-      tokenMap[v.id] = tokenPath
-      if (v.key) tokenMap[v.key] = tokenPath
-      if (v.resolvedType === 'FLOAT' && v.valuesByMode) {
-        const num = Object.values(v.valuesByMode).find((x): x is number => typeof x === 'number')
-        if (typeof num === 'number') {
-          tokenValueMap[v.id] = num
-          if (v.key) tokenValueMap[v.key] = num
-          tokenValueMap[tokenPath] = num
-        }
-      }
-      if (v.resolvedType === 'COLOR' && v.valuesByMode) {
-        const color = Object.values(v.valuesByMode).map(colorTokenToCss).find((x): x is string => !!x)
-        if (color) {
-          tokenColorMap[v.id] = color
-          if (v.key) tokenColorMap[v.key] = color
-          tokenColorMap[tokenPath] = color
-        }
-      }
-    }
-  } catch { /* tokens file is optional */ }
-
-  // Load typography map (textStyleId → typography component name).
-  let typographyMap: Record<string, string> = {}
-  try {
-    typographyMap = JSON.parse(await readFile(resolve(componentsDir, 'typography/figma-binding.json'), 'utf8'))
-  } catch { /* optional */ }
-
-  // Load optional font calibration metadata shared by capture/codegen targets.
-  let fontManifest: unknown
-  try {
-    fontManifest = JSON.parse(await readFile(resolve(root, 'src/fonts/__pixpec-fonts.json'), 'utf8'))
-  } catch { /* optional */ }
-
-  // Load codegen plugins from pixpec.config.ts (icon currentColor etc.).
-  let plugins: unknown[] = []
-  try {
-    const cfgPath = resolve(root, 'pixpec.config.ts')
-    if (existsSync(cfgPath)) {
-      const mod = (await import(cfgPath)) as { default?: { plugins?: unknown[] }; plugins?: unknown[] }
-      plugins = mod.default?.plugins ?? mod.plugins ?? []
-    }
-  } catch { /* optional */ }
-
-  let registry = await loadRegistry(componentsDir)
+  let registry = opts.registry ?? context.registry
 
   // Owning component: prefer caller-provided --name; otherwise the entry
   // whose variant AST contains nodeId.
@@ -154,7 +152,11 @@ export async function runGenerate(componentId: string, opts: GenerateOptions = {
   // Dump → compile → target codegen.
   const targetName = opts.target
   let ast = opts.ast
+  let tab: { key: string } | undefined
   if (!ast) {
+    const tabs = await listFigmaTabs({ cfigmaBin: cfg.cfigmaBin })
+    tab = tabs.find((t) => t.key === fileKey)
+    if (!tab) throw new Error(`pixpec generate: no open figma tab matches fileKey ${fileKey}`)
     const raw = await dump({ cfigmaBin: cfg.cfigmaBin ?? 'cfigma', tab: tab.key, nodeId })
     registry = await ensureRegistryForRaw(raw, {
       registry,
@@ -162,9 +164,15 @@ export async function runGenerate(componentId: string, opts: GenerateOptions = {
       cfigmaBin: cfg.cfigmaBin,
       cwd: root,
     })
+    context.registry = registry
+    context.targetRegistry = toTargetRegistry(registry)
+    const tabKey = tab.key
     ast = await compile(raw, {
-      registry, tokenMap, tokenValueMap, tokenColorMap,
-      exportSvg: (id) => exportNodeSvg({ cfigmaBin: cfg.cfigmaBin ?? 'cfigma', tab: tab.key, nodeId: id }),
+      registry,
+      tokenMap: context.tokenMap,
+      tokenValueMap: context.tokenValueMap,
+      tokenColorMap: context.tokenColorMap,
+      exportSvg: (id) => exportNodeSvg({ cfigmaBin: cfg.cfigmaBin ?? 'cfigma', tab: tabKey, nodeId: id }),
       detachInstances: opts.detachInstances || targetName === 'gpui',
       detachUnregisteredInstances: true,
     })
@@ -177,16 +185,14 @@ export async function runGenerate(componentId: string, opts: GenerateOptions = {
   const result = await target.codegen(ast, {
     componentName,
     designSystem: {
-      tokens: tokenMap,
-      tokenValues: tokenValueMap,
-      tokenColors: tokenColorMap,
-      typography: typographyMap,
-      fonts: fontManifest,
+      tokens: context.tokenMap,
+      tokenValues: context.tokenValueMap,
+      tokenColors: context.tokenColorMap,
+      typography: context.typographyMap,
+      fonts: context.fontManifest,
     },
-    registry: new Map(
-      [...registry].map(([, v]) => [v.componentName, { componentName: v.componentName, dir: v.dir, hasProps: true }]),
-    ),
-    plugins: plugins as never,
+    registry: context.targetRegistry,
+    plugins: context.plugins as never,
     remBase: cfg.remBase,
     renderScale: opts.renderScale ?? cfg.scale,
     propKeys: opts.propKeys,
@@ -205,7 +211,7 @@ export async function runGenerate(componentId: string, opts: GenerateOptions = {
   await mkdir(outDir, { recursive: true })
   const outPath = join(outDir, outName)
   let source = result.source
-  if (result.fileExtension === 'ts' || result.fileExtension === 'tsx') {
+  if (opts.format !== false && (result.fileExtension === 'ts' || result.fileExtension === 'tsx')) {
     const prettier = await import('prettier')
     source = await prettier.format(source, {
       parser: 'typescript',
@@ -283,6 +289,81 @@ function collectMissingComponentSetKeys(raw: RawNode, registry: Registry): strin
   }
   visit(raw)
   return [...out]
+}
+
+async function loadTokenMaps(root: string): Promise<{
+  tokenMap: Record<string, string>
+  tokenValueMap: Record<string, number>
+  tokenColorMap: Record<string, string>
+}> {
+  const tokenMap: Record<string, string> = {}
+  const tokenValueMap: Record<string, number> = {}
+  const tokenColorMap: Record<string, string> = {}
+  try {
+    const ft = JSON.parse(await readFile(resolve(root, 'tokens/figma-tokens.json'), 'utf8')) as {
+      variables: Array<{ id: string; key?: string; name: string; resolvedType: string; valuesByMode?: Record<string, unknown> }>
+    }
+    for (const v of ft.variables) {
+      const tokenPath = v.name.replace(/[\x00-\x1f]/g, '')
+        .split('/').map((s) => s.replace(/\s+/g, '').replace(/^./, (c) => c.toLowerCase()))
+        .join('.')
+      tokenMap[v.id] = tokenPath
+      if (v.key) tokenMap[v.key] = tokenPath
+      if (v.resolvedType === 'FLOAT' && v.valuesByMode) {
+        const num = Object.values(v.valuesByMode).find((x): x is number => typeof x === 'number')
+        if (typeof num === 'number') {
+          tokenValueMap[v.id] = num
+          if (v.key) tokenValueMap[v.key] = num
+          tokenValueMap[tokenPath] = num
+        }
+      }
+      if (v.resolvedType === 'COLOR' && v.valuesByMode) {
+        const color = Object.values(v.valuesByMode).map(colorTokenToCss).find((x): x is string => !!x)
+        if (color) {
+          tokenColorMap[v.id] = color
+          if (v.key) tokenColorMap[v.key] = color
+          tokenColorMap[tokenPath] = color
+        }
+      }
+    }
+  } catch { /* tokens file is optional */ }
+  return { tokenMap, tokenValueMap, tokenColorMap }
+}
+
+async function loadTypographyMap(componentsDir: string): Promise<Record<string, string>> {
+  try {
+    return JSON.parse(await readFile(resolve(componentsDir, 'typography/figma-binding.json'), 'utf8'))
+  } catch {
+    return {}
+  }
+}
+
+async function loadFontManifest(root: string): Promise<unknown> {
+  try {
+    return JSON.parse(await readFile(resolve(root, 'src/fonts/__pixpec-fonts.json'), 'utf8'))
+  } catch {
+    return undefined
+  }
+}
+
+async function loadPlugins(root: string): Promise<unknown[]> {
+  try {
+    const cfgPath = resolve(root, 'pixpec.config.ts')
+    if (!existsSync(cfgPath)) return []
+    const mod = (await import(cfgPath)) as { default?: { plugins?: unknown[] }; plugins?: unknown[] }
+    return mod.default?.plugins ?? mod.plugins ?? []
+  } catch {
+    return []
+  }
+}
+
+function toTargetRegistry(registry: Registry): GenerateContext['targetRegistry'] {
+  return new Map(
+    [...registry].map(([, v]) => [
+      v.componentName,
+      { componentName: v.componentName, dir: v.dir, hasProps: true },
+    ]),
+  )
 }
 
 function colorTokenToCss(value: unknown): string | undefined {

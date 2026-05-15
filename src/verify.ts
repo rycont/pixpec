@@ -8,6 +8,7 @@ import { fileURLToPath } from 'node:url'
 import { dirname, resolve } from 'node:path'
 import { existsSync } from 'node:fs'
 import { readFile } from 'node:fs/promises'
+import { runCurrentCliChild } from './cli-child.ts'
 import { loadConfig } from './init.ts'
 import { captureDir, loadCaptureComponent, runCapture, stageMeasureInput } from './capture/index.ts'
 import { resolveConfiguredTargets } from './targets/index.ts'
@@ -25,6 +26,8 @@ export interface VerifyOptions {
   blobThreshold?: string
   maxBlob?: string
   target?: string
+  rgg?: boolean
+  verbose?: boolean
 }
 
 export async function runVerify(
@@ -37,14 +40,14 @@ export async function runVerify(
   if (!existsSync(componentDir)) throw new Error(`pixpec verify: no component dir ${componentDir}`)
   const targets = opts.target ? [opts.target] : resolveConfiguredTargets(cfg)
   const loaded = await loadCaptureComponent(componentName)
-  await runCapture('src', componentName, { backend: 'figma', clearOutDir: true })
+  await runCapture('src', componentName, { backend: 'figma', clearOutDir: false })
   let pass = 0
   let fail = 0
   let total = 0
   const failed: string[] = []
   const verifyTargets: VerifyTargetReport[] = []
   for (const target of targets) {
-    const r = await runVerifyTarget(componentName, componentDir, target, opts)
+    const r = await runVerifyTarget(componentName, componentDir, root, target, opts)
     pass += r.pass
     fail += r.fail
     total += r.total
@@ -64,11 +67,16 @@ export async function runVerify(
 async function runVerifyTarget(
   componentName: string,
   componentDir: string,
+  root: string,
   target: string,
   opts: VerifyOptions,
 ): Promise<{ pass: number; fail: number; total: number; failed: string[]; report: VerifyTargetReport }> {
   console.log(`[verify:${target}] capturing ${componentName} destination artifacts…`)
-  await runCapture('dst', componentName, { backend: target, clearOutDir: true })
+  if (process.env.PIXPEC_VERIFY_CAPTURE_IN_PROCESS === '1') {
+    await runCapture('dst', componentName, { backend: target, clearOutDir: true })
+  } else {
+    await runCurrentCliChild(['capture', 'dst', componentName, '--backend', target], { cwd: root })
+  }
   // Pad both sides to next multiple of 8 (measure-rs's downsample factor)
   // and to the per-case max size. Padding is identical on both → contributes 0 ΔE.
   const sharp = (await import('sharp')).default
@@ -136,18 +144,23 @@ async function runVerifyTarget(
   // figmaId itself IS the human-traceable identifier (back to figma URL).
   let pass = 0
   const failed: string[] = []
+  const verbose = opts.verbose || process.env.PIXPEC_VERIFY_VERBOSE === '1'
   for (const r of results) {
     const ok = r.blob_max_size <= maxBlob
-    console.log(`  ${ok ? '✓' : '✗'} ${r.case} blob=${r.blob_max_size} max=${r.dE00_max.toFixed(2)} sum=${r.dE00.toFixed(0)}`)
+    if (verbose) {
+      console.log(`  ${ok ? '✓' : '✗'} ${r.case} blob=${r.blob_max_size} max=${r.dE00_max.toFixed(2)} sum=${r.dE00.toFixed(0)}`)
+    }
     if (ok) pass++
     else failed.push(r.case)
   }
   const failedRecords = results.filter((r) => r.blob_max_size > maxBlob)
-  await writeRggForFailedCases({
-    componentDir,
-    target,
-    failed: failedRecords,
-  })
+  if (opts.rgg || process.env.PIXPEC_VERIFY_RGG === '1') {
+    await writeRggForFailedCases({
+      componentDir,
+      target,
+      failed: failedRecords,
+    })
+  }
   console.log(`\n[${target}] ${pass}/${results.length} passed${failed.length ? `, ${failed.length} failed` : ''}`)
   return {
     pass,

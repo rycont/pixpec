@@ -31,7 +31,9 @@ abstract class DContainerNode<T extends DFlex | DStack | DBox> extends DNodeClas
       "cornerSmoothing",
       "clip",
     ];
-    if (this.node.padding) fields.push("padding");
+    if (this.node.padding) {
+      fields.push("padding.top", "padding.right", "padding.bottom", "padding.left");
+    }
     if ("gap" in this.node && this.node.gap) fields.push("gap");
     if ("counterGap" in this.node && this.node.counterGap) fields.push("counterGap");
     if (this.node.width && this.node.width !== Sizing.Fill && this.node.width !== Sizing.Hug) fields.push("width");

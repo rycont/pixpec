@@ -101,7 +101,7 @@ async function main() {
     case 'verify': {
       const componentName = rest[0]
       if (!componentName) {
-        console.error('usage: pixpec verify <Component> [--blob-threshold X] [--max-blob N]')
+        console.error('usage: pixpec verify <Component> [--blob-threshold X] [--max-blob N] [--rgg] [--verbose]')
         process.exit(2)
       }
       const btIdx = rest.indexOf('--blob-threshold')
@@ -111,6 +111,8 @@ async function main() {
         blobThreshold: btIdx >= 0 ? rest[btIdx + 1] : undefined,
         maxBlob: mbIdx >= 0 ? rest[mbIdx + 1] : undefined,
         target: targetIdx >= 0 ? rest[targetIdx + 1] : undefined,
+        rgg: rest.includes('--rgg'),
+        verbose: rest.includes('--verbose'),
       })
       if (r.fail > 0) process.exit(1)
       break
@@ -137,7 +139,7 @@ async function main() {
       console.log('  breakdown <fileKey>:<nodeId>   emit src/view output plus DFS subtrees [--detach-instances] [--scale N] [--verify]')
       console.log('  capture src <Component>        capture source artifacts [--backend figma]')
       console.log('  capture dst <Component>        capture destination artifacts [--backend target]')
-      console.log('  verify <Component>             capture + pixel-verify src vs dst [--target name]')
+      console.log('  verify <Component>             capture + pixel-verify src vs dst [--target name] [--rgg] [--verbose]')
       console.log('  analyze <Component> <case>     per-blob shift+shape diagnosis [--target name] [--crop]')
       console.log('\nseparate bins:')
       console.log('  pixpec-measure <dir>           Rust HSB-Euclidean dE → results.json')

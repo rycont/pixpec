@@ -121,10 +121,7 @@ async function loadOne(dir: string, manifestPath: string): Promise<RegistryEntry
         typeof parser.propsFromFigma === "function"
           ? (parser.propsFromFigma as (...args: unknown[]) => Record<string, unknown>)
           : undefined,
-      usecases: readJsonIfExists<Case<Record<string, unknown>>[]>(
-        resolve(variantDir, "usecases.json"),
-        [],
-      ),
+      usecases: [],
     };
   }
   return {

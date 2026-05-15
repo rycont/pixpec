@@ -165,6 +165,7 @@ export class Renderer {
       color: { r: 0, g: 0, b: 0, a: 0 },
     });
     const dpr = VERIFY_DPR;
+    let fontsSettled = false;
     return {
       async reload() {
         lastError = null;
@@ -197,7 +198,12 @@ export class Renderer {
             (n) => {
               if ((window as any).__pixpecError)
                 throw new Error((window as any).__pixpecError);
-              return document.querySelectorAll("[data-case]").length >= n;
+              const target = document.querySelector<HTMLElement>("#pixpec-target");
+              const expectedBatch = new URL(window.location.href).searchParams.get("batch") ?? "";
+              return (
+                target?.dataset.pixpecBatch === expectedBatch &&
+                document.querySelectorAll("[data-case]").length >= n
+              );
             },
             expectedCount,
             { timeout: 60_000 },
@@ -216,7 +222,19 @@ export class Renderer {
           throw new Error(`${(e as Error).message}${detail}`);
         }
         // Harness post-mount.
-        await waitForFontSettle(page);
+        if (!fontsSettled) {
+          await waitForFontSettle(page);
+          fontsSettled = true;
+        } else {
+          await page
+            .evaluate(
+              async () => {
+                if ("fonts" in document)
+                  await (document as Document & { fonts: FontFaceSet }).fonts.ready;
+              },
+            )
+            .catch(() => undefined);
+        }
         await page.evaluate(() => (window as any).__pixpecSettle());
         await page.evaluate(
           () =>
@@ -440,13 +458,27 @@ export class Renderer {
           throw err;
         }
         const fullBuf = Buffer.from(data, "base64");
-        const meta = await sharp(fullBuf, {
+        const rawImage = await sharp(fullBuf, {
           limitInputPixels: false,
-        }).metadata();
-        const fullW = meta.width ?? Math.round(unionW * dpr);
-        const fullH = meta.height ?? Math.round(unionH * dpr);
-        await Promise.all(
-          items.map(async (item, i) => {
+        })
+          .ensureAlpha()
+          .raw()
+          .toBuffer({ resolveWithObject: true });
+        const fullW = rawImage.info.width ?? Math.round(unionW * dpr);
+        const fullH = rawImage.info.height ?? Math.round(unionH * dpr);
+        const fullChannels = rawImage.info.channels ?? 4;
+        const rawInput = {
+          raw: {
+            width: fullW,
+            height: fullH,
+            channels: fullChannels,
+          },
+          limitInputPixels: false,
+        } as const;
+        await mapLimit(
+          items.map((item, i) => ({ item, i })),
+          Number(process.env.PIXPEC_CAPTURE_CROP_PARALLEL ?? 4),
+          async ({ item, i }) => {
             const b = bounds[i]!;
             const left = Math.max(0, Math.floor((b.x - clipX) * dpr));
             const top = Math.max(0, Math.floor((b.y - clipY) * dpr));
@@ -466,7 +498,7 @@ export class Renderer {
               process.stderr.write(
                 `\n[!!! WARNING !!!] screenshotMany: extract clipped for ${selectors[i]}\n  bound=(${b.x},${b.y},${b.w},${b.h}) want=${wantW}×${wantH} have=${haveW}×${haveH}\n  Padding right/bottom with RED #ff0000.\n\n`,
               );
-              const cropped = await sharp(fullBuf, { limitInputPixels: false })
+              const cropped = await sharp(rawImage.data, rawInput)
                 .extract({ left, top, width: haveW, height: haveH })
                 .toBuffer();
               await sharp({
@@ -481,12 +513,12 @@ export class Renderer {
                 .png()
                 .toFile(item.outPath);
             } else {
-              await sharp(fullBuf, { limitInputPixels: false })
+              await sharp(rawImage.data, rawInput)
                 .extract({ left, top, width: wantW, height: wantH })
                 .png()
                 .toFile(item.outPath);
             }
-          }),
+          },
         );
       },
       async close() {
@@ -499,6 +531,24 @@ export class Renderer {
   async close(): Promise<void> {
     await this.browser.close();
   }
+}
+
+async function mapLimit<T>(
+  items: T[],
+  concurrency: number,
+  mapper: (item: T, index: number) => Promise<void>,
+): Promise<void> {
+  const limit = Math.max(1, Math.floor(concurrency));
+  let next = 0;
+  await Promise.all(
+    Array.from({ length: Math.min(limit, items.length) }, async () => {
+      while (true) {
+        const index = next++;
+        if (index >= items.length) return;
+        await mapper(items[index], index);
+      }
+    }),
+  );
 }
 
 async function screenshotVisualBounds(

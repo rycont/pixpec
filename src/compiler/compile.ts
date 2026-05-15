@@ -96,6 +96,10 @@ export interface CompileOptions {
   /** Compile every INSTANCE from its resolved raw subtree instead of emitting
    *  a DInstance component reference. Intended for breakdown/debug output. */
   detachInstances?: boolean;
+  /** Compile only the root INSTANCE as its resolved raw subtree. Intended for
+   *  component usage cases: the usage root is the concrete case frame, while
+   *  nested instances should still resolve through the registry normally. */
+  detachRootInstance?: boolean;
   /** When a dependency cannot be resolved from the registry but the raw dump
    *  contains the instance's resolved children, keep compiling by expanding
    *  that subtree. Intended for remote visual dependencies whose source
@@ -1401,6 +1405,9 @@ export async function compile(
   raw: RawNode,
   opts: CompileOptions,
 ): Promise<DNode> {
+  if (opts.detachRootInstance && raw.type === "INSTANCE") {
+    return compileContainer(raw, withInstanceOverrideFields(opts, raw), undefined, false);
+  }
   return compileNode(raw, opts, undefined);
 }
 

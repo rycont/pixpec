@@ -11,12 +11,15 @@
  * props, exposed instances, and DNode fields.
  */
 import { existsSync } from "node:fs";
+import { createHash } from "node:crypto";
 import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { parse as parseToml } from "smol-toml";
 import { listFigmaTabs, scanAllOpenTabsForInit } from "./cfigma-meta.ts";
-import { dump } from "./dumper/index.ts";
+import { runCurrentCliChild } from "./cli-child.ts";
+import { preflightCfigmaExport } from "./figma.ts";
+import { dump, dumpMany } from "./dumper/index.ts";
 import type { RawNode } from "./dumper/raw-node.ts";
 import {
   compile,
@@ -117,6 +120,7 @@ type CompileDesignContext = {
   tokenColorMap: Record<string, string>;
   typographyMap: Record<string, string>;
 };
+const INIT_USAGE_DUMP_BATCH_SIZE = 100;
 
 export async function loadConfig(start: string = process.cwd()): Promise<{
   cfg: PixpecConfig;
@@ -192,6 +196,12 @@ export async function init(opts: {
     tab: tab.key,
     nodeId,
   });
+  await preflightCfigmaExport({
+    cfigmaBin: cfg.cfigmaBin,
+    tabPattern: tab.key,
+    nodeId: preflightExportNodeId(raw),
+    bridge: cfg.bridge,
+  });
   let registry = await loadRegistry(componentsDir);
   const { ensureRegistryForRaw } = await import("./generate.ts");
   registry = await ensureRegistryForRaw(raw, {
@@ -222,21 +232,21 @@ export async function init(opts: {
 
   const tabByKey = new Map(tabs.map((t) => [t.key, t]));
   const usecases: UsecaseSource[] = [];
+  const usageRawById = await dumpUsageRawsForInit(scan?.usages ?? [], tabByKey, cfg);
   for (const u of scan?.usages ?? []) {
     if (!u.fileKey) continue;
-    const usageTab = tabByKey.get(u.fileKey);
-    if (!usageTab) continue;
+    const usageRaw = usageRawById.get(`${u.fileKey}:${u.id}`);
+    if (!usageRaw) continue;
     try {
-      const usageRaw = await dump({
-        cfigmaBin: cfg.cfigmaBin ?? "cfigma",
-        tab: usageTab.key,
-        nodeId: u.id,
-      });
       usecases.push({
         figmaId: `${u.fileKey}:${u.id}`,
         variantKey: u.mainKey,
         raw: usageRaw,
-        ir: await compileForInit(usageRaw, analysisRegistry, designContext),
+        ir: await compileUsageForInit(
+          usageRaw,
+          analysisRegistry,
+          designContext,
+        ),
         render: parseRenderBox(usageRaw),
       });
     } catch (e) {
@@ -391,21 +401,33 @@ export async function init(opts: {
   );
 
   if (process.env.PIXPEC_SKIP_INIT_GENERATE !== "1") {
-    const { runGenerate } = await import("./generate.ts");
-    for (const meta of variantMetas) {
-      for (const target of cfg.targets) {
-        const result = await runGenerate(`${fileKey}:${meta.variant.id}`, {
+    const { prepareGenerateContext, runGeneratePrepared } = await import("./generate.ts");
+    const generateContext = await prepareGenerateContext({
+      cwd: root,
+      registry: analysisRegistry,
+    });
+    const jobs = variantMetas.flatMap((meta) =>
+      cfg.targets.map((target) => ({ meta, target })),
+    );
+    const generated = await mapLimit(
+      jobs,
+      Number(process.env.PIXPEC_INIT_GENERATE_PARALLEL ?? 4),
+      async ({ meta, target }) => {
+        const result = await runGeneratePrepared(`${fileKey}:${meta.variant.id}`, {
           target,
           componentName,
           outputDir: join(componentDir, meta.path, target),
           outName: "index",
           propsFile: join(componentDir, "schema.ts"),
           ast: meta.ast,
-        });
-        console.log(
-          `[init] generated ${componentName}/${meta.variant.name} [${target}] → ${result.outPath}`,
-        );
-      }
+          format: false,
+        }, generateContext);
+        return { target, outPath: result.outPath };
+      },
+    );
+    for (const target of cfg.targets) {
+      const count = generated.filter((item) => item.target === target).length;
+      console.log(`[init] generated ${componentName} [${target}] ${count} variants`);
     }
   }
 
@@ -419,8 +441,12 @@ export async function init(opts: {
   }
 
   if (!opts.skipVerify && process.env.PIXPEC_SKIP_INIT_VERIFY !== "1") {
-    const { runVerify } = await import("./verify.ts");
-    await runVerify(componentName);
+    if (process.env.PIXPEC_INIT_VERIFY_IN_PROCESS === "1") {
+      const { runVerify } = await import("./verify.ts");
+      await runVerify(componentName);
+    } else {
+      await runCurrentCliChild(["verify", componentName], { cwd: root });
+    }
   }
 
   return {
@@ -428,6 +454,66 @@ export async function init(opts: {
     componentDir,
     variantCount: component.variants.length,
   };
+}
+
+function preflightExportNodeId(raw: RawNode): string {
+  if (raw.type === "COMPONENT_SET") {
+    const firstVariant = (raw.children ?? []).find(
+      (child) => child.type === "COMPONENT",
+    );
+    if (firstVariant) return firstVariant.id;
+  }
+  return raw.id;
+}
+
+async function dumpUsageRawsForInit(
+  usages: Array<{ id: string; fileKey?: string | null }>,
+  tabByKey: Map<string, { key: string }>,
+  cfg: PixpecConfig,
+): Promise<Map<string, RawNode>> {
+  const out = new Map<string, RawNode>();
+  const byFileKey = groupBy(
+    usages.filter((usage): usage is { id: string; fileKey: string } => !!usage.fileKey && tabByKey.has(usage.fileKey)),
+    (usage) => usage.fileKey,
+  );
+  for (const [fileKey, group] of byFileKey) {
+    const tab = tabByKey.get(fileKey);
+    if (!tab) continue;
+    const ids = [...new Set(group.map((usage) => usage.id))];
+    for (let start = 0; start < ids.length; start += INIT_USAGE_DUMP_BATCH_SIZE) {
+      const chunk = ids.slice(start, start + INIT_USAGE_DUMP_BATCH_SIZE);
+      try {
+        const dumped = await dumpMany({
+          cfigmaBin: cfg.cfigmaBin ?? "cfigma",
+          tab: tab.key,
+          nodeIds: chunk,
+        });
+        for (const [id, raw] of dumped) out.set(`${fileKey}:${id}`, raw);
+      } catch (e) {
+        console.warn(
+          `[init] batch usecase dump failed for ${fileKey} [${start}..${start + chunk.length}); falling back to single dumps: ${(e as Error).message}`,
+        );
+        for (const id of chunk) {
+          try {
+            out.set(
+              `${fileKey}:${id}`,
+              await dump({
+                cfigmaBin: cfg.cfigmaBin ?? "cfigma",
+                tab: tab.key,
+                nodeId: id,
+              }),
+            );
+          } catch (singleError) {
+            if (isFatalInitError(singleError)) throw singleError;
+            console.warn(
+              `[init] skipped usecase ${fileKey}:${id}: ${(singleError as Error).message}`,
+            );
+          }
+        }
+      }
+    }
+  }
+  return out;
 }
 
 async function buildComponentSource(
@@ -480,6 +566,22 @@ async function compileForInit(
 ): Promise<DNode> {
   return compile(raw, {
     registry,
+    detachUnregisteredInstances: true,
+    tokenMap: design.tokenMap,
+    tokenValueMap: design.tokenValueMap,
+    tokenColorMap: design.tokenColorMap,
+    typographyMap: design.typographyMap,
+  });
+}
+
+async function compileUsageForInit(
+  raw: RawNode,
+  registry: Awaited<ReturnType<typeof loadRegistry>>,
+  design: CompileDesignContext,
+): Promise<DNode> {
+  return compile(raw, {
+    registry,
+    detachRootInstance: true,
     detachUnregisteredInstances: true,
     tokenMap: design.tokenMap,
     tokenValueMap: design.tokenValueMap,
@@ -599,12 +701,14 @@ async function detectPromotions(
 ): Promise<PromotedField[]> {
   if (usecases.length === 0) return [];
   const masterNodes = indexDNodes(master);
+  const masterRoot = masterNodes.get("$root");
   const counts = new Map<string, { source: PromotedField; count: number }>();
   for (const usecase of usecases) {
     const usageNodes = indexDNodes(usecase.ir);
     const usageNodesByBareId = indexDNodesByBareId(usecase.ir);
     const seen = new Set<string>();
     for (const [nodeId, masterNode] of masterNodes) {
+      if (nodeId !== "$root" && masterNode === masterRoot) continue;
       const usageNode =
         usageNodes.get(nodeId) ?? usageNodesByBareId.get(stripPrefix(nodeId));
       if (!usageNode || usageNode.kind !== masterNode.kind) continue;
@@ -1076,6 +1180,7 @@ function makeCaseWithParser(
     props: { ...props, ...rootSizeStyleProps(variant.raw, remBase, false) },
     figmaId,
     render: parseRenderBox(variant.raw),
+    sourceHash: hashRawNode(variant.raw),
     ...(isMainCase ? { isMainCase: true } : {}),
   };
 }
@@ -1108,7 +1213,12 @@ function makeUsecaseWithParser(
     props: { ...props, ...rootSizeStyleProps(usecase.raw, remBase, true) },
     figmaId: usecase.figmaId,
     render: parseRenderBox(usecase.raw),
+    sourceHash: hashRawNode(usecase.raw),
   };
+}
+
+function hashRawNode(raw: RawNode): string {
+  return createHash("sha1").update(stableJson(raw)).digest("hex");
 }
 
 function isFatalInitError(error: unknown): boolean {
@@ -1313,9 +1423,11 @@ function hasUnconsumedDNodeDiff(
   consumedFields: Set<string>,
 ): boolean {
   const masterNodes = indexDNodes(master);
+  const masterRoot = masterNodes.get("$root");
   const usageNodes = indexDNodes(usage);
   const usageNodesByBareId = indexDNodesByBareId(usage);
   for (const [nodeId, masterNode] of masterNodes) {
+    if (nodeId !== "$root" && masterNode === masterRoot) continue;
     const usageNode =
       usageNodes.get(nodeId) ?? usageNodesByBareId.get(stripPrefix(nodeId));
     if (!usageNode || usageNode.kind !== masterNode.kind) return true;
@@ -1630,6 +1742,25 @@ function groupBy<T>(items: T[], key: (item: T) => string): Map<string, T[]> {
     out.set(k, bucket);
   }
   return out;
+}
+
+async function mapLimit<T, R>(
+  items: T[],
+  concurrency: number,
+  mapper: (item: T, index: number) => Promise<R>,
+): Promise<R[]> {
+  const limit = Math.max(1, Math.floor(concurrency));
+  const results = new Array<R>(items.length);
+  let next = 0;
+  const workers = Array.from({ length: Math.min(limit, items.length) }, async () => {
+    while (true) {
+      const index = next++;
+      if (index >= items.length) return;
+      results[index] = await mapper(items[index], index);
+    }
+  });
+  await Promise.all(workers);
+  return results;
 }
 
 function literal(value: unknown): string {

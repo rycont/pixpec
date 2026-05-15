@@ -41,6 +41,9 @@ export interface Case<P> {
   skipVerify?: string
   /** Platform-neutral render/capture context for this usecase. */
   render?: CaseRenderSpec
+  /** Hash of the raw Figma subtree used to decide whether source PNG capture
+   * can safely reuse a previous export. */
+  sourceHash?: string
 }
 
 export interface RenderBoxSpec {
