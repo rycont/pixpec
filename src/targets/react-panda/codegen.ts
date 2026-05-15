@@ -450,9 +450,14 @@ interface Ctx {
 interface ParentCtx {
     dir: 'row' | 'column' | 'none'
     mainSizing: Sizing
+    isRoot?: boolean
 }
 
-const ROOT_PARENT: ParentCtx = { dir: 'none', mainSizing: Sizing.Fixed }
+const ROOT_PARENT: ParentCtx = {
+    dir: 'none',
+    mainSizing: Sizing.Fixed,
+    isRoot: true,
+}
 
 // ---------------------------------------------------------------------------
 // Per-node emit functions.
@@ -720,6 +725,7 @@ function emitContainer(
     }
     if (n.opacity !== undefined) styles.opacity = n.opacity
     if (
+        !parent.isRoot &&
         n.positioning !== Positioning.Absolute &&
         n.renderBoundsOffset &&
         !isRenderBoundsFromAbsoluteChild(n)
