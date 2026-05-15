@@ -102,6 +102,8 @@ export interface CompileOptions {
    * descendant node id. Used to represent SVG paint overrides without
    * treating the SVG's baked-in original fill as a DVector override. */
   overrideFields?: Map<string, Set<string>>;
+  remBase?: number;
+  paintOpacityMultiplier?: number;
 }
 
 /** Subtree predicate: every descendant (including the node itself) must
@@ -271,6 +273,10 @@ function px(n: number): Size {
   return { value: n, unit: "px" };
 }
 
+function pxToRem(n: number, remBase: number): string {
+  return `${+(n / remBase).toFixed(6)}rem`;
+}
+
 function isOrthogonalSwapRotation(n: RawNode): boolean {
   if (typeof n.rotation !== "number") return false;
   const normalized = ((n.rotation % 360) + 360) % 360;
@@ -368,20 +374,22 @@ function pickColor(
   opts: CompileOptions,
 ): Color | undefined {
   if (!paint) return undefined;
+  const opacity = (paint.opacity ?? 1) * (opts.paintOpacityMultiplier ?? 1);
   const tokenPath = lookupTokenPath(varId, opts.tokenMap);
   if (tokenPath) {
     const intrinsic = lookupTokenColor(varId, opts.tokenColorMap);
-    const actual = rgbaHex(paint.color, paint.opacity ?? 1);
+    const actual = rgbaHex(paint.color, opacity);
     if (intrinsic && colorsEquivalent(intrinsic, actual)) return { tokenPath };
   }
-  if (paint.opacity !== undefined && paint.opacity < 0.999) {
-    return { color: rgbaHex(paint.color, paint.opacity) };
+  if (opacity < 0.999) {
+    return { color: rgbaHex(paint.color, opacity) };
   }
-  return { color: rgbaHex(paint.color, paint.opacity ?? 1) };
+  return { color: rgbaHex(paint.color, opacity) };
 }
 
 function gradientPaintToColor(paint: RawGradientPaint | null | undefined): Color | undefined {
   if (!paint?.gradientStops?.length) return undefined;
+  const angle = gradientCssAngle(paint);
   const stops = [...paint.gradientStops]
     .sort((a, b) => a.position - b.position)
     .map((stop) => {
@@ -391,7 +399,18 @@ function gradientPaintToColor(paint: RawGradientPaint | null | undefined): Color
       );
       return `${color} ${+(stop.position * 100).toFixed(3)}%`;
     });
-  return { color: `linear-gradient(180deg, ${stops.join(", ")})` };
+  return { color: `linear-gradient(${angle}deg, ${stops.join(", ")})` };
+}
+
+function gradientCssAngle(paint: RawGradientPaint): number {
+  const transform = paint.gradientTransform;
+  if (!transform) return 180;
+  const dx = transform[0]?.[0];
+  const dy = transform[0]?.[1];
+  if (typeof dx !== "number" || typeof dy !== "number") return 180;
+  if (Math.abs(dx) < 0.0001 && Math.abs(dy) < 0.0001) return 180;
+  const deg = (Math.atan2(dx, -dy) * 180) / Math.PI;
+  return +(((deg % 360) + 360) % 360).toFixed(3);
 }
 
 function pickPaintColor(
@@ -522,6 +541,7 @@ function buildBase(
     };
   }
   out.renderBoundsOffset = renderBoundsOffsetFromRaw(n);
+  out.renderBounds = renderBoundsFromRaw(n);
   return out;
 }
 
@@ -603,18 +623,28 @@ function exposedProps(
   return out;
 }
 
-function fieldConsumer(compiledChildren: DNode[]) {
+function fieldConsumer(compiledChildren: DNode[], remBase = 16) {
   const byId = indexDNodes(compiledChildren);
+  const byBareId = indexDNodesByBareId(compiledChildren);
   const consumed = new Set<string>();
   return {
     consumed,
     consume(nodeId: string, field: string): unknown {
       consumed.add(`${nodeId}\0${field}`);
-      const node = byId.get(nodeId);
+      const node = byId.get(nodeId) ?? byBareId.get(stripPrefix(nodeId));
       if (!node) return undefined;
-      return normalizePropValue(node.readField(field));
+      return normalizeConsumedField(node.readField(field), field, remBase);
     },
   };
+}
+
+function normalizeConsumedField(value: unknown, field: string, remBase: number): unknown {
+  if ((field === "width" || field === "height") && value && typeof value === "object") {
+    const record = value as Record<string, unknown>;
+    if (typeof record.value === "number" && record.unit === "px") return pxToRem(record.value, remBase);
+    if (typeof record.tokenPath === "string") return record.tokenPath;
+  }
+  return normalizePropValue(value);
 }
 
 function normalizePropValue(value: unknown): unknown {
@@ -640,8 +670,9 @@ function hasUnconsumedDNodeDiff(
   if (!master) return usageChildren.length > 0;
   const masterNodes = indexDNodes(containerChildren(master));
   const usageNodes = indexDNodes(usageChildren);
+  const usageNodesByBareId = indexDNodesByBareId(usageChildren);
   for (const [nodeId, masterNode] of masterNodes) {
-    const usageNode = usageNodes.get(nodeId);
+    const usageNode = usageNodes.get(nodeId) ?? usageNodesByBareId.get(stripPrefix(nodeId));
     if (!usageNode || usageNode.kind !== masterNode.kind) return true;
     for (const diff of masterNode.visualDiff(usageNode)) {
       if (consumedFields.has(`${nodeId}\0${diff.field}`)) continue;
@@ -649,6 +680,12 @@ function hasUnconsumedDNodeDiff(
     }
   }
   return false;
+}
+
+function indexDNodesByBareId(nodes: DNode[]): Map<string, DNodeClass> {
+  const out = new Map<string, DNodeClass>();
+  for (const [id, node] of indexDNodes(nodes)) out.set(stripPrefix(id), node);
+  return out;
 }
 
 function containerChildren(node: DNode): DNode[] {
@@ -679,6 +716,23 @@ function renderBoundsOffsetFromRaw(n: RawNode): { x: number; y: number } | undef
   const y = rb.y - bb.y;
   if (Math.abs(x) < 0.001 && Math.abs(y) < 0.001) return undefined;
   return { x, y };
+}
+
+function renderBoundsFromRaw(n: RawNode): { x: number; y: number; width: number; height: number } | undefined {
+  const bb = n.absoluteBoundingBox;
+  const rb = n.absoluteRenderBounds;
+  if (!bb || !rb) return undefined;
+  const x = rb.x - bb.x;
+  const y = rb.y - bb.y;
+  const width = rb.width;
+  const height = rb.height;
+  if (
+    Math.abs(x) < 0.001 &&
+    Math.abs(y) < 0.001 &&
+    Math.abs(width - (bb.width ?? width)) < 0.001 &&
+    Math.abs(height - (bb.height ?? height)) < 0.001
+  ) return undefined;
+  return { x, y, width, height };
 }
 
 function compileText(
@@ -996,14 +1050,9 @@ async function compileContainer(
   const stroke = firstSolidFill(n.strokes);
   const gradientStroke = firstGradientFill(n.strokes);
   const childRaws = (n.children ?? []).filter(
-    (c) => c.visible !== false && !isInvisibleShape(c),
+    (c) => c.visible !== false && (c.isMask || !isInvisibleShape(c)),
   );
-  const children: DNode[] = [];
-  for (const c of childRaws) {
-    const child = await compileNode(c, opts, n, rawSubtree);
-    if (direction === "none") applyAbsoluteChildPosition(child, c, n);
-    children.push(child);
-  }
+  const children = await compileChildren(childRaws, opts, n, rawSubtree, direction === "none");
   const bgVarId =
     varId(fill?.boundVariables, "color") ?? varId(n.boundVariables, "fills");
   const strokeVarId = varId(stroke?.boundVariables, "color");
@@ -1108,6 +1157,36 @@ async function compileContainer(
   return { ...common, kind: NodeKind.Box };
 }
 
+function maskOpacity(n: RawNode): number {
+  const fill = firstSolidFill(n.fills);
+  return (n.opacity ?? 1) * (fill?.opacity ?? 1);
+}
+
+async function compileChildren(
+  childRaws: RawNode[],
+  opts: CompileOptions,
+  parent: RawNode,
+  rawSubtree: boolean,
+  applyAbsolutePosition: boolean,
+): Promise<DNode[]> {
+  const children: DNode[] = [];
+  let maskOpacityMultiplier = opts.paintOpacityMultiplier ?? 1;
+  for (const childRaw of childRaws) {
+    if (childRaw.isMask) {
+      maskOpacityMultiplier *= maskOpacity(childRaw);
+      continue;
+    }
+    const childOpts =
+      maskOpacityMultiplier === (opts.paintOpacityMultiplier ?? 1)
+        ? opts
+        : { ...opts, paintOpacityMultiplier: maskOpacityMultiplier };
+    const child = await compileNode(childRaw, childOpts, parent, rawSubtree);
+    if (applyAbsolutePosition) applyAbsoluteChildPosition(child, childRaw, parent);
+    children.push(child);
+  }
+  return children;
+}
+
 function applyAbsoluteChildPosition(
   out: DNode,
   n: RawNode,
@@ -1152,13 +1231,13 @@ async function compileInstance(
   rawSubtree = false,
 ): Promise<DNode> {
   const childOpts = withInstanceOverrideFields(opts, n);
-  if (rawSubtree || opts.detachInstances) return compileContainer(n, childOpts, parent, true);
+  if (opts.detachInstances) return compileContainer(n, childOpts, parent, true);
 
   const setKey = n.mainComponent?.parentKey ?? n.mainComponent?.key;
   const entry = setKey ? opts.registry.get(setKey) : undefined;
   if (!entry) {
     if (opts.detachUnregisteredInstances && (n.children?.length ?? 0) > 0) {
-      return compileContainer(n, childOpts, parent, true);
+      return compileContainer(n, childOpts, parent, false);
     }
     throw new Error(
       `pixpec compile: encountered INSTANCE ${n.id} (${n.name}) of unregistered component ` +
@@ -1171,11 +1250,15 @@ async function compileInstance(
     n.mainComponent?.key,
     n.mainComponent?.name,
   );
-  const compiledChildren: DNode[] = [];
-  for (const c of n.children ?? [])
-    compiledChildren.push(await compileNode(c, childOpts, n));
+  const compiledChildren = await compileChildren(
+    (n.children ?? []).filter((c) => c.visible !== false && (c.isMask || !isInvisibleShape(c))),
+    childOpts,
+    n,
+    false,
+    false,
+  );
   let props: Record<string, unknown> = {};
-  const fields = fieldConsumer(compiledChildren);
+  const fields = fieldConsumer(compiledChildren, opts.remBase);
   props =
     variant?.propsFromFigma?.(
       exactComponentProps(n),
@@ -1183,7 +1266,7 @@ async function compileInstance(
       fields,
     ) ?? {};
   if (hasUnconsumedDNodeDiff(variant?.ast, compiledChildren, fields.consumed))
-    return compileContainer(n, opts, parent, true);
+    return compileContainer(n, opts, parent, false);
   const out: DInstance = {
     ...buildBase(n, opts, parent),
     kind: NodeKind.Instance,

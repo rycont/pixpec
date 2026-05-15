@@ -301,6 +301,17 @@ function sizeToPxWithTokens(
     return s.value
 }
 
+function sizeToPropMinusPx(
+    s: Size | undefined,
+    px: number,
+    remBase: number,
+): string | number | ast.Expression | undefined {
+    if (!px) return sizeToProp(s, remBase)
+    const value = sizeToPx(s)
+    if (value === undefined) return sizeToProp(s, remBase)
+    return sizeToProp({ value: Math.max(0, value - px), unit: 'px' }, remBase)
+}
+
 function colorToProp(c: Color | Value<Color> | undefined): string | undefined {
     if (c && 'kind' in c) {
         if (c.kind === 'expression') return undefined
@@ -629,6 +640,7 @@ function emitContainer(
           ? 'column'
           : 'none'
     const styles: Record<string, unknown> = {}
+    const cssBorderLayoutInsetPx = insideCssBorderLayoutInsetPx(n)
 
     if (direction !== 'none') {
         const flex = n as DFlex | DStack
@@ -667,10 +679,10 @@ function emitContainer(
 
     // padding
     if (n.padding) {
-        const pt = sizeToProp(n.padding.top, ctx.remBase)
-        const pr = sizeToProp(n.padding.right, ctx.remBase)
-        const pb = sizeToProp(n.padding.bottom, ctx.remBase)
-        const pl = sizeToProp(n.padding.left, ctx.remBase)
+        const pt = sizeToPropMinusPx(n.padding.top, cssBorderLayoutInsetPx, ctx.remBase)
+        const pr = sizeToPropMinusPx(n.padding.right, cssBorderLayoutInsetPx, ctx.remBase)
+        const pb = sizeToPropMinusPx(n.padding.bottom, cssBorderLayoutInsetPx, ctx.remBase)
+        const pl = sizeToPropMinusPx(n.padding.left, cssBorderLayoutInsetPx, ctx.remBase)
         if (pt !== undefined && pt !== 0) styles.paddingTop = pt
         if (pr !== undefined && pr !== 0) styles.paddingRight = pr
         if (pb !== undefined && pb !== 0) styles.paddingBottom = pb
@@ -842,6 +854,16 @@ function emitContainer(
     ctx.usedJsxPatterns.add(tag)
     const compact = compactPaddingStyles(styles)
     const attrs = attrsFromObject(compact)
+    if (parent.isRoot && n.renderBounds) {
+        attrs.push(
+            ...attrsFromObject({
+                'data-pixpec-render-x': n.renderBounds.x,
+                'data-pixpec-render-y': n.renderBounds.y,
+                'data-pixpec-render-width': n.renderBounds.width,
+                'data-pixpec-render-height': n.renderBounds.height,
+            }),
+        )
+    }
     const squircleRadius =
         n.cornerSmoothing &&
         n.cornerSmoothing > 0 &&
@@ -958,6 +980,19 @@ function emitContainer(
     const repeated = emitRepetitionChildren(n, ctx, childParent)
     const children = repeated ?? n.children.map((c) => emitNode(c, ctx, childParent))
     return f.createJsxElement(open, children, close)
+}
+
+function insideCssBorderLayoutInsetPx(n: DFlex | DStack | DBox): number {
+    if (!n.border || n.border.align !== StrokeAlign.Inside) return 0
+    const w = n.border.width
+    if ('top' in w) return 0
+    const wPx = sizeToPx(w)
+    if (!wPx) return 0
+    const borderPaintProp = expressionPropName(
+        n.border.paint as unknown as Value<Color>,
+    )
+    const colorStr = colorToProp(n.border.paint)
+    return borderPaintProp || colorStr?.includes('gradient(') ? wPx : 0
 }
 
 function isRenderBoundsFromAbsoluteChild(n: DFlex | DStack | DBox): boolean {
@@ -1426,6 +1461,7 @@ function emitText(n: DText, ctx: Ctx, parent: ParentCtx): ast.JsxElement {
             : undefined
     const contentLiteral = literalValue(n.content) ?? ''
     const hasExplicitLineBreak = /[\n\r\u2028\u2029]/.test(contentLiteral)
+    const contentCanContainLineBreaks = expressionPropName(n.content) !== undefined
 
     ctx.usedJsxPatterns.add('styled')
     const styles: Record<string, unknown> = {}
@@ -1457,7 +1493,8 @@ function emitText(n: DText, ctx: Ctx, parent: ParentCtx): ast.JsxElement {
         styles.minWidth = 0
     }
     if (fillCross) styles.alignSelf = 'stretch'
-    if (hasExplicitLineBreak) styles.whiteSpace = 'pre-wrap'
+    if (hasExplicitLineBreak || (contentCanContainLineBreaks && !isHug))
+        styles.whiteSpace = 'pre-wrap'
     else if (isHug) styles.whiteSpace = 'nowrap'
     const tag = () =>
         f.createPropertyAccessExpression(

@@ -274,6 +274,26 @@ export class Renderer {
             const el = document.querySelector(spec.selector);
             if (!el) return null;
             const rootRect = el.getBoundingClientRect();
+            const renderX = Number(el.getAttribute("data-pixpec-render-x"));
+            const renderY = Number(el.getAttribute("data-pixpec-render-y"));
+            const renderWidth = Number(el.getAttribute("data-pixpec-render-width"));
+            const renderHeight = Number(el.getAttribute("data-pixpec-render-height"));
+            if (
+              Number.isFinite(renderX) &&
+              Number.isFinite(renderY) &&
+              Number.isFinite(renderWidth) &&
+              Number.isFinite(renderHeight) &&
+              renderWidth > 0 &&
+              renderHeight > 0
+            ) {
+              return {
+                x: rootRect.x + renderX,
+                y: rootRect.y + renderY,
+                w: renderWidth,
+                h: renderHeight,
+                overflow: true,
+              };
+            }
             if (spec.clipToElement) {
               return {
                 x: rootRect.x,

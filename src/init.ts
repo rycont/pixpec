@@ -22,7 +22,7 @@ import { compile, loadRegistry } from "./compiler/index.ts";
 import { NodeKind, type DataScopeBinding, type DNode } from "./compiler/design-ast.ts";
 import { indexDNodeClasses, materializeDNode } from "./compiler/nodes/index.ts";
 import type { DNodeClass } from "./compiler/nodes/index.ts";
-import type { CaseRenderSpec } from "./types.ts";
+import type { CaseRenderSpec, RenderBoxSpec } from "./types.ts";
 
 export interface PixpecConfig {
   figmaFileId: string;
@@ -82,6 +82,7 @@ interface PromotedField {
   nodeId: string;
   field: string;
   valueType: string;
+  componentName?: string;
 }
 
 const STATIC_CSS_PROPERTIES = [
@@ -291,7 +292,8 @@ export async function init(opts: {
     const masterCase = makeCaseWithParser(parser, component.defs, meta.variant, `${fileKey}:${meta.variant.id}`, cfg.remBase ?? 16, true);
     const usecases = (usecasesByVariant.get(meta.variant.key ?? "") ?? []).flatMap((u) => {
       try {
-        return [makeUsecaseWithParser(parser, component.defs, u, cfg.remBase ?? 16)];
+        const usecase = makeUsecaseWithParser(parser, component.defs, meta.variant, u, cfg.remBase ?? 16);
+        return usecase ? [usecase] : [];
       } catch (e) {
         if (isFatalInitError(e)) throw e;
         console.warn(`[init] skipped usecase ${u.figmaId}: ${(e as Error).message}`);
@@ -386,9 +388,10 @@ function detectPromotions(master: DNode, usecases: UsecaseSource[], remBase: num
   const counts = new Map<string, { source: PromotedField; count: number }>();
   for (const usecase of usecases) {
     const usageNodes = indexDNodes(usecase.ir);
+    const usageNodesByBareId = indexDNodesByBareId(usecase.ir);
     const seen = new Set<string>();
     for (const [nodeId, masterNode] of masterNodes) {
-      const usageNode = usageNodes.get(nodeId);
+      const usageNode = usageNodes.get(nodeId) ?? usageNodesByBareId.get(stripPrefix(nodeId));
       if (!usageNode || usageNode.kind !== masterNode.kind) continue;
       for (const diff of masterNode.visualDiff(usageNode)) {
         const prop = promotedPropName(masterNode.sourceName ?? "node", diff.field);
@@ -396,7 +399,16 @@ function detectPromotions(master: DNode, usecases: UsecaseSource[], remBase: num
         if (seen.has(key)) continue;
         seen.add(key);
         counts.set(key, {
-          source: { prop, nodeId, field: diff.field, valueType: "string" },
+          source: {
+            prop,
+            nodeId,
+            field: diff.field,
+            valueType: "string",
+            componentName:
+              masterNode.kind === NodeKind.Instance && diff.field.startsWith("component.")
+                ? (masterNode.toJSON() as { componentName?: string }).componentName
+                : undefined,
+          },
           count: (counts.get(key)?.count ?? 0) + 1,
         });
       }
@@ -430,7 +442,8 @@ function inferPromotedValueType(
   const masterNode = indexDNodes(master).get(source.nodeId);
   if (masterNode) values.push(normalizePromotedValue(masterNode.readField(source.field), source.field, remBase));
   for (const usecase of usecases) {
-    const usageNode = indexDNodes(usecase.ir).get(source.nodeId);
+    const usageNodes = indexDNodes(usecase.ir);
+    const usageNode = usageNodes.get(source.nodeId) ?? indexDNodesByBareId(usecase.ir).get(stripPrefix(source.nodeId));
     if (usageNode) values.push(normalizePromotedValue(usageNode.readField(source.field), source.field, remBase));
   }
   const typed = values
@@ -462,6 +475,12 @@ function dataScopeAst(root: DNode, promotions: PromotedField[]): DNode {
   return bindings.length
     ? { kind: NodeKind.DataScope, bindings, child: root }
     : root;
+}
+
+function indexDNodesByBareId(root: DNode): Map<string, DNodeClass> {
+  const out = new Map<string, DNodeClass>();
+  for (const [id, node] of indexDNodes(root)) out.set(stripPrefix(id), node);
+  return out;
 }
 
 function dataScopeBindings(promotions: PromotedField[]): DataScopeBinding[] {
@@ -551,6 +570,12 @@ function emitSchema(
     const typeName = `${childName}Props`;
     imports.set(typeName, `import type { ${typeName} } from '../${childName}/schema.ts'`);
   }
+  for (const promotion of promotions) {
+    if (!promotion.componentName || !promotion.field.startsWith("component.")) continue;
+    const childName = pascalize(promotion.componentName);
+    const typeName = `${childName}Props`;
+    imports.set(typeName, `import type { ${typeName} } from '../${childName}/schema.ts'`);
+  }
   const reactNodeImport = Object.values(defs).some((d) => d.type === "INSTANCE_SWAP")
     ? "import type { ReactNode } from 'react'\n"
     : "";
@@ -558,7 +583,7 @@ function emitSchema(
     ...Object.entries(defs).map(([name, def]) => `  ${propsKey(name)}: ${zodForDef(def)},`),
     ...Object.values(exposedSlots).map((slot) => `  ${propsKey(slot.prop)}: z.custom<${pascalize(slot.componentName)}Props>().optional(),`),
   ];
-  const promotionLines = promotions.map((p) => `  ${propsKey(p.prop)}: ${zodForType(p.valueType, true)},`);
+  const promotionLines = promotions.map((p) => `  ${propsKey(p.prop)}: ${zodForPromotion(p, true)},`);
   return `import { z } from 'pixpec/spec'
 ${reactNodeImport}${[...imports.values()].join("\n")}
 import type { BoxProps, FlexProps, StackProps } from '../../../styled-system/jsx'
@@ -640,17 +665,23 @@ function makeCaseWithParser(
 function makeUsecaseWithParser(
   parser: Record<string, unknown>,
   defs: Record<string, PropDef>,
+  variant: VariantSource,
   usecase: UsecaseSource,
   remBase: number,
 ) {
   const propsFromFigma = parser.propsFromFigma;
   if (typeof propsFromFigma !== "function")
     throw new Error(`pixpec init: generated parser does not export propsFromFigma`);
+  const fields = initFieldConsumer(usecase.ir, remBase);
   const props = propsFromFigma(
     rawComponentProps(defs, usecase.raw.componentProperties),
     {},
-    initFieldConsumer(usecase.ir, remBase),
+    fields,
   ) as Record<string, unknown>;
+  if (hasUnconsumedDNodeDiff(variant.ir, usecase.ir, fields.consumed)) {
+    console.warn(`[init] detached usecase ${usecase.figmaId}: unconsumed visual override`);
+    return undefined;
+  }
   return {
     props: { ...props, ...rootSizeStyleProps(usecase.raw, remBase, true) },
     figmaId: usecase.figmaId,
@@ -805,13 +836,32 @@ function componentRefsRaw(root: RawNode): Record<string, unknown> {
 
 function initFieldConsumer(ir: DNode, remBase: number) {
   const nodes = indexDNodes(ir);
+  const nodesByBareId = indexDNodesByBareId(ir);
+  const consumed = new Set<string>();
   return {
+    consumed,
     consume(nodeId: string, field: string): unknown {
-      const node = nodes.get(stripPrefix(nodeId));
+      consumed.add(`${nodeId}\0${field}`);
+      const node = nodes.get(nodeId) ?? nodesByBareId.get(stripPrefix(nodeId));
       if (!node) return undefined;
       return normalizePromotedValue(node.readField(field), field, remBase);
     },
   };
+}
+
+function hasUnconsumedDNodeDiff(master: DNode, usage: DNode, consumedFields: Set<string>): boolean {
+  const masterNodes = indexDNodes(master);
+  const usageNodes = indexDNodes(usage);
+  const usageNodesByBareId = indexDNodesByBareId(usage);
+  for (const [nodeId, masterNode] of masterNodes) {
+    const usageNode = usageNodes.get(nodeId) ?? usageNodesByBareId.get(stripPrefix(nodeId));
+    if (!usageNode || usageNode.kind !== masterNode.kind) return true;
+    for (const diff of masterNode.visualDiff(usageNode)) {
+      if (consumedFields.has(`${nodeId}\0${diff.field}`)) continue;
+      return true;
+    }
+  }
+  return false;
 }
 
 async function importFresh(path: string): Promise<Record<string, unknown>> {
@@ -862,7 +912,20 @@ function parseRenderBox(n: RawNode): CaseRenderSpec | undefined {
   const width = n.absoluteRenderBounds?.width ?? n.width;
   const height = n.absoluteRenderBounds?.height ?? n.height;
   if (typeof width !== "number" || typeof height !== "number") return undefined;
-  return { box: { width, height } };
+  const box: RenderBoxSpec = { width, height };
+  const bb = n.absoluteBoundingBox;
+  const rb = n.absoluteRenderBounds;
+  if (bb && rb) {
+    const paddingLeft = bb.x - rb.x;
+    const paddingTop = bb.y - rb.y;
+    const paddingRight = rb.x + rb.width - (bb.x + bb.width);
+    const paddingBottom = rb.y + rb.height - (bb.y + bb.height);
+    if (Math.abs(paddingLeft) >= 0.001) box.paddingLeft = paddingLeft;
+    if (Math.abs(paddingTop) >= 0.001) box.paddingTop = paddingTop;
+    if (Math.abs(paddingRight) >= 0.001) box.paddingRight = paddingRight;
+    if (Math.abs(paddingBottom) >= 0.001) box.paddingBottom = paddingBottom;
+  }
+  return { box };
 }
 
 function rootSizeStyleProps(n: RawNode, remBase: number, standaloneInstance: boolean): Record<string, string> {
@@ -936,6 +999,15 @@ function zodForType(type: string, optional = false): string {
   if (type === "boolean") return `z.boolean()${suffix}`;
   if (type === "number") return `z.number()${suffix}`;
   throw new Error(`pixpec init: unsupported promoted value type ${type}`);
+}
+
+function zodForPromotion(promotion: PromotedField, optional = false): string {
+  if (promotion.componentName && promotion.field.startsWith("component.")) {
+    const childName = pascalize(promotion.componentName);
+    const propName = promotion.field.slice("component.".length);
+    return `z.custom<${childName}Props[${JSON.stringify(propName)}]>()${optional ? ".optional()" : ""}`;
+  }
+  return zodForType(promotion.valueType, optional);
 }
 
 function uniquePromotions(promotions: PromotedField[]): PromotedField[] {
