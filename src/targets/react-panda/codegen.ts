@@ -36,14 +36,11 @@ import type {
   Length,
   LengthValue,
   Color,
-  ColorLiteral,
-  GradientPaint,
   Paint,
   CornerRadii,
   Shadow,
   Value,
   ExpressionValue,
-  LiteralValue,
   DataScopeEntry,
 } from "../../compiler/design-ast.ts";
 import {
@@ -65,6 +62,28 @@ import type {
   CodegenResult,
   TargetComponentMeta,
 } from "../types.ts";
+import type { LowererCtx as Ctx, ParentCtx } from "./lowerer-types.ts";
+import { ROOT_PARENT } from "./lowerer-types.ts";
+import {
+  colorLiteralToCss,
+  colorToProp,
+  cssBackgroundLayer,
+  cssColorLiteral,
+  isColorLiteralObject,
+  isCornerRadii,
+  isExpressionValue,
+  isGradientPaint,
+  isLengthLiteral,
+  isLiteralValue,
+  isPerSideWidth,
+  paintLiteralToProp,
+  paintToProp,
+  px2rem,
+  shadowToCss,
+  sizeToPropLiteral,
+  sizeToPx,
+  sizeToPxWithTokens,
+} from "./data-lowerer.ts";
 
 // ---------------------------------------------------------------------------
 // AST factory helpers — same wrappers as the legacy codegen.
@@ -233,33 +252,8 @@ function deepEq(a: unknown, b: unknown): boolean {
 }
 
 // ---------------------------------------------------------------------------
-// Length / Paint → panda value.
+// Length expression → panda value.
 // ---------------------------------------------------------------------------
-
-const px2rem = (v: number, base: number): string =>
-  `${+(v / base).toFixed(6)}rem`;
-
-function isLengthLiteral(value: unknown): value is Length {
-  return (
-    !!value &&
-    typeof value === "object" &&
-    typeof (value as { value?: unknown }).value === "number" &&
-    (value as { unit?: unknown }).unit === "px"
-  );
-}
-
-function isCornerRadii(value: unknown): value is CornerRadii {
-  return !!value && typeof value === "object" && "tl" in value;
-}
-
-function isPerSideWidth(value: unknown): value is {
-  top: LengthValue;
-  right: LengthValue;
-  bottom: LengthValue;
-  left: LengthValue;
-} {
-  return !!value && typeof value === "object" && "top" in value;
-}
 
 /** Length → panda atomic-prop value. Tokens emit the dot path; literals
  *  emit a rem string (panda passes through literal CSS values). */
@@ -275,51 +269,12 @@ function sizeToProp(
   return sizeToPropLiteral(s, remBase);
 }
 
-function sizeToPropLiteral(s: Length, remBase: number): string | number {
-  if (s.value === 0) return 0;
-  return px2rem(s.value, remBase);
-}
-
-function isExpressionValue(value: unknown): value is ExpressionValue {
-  return (
-    !!value &&
-    typeof value === "object" &&
-    (value as { kind?: unknown }).kind === "expression"
-  );
-}
-
 function isExpressionNode(value: unknown): value is ast.Expression {
   return (
     !!value &&
     typeof value === "object" &&
     typeof (value as { kind?: unknown }).kind === "number"
   );
-}
-
-function isLiteralValue<T>(value: unknown): value is LiteralValue<T> {
-  return (
-    !!value &&
-    typeof value === "object" &&
-    (value as { kind?: unknown }).kind === "literal"
-  );
-}
-
-/** Numeric value (for non-px props like flex, opacity). */
-function sizeToPx(s: LengthValue | undefined): number | undefined {
-  if (!s || isExpressionValue(s) || typeof s === "string") return undefined;
-  if (isLiteralValue<Length>(s)) return s.value.value;
-  return undefined;
-}
-
-function sizeToPxWithTokens(
-  s: LengthValue | undefined,
-  tokenValues: Record<string, number>,
-): number | undefined {
-  if (!s) return undefined;
-  if (isExpressionValue(s)) return undefined;
-  if (typeof s === "string") return tokenValues[s];
-  if (isLiteralValue<Length>(s)) return s.value.value;
-  return undefined;
 }
 
 function sizeToPropMinusPx(
@@ -351,76 +306,6 @@ function isAbsoluteNode(node: DNode): boolean {
   return !!node.absolute;
 }
 
-function isColorLiteralObject(value: unknown): value is ColorLiteral {
-  return (
-    !!value &&
-    typeof value === "object" &&
-    typeof (value as { r?: unknown }).r === "number" &&
-    typeof (value as { g?: unknown }).g === "number" &&
-    typeof (value as { b?: unknown }).b === "number" &&
-    ((value as { a?: unknown }).a === undefined ||
-      typeof (value as { a?: unknown }).a === "number")
-  );
-}
-
-function colorLiteralToCss(c: ColorLiteral): string {
-  if (c.a !== undefined && c.a < 0.999) {
-    return `rgba(${c.r},${c.g},${c.b},${+c.a.toFixed(6)})`;
-  }
-  return `#${[c.r, c.g, c.b]
-    .map((v) =>
-      Math.max(0, Math.min(255, Math.round(v)))
-        .toString(16)
-        .padStart(2, "0"),
-    )
-    .join("")}`;
-}
-
-function colorToProp(c: Color | undefined): string | undefined {
-  if (c && typeof c === "object" && "kind" in c) {
-    if (c.kind === "expression") return undefined;
-    if (c.kind === "literal") return colorLiteralToCss(c.value);
-  }
-  if (!c) return undefined;
-  if (typeof c === "string") return c;
-  if (isColorLiteralObject(c)) return colorLiteralToCss(c);
-  return undefined;
-}
-
-function paintToProp(paint: Paint | undefined): string | undefined {
-  if (!paint) return undefined;
-  if (isExpressionValue(paint)) return undefined;
-  if (typeof paint === "string") return paint;
-  if (isLiteralValue<ColorLiteral | GradientPaint>(paint))
-    return paintLiteralToProp(paint.value);
-  return undefined;
-}
-
-function paintLiteralToProp(paint: ColorLiteral | GradientPaint): string | undefined {
-  if (isColorLiteralObject(paint)) return colorLiteralToCss(paint);
-  if (paint.kind === "linearGradient") {
-    const stops = paint.stops
-      .map(
-        (stop: { offset: number; color: Color }) =>
-          `${colorToProp(stop.color) ?? "transparent"} ${+(
-            stop.offset * 100
-          ).toFixed(3)}%`,
-      )
-      .join(", ");
-    return `linear-gradient(${paint.angle}deg, ${stops})`;
-  }
-  return undefined;
-}
-
-function isGradientPaint(value: unknown): value is GradientPaint {
-  return (
-    !!value &&
-    typeof value === "object" &&
-    (value as { kind?: unknown }).kind === "linearGradient" &&
-    Array.isArray((value as { stops?: unknown }).stops)
-  );
-}
-
 function componentPropToTargetValue(value: unknown, ctx: Ctx): unknown {
   if (!isLiteralValue<unknown>(value)) return value;
   const literal = value.value;
@@ -430,51 +315,10 @@ function componentPropToTargetValue(value: unknown, ctx: Ctx): unknown {
   return literal;
 }
 
-function colorToCss(c: Color | undefined): string {
-  const prop = colorToProp(c);
-  if (!prop) return "transparent";
-  if (typeof c === "string") {
-    return `var(--colors-${prop.replace(/\./g, "-")})`;
-  }
-  return prop;
-}
-
-function cssColorLiteral(value: string): string {
-  if (
-    value === "transparent" ||
-    value.startsWith("#") ||
-    value.startsWith("rgb") ||
-    value.includes("gradient(")
-  ) {
-    return value;
-  }
-  return `var(--colors-${value.replace(/\./g, "-")})`;
-}
-
-function cssBackgroundLayer(value: string): string {
-  return value.includes("gradient(")
-    ? value
-    : `linear-gradient(${value}, ${value})`;
-}
-
 function tokenCssVar(tokenPath: string, ctx: Ctx): string {
   const fallback = ctx.tokenColorMap[tokenPath];
   const name = `--colors-${tokenPath.replace(/\./g, "-")}`;
   return fallback ? `var(${name}, ${fallback})` : `var(${name})`;
-}
-
-function shadowToCss(shadow: Shadow, remBase: number): string {
-  const x = sizeToPx(shadow.x) ?? 0;
-  const y = sizeToPx(shadow.y) ?? 0;
-  const blur = sizeToPx(shadow.blur) ?? 0;
-  const spread = shadow.spread ? (sizeToPx(shadow.spread) ?? 0) : 0;
-  return [
-    px2rem(x, remBase),
-    px2rem(y, remBase),
-    px2rem(blur, remBase),
-    px2rem(spread, remBase),
-    colorToCss(shadow.color),
-  ].join(" ");
 }
 
 // ---------------------------------------------------------------------------
@@ -519,66 +363,6 @@ function compactPaddingStyles(
   }
   return out;
 }
-
-// ---------------------------------------------------------------------------
-// Codegen context.
-// ---------------------------------------------------------------------------
-
-interface Ctx {
-  remBase: number;
-  componentName: string;
-  registry: Map<string, TargetComponentMeta>;
-  tokenMap: Record<string, string>;
-  tokenValueMap: Record<string, number>;
-  tokenColorMap: Record<string, string>;
-  typographyMap: Record<string, string>;
-  plugins: CodegenPlugin[];
-  usedJsxPatterns: Set<string>; // Flex / Stack / Box / styled
-  usedTypography: Set<string>;
-  usedComponents: Set<string>;
-  usedPropBindings: Set<string>;
-  usesCss: boolean;
-  outputDir?: string;
-  rootDir?: string;
-  componentsDir?: string;
-  propsFile?: string;
-  viewConfig: NonNullable<CodegenContext["viewConfig"]>;
-  repetitionComponents: Array<{
-    name: string;
-    props: Record<string, unknown[]>;
-    jsx: ast.JsxChild;
-  }>;
-  repetitionMarkers: Map<string, string>;
-  repetitionCounter: number;
-  /** Target asset sidecars plus the import alias the generated JSX references. */
-  svgSidecars: Map<
-    string,
-    { alias: string; content: string; importPath: string }
-  >;
-  imageSidecars: Map<string, { content: Uint8Array }>;
-  assetUrls: Map<string, string>;
-  squircleHooks: Array<{ id: number; radiusPx: number; smoothing: number }>;
-  /** When true, the generated FC inlines an SVG filter `<defs>` and the
-   *  inner Svg conditionally applies `filter: url(#tint_<id>)` when the
-   *  caller passes a `color` CSS prop. Implements the "monochrome tint
-   *  override" pattern (e.g. Logo rendered all-gray). */
-  usesTinting: boolean;
-  /** Stable filter id used inside the FC. Derived from sourceId so it
-   *  doesn't collide across mounted components. */
-  tintFilterId: string;
-}
-
-interface ParentCtx {
-  dir: "row" | "column" | "none";
-  mainSizing: Sizing;
-  isRoot?: boolean;
-}
-
-const ROOT_PARENT: ParentCtx = {
-  dir: "none",
-  mainSizing: Sizing.Fixed,
-  isRoot: true,
-};
 
 // ---------------------------------------------------------------------------
 // Per-node emit functions.
