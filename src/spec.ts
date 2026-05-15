@@ -16,3 +16,14 @@ export type {
   CaseRenderSpec,
   RenderBoxSpec,
 } from "./types.ts";
+export type {
+  Value,
+  Length,
+  LengthValue,
+  Color,
+  ColorLiteral,
+  Paint,
+  Shadow,
+  TextStyle,
+  TextStyleValue,
+} from "./compiler/design-ast.ts";

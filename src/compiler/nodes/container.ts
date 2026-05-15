@@ -34,8 +34,8 @@ abstract class DContainerNode<T extends DFlex | DStack | DBox> extends DNodeClas
     if (this.node.padding) fields.push("padding");
     if ("gap" in this.node && this.node.gap) fields.push("gap");
     if ("counterGap" in this.node && this.node.counterGap) fields.push("counterGap");
-    if (this.node.sizing?.horizontal === Sizing.Fixed && this.node.width) fields.push("width");
-    if (this.node.sizing?.vertical === Sizing.Fixed && this.node.height) fields.push("height");
+    if (this.node.width && this.node.width !== Sizing.Fill && this.node.width !== Sizing.Hug) fields.push("width");
+    if (this.node.height && this.node.height !== Sizing.Fill && this.node.height !== Sizing.Hug) fields.push("height");
     return fields;
   }
 }

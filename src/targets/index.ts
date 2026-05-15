@@ -2,7 +2,6 @@
 
 import type { CompileTarget } from './types.ts'
 import { reactPandaTarget } from './react-panda/index.ts'
-import { gpuiTarget } from './gpui/index.ts'
 
 export type {
   CompileTarget,
@@ -17,7 +16,6 @@ export type {
 
 const REGISTRY: Record<string, CompileTarget> = {
   [reactPandaTarget.name]: reactPandaTarget,
-  [gpuiTarget.name]: gpuiTarget,
 }
 
 export function getTarget(name: string): CompileTarget {

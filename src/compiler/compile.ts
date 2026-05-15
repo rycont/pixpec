@@ -11,10 +11,9 @@
  * applies the verdict per INSTANCE.
  *
  * Token resolution: every numeric/color property that figma binds to a
- * variable becomes either a `{ tokenPath }` (when the bound variable's
- * intrinsic value matches the node's effective value) or a literal
- * `{ value, unit: 'px' }` / `{ color, opacity? }`. The picker lives in the
- * `pickSize` / `pickColor` helpers below.
+ * variable becomes the token path string when the bound variable's intrinsic
+ * value matches the node's effective value. Anything else becomes a flat
+ * literal, for example `{ kind: "literal", value: 12, unit: "px" }`.
  */
 
 import type {
@@ -33,10 +32,14 @@ import type {
   DNodeBase,
   Padding,
   CornerRadii,
-  Size,
+  LengthValue,
   Color,
+  ColorLiteral,
+  Paint,
   Shadow,
   Value,
+  AxisSize,
+  TextStyleValue,
 } from "./design-ast.ts";
 import {
   NodeKind,
@@ -102,6 +105,8 @@ export interface CompileOptions {
    * descendant node id. Used to represent SVG paint overrides without
    * treating the SVG's baked-in original fill as a DVector override. */
   overrideFields?: Map<string, Set<string>>;
+  /** Figma textStyleId → human-readable design token name. */
+  typographyMap?: Record<string, string>;
   remBase?: number;
   paintOpacityMultiplier?: number;
 }
@@ -202,6 +207,25 @@ function rgbaHex(c: { r: number; g: number; b: number }, opacity = 1): string {
   return `rgba(${r},${g},${b},${opacity.toFixed(3)})`;
 }
 
+function colorLiteral(
+  c: { r: number; g: number; b: number },
+  opacity = 1,
+): Color {
+  const value: ColorLiteral = {
+    r: Math.round(c.r * 255),
+    g: Math.round(c.g * 255),
+    b: Math.round(c.b * 255),
+  };
+  const a = normalizeNumber(opacity);
+  if (a < 0.999) value.a = a;
+  return literalValue(value);
+}
+
+function normalizeNumber(value: number, precision = 3): number {
+  const normalized = +value.toFixed(precision);
+  return Object.is(normalized, -0) ? 0 : normalized;
+}
+
 function firstSolidFill(fills?: RawNode["fills"]): RawSolidPaint | null {
   if (!Array.isArray(fills)) return null;
   for (const f of fills) {
@@ -269,8 +293,8 @@ function justifyFromRaw(
 // Size / Color picker — token-vs-literal discrimination.
 // ---------------------------------------------------------------------------
 
-function px(n: number): Size {
-  return { value: n, unit: "px" };
+function px(n: number): LengthValue {
+  return { kind: "literal", value: { value: normalizeNumber(n), unit: "px" } };
 }
 
 function pxToRem(n: number, remBase: number): string {
@@ -353,13 +377,13 @@ function pickSize(
   actual: number | undefined,
   varId: string | undefined,
   opts: CompileOptions,
-): Size | undefined {
+): LengthValue | undefined {
   if (actual === undefined) return undefined;
   const tokenPath = lookupTokenPath(varId, opts.tokenMap);
   if (tokenPath) {
     const intrinsic = lookupTokenNumber(varId, opts.tokenValueMap);
     if (typeof intrinsic === "number" && Math.abs(intrinsic - actual) < 1e-3) {
-      return { tokenPath };
+      return tokenPath;
     }
   }
   return px(actual);
@@ -367,7 +391,7 @@ function pickSize(
 
 /** Pick a `Color` value: token path when bound (color tokens don't get
  *  scaled the way numerics do, so binding implies the resolved color
- *  matches the token's intrinsic). Otherwise the literal hex/rgba. */
+ *  matches the token's intrinsic). Otherwise the raw structured color. */
 function pickColor(
   paint: RawSolidPaint | null | undefined,
   varId: string | undefined,
@@ -379,27 +403,27 @@ function pickColor(
   if (tokenPath) {
     const intrinsic = lookupTokenColor(varId, opts.tokenColorMap);
     const actual = rgbaHex(paint.color, opacity);
-    if (intrinsic && colorsEquivalent(intrinsic, actual)) return { tokenPath };
+    if (intrinsic && colorsEquivalent(intrinsic, actual)) return tokenPath;
   }
-  if (opacity < 0.999) {
-    return { color: rgbaHex(paint.color, opacity) };
-  }
-  return { color: rgbaHex(paint.color, opacity) };
+  return colorLiteral(paint.color, opacity);
 }
 
-function gradientPaintToColor(paint: RawGradientPaint | null | undefined): Color | undefined {
+function gradientPaintToPaint(paint: RawGradientPaint | null | undefined): Paint | undefined {
   if (!paint?.gradientStops?.length) return undefined;
   const angle = gradientCssAngle(paint);
-  const stops = [...paint.gradientStops]
-    .sort((a, b) => a.position - b.position)
-    .map((stop) => {
-      const color = rgbaHex(
-        { r: stop.color.r, g: stop.color.g, b: stop.color.b },
-        (stop.color.a ?? 1) * (paint.opacity ?? 1),
-      );
-      return `${color} ${+(stop.position * 100).toFixed(3)}%`;
-    });
-  return { color: `linear-gradient(${angle}deg, ${stops.join(", ")})` };
+  return literalValue({
+    kind: "linearGradient",
+    angle,
+    stops: [...paint.gradientStops]
+      .sort((a, b) => a.position - b.position)
+      .map((stop) => ({
+        offset: +stop.position.toFixed(4),
+        color: colorLiteral(
+          { r: stop.color.r, g: stop.color.g, b: stop.color.b },
+          (stop.color.a ?? 1) * (paint.opacity ?? 1),
+        ),
+      })),
+  });
 }
 
 function gradientCssAngle(paint: RawGradientPaint): number {
@@ -413,13 +437,13 @@ function gradientCssAngle(paint: RawGradientPaint): number {
   return +(((deg % 360) + 360) % 360).toFixed(3);
 }
 
-function pickPaintColor(
+function pickPaint(
   solid: RawSolidPaint | null | undefined,
   gradient: RawGradientPaint | null | undefined,
   varId: string | undefined,
   opts: CompileOptions,
-): Color | undefined {
-  return pickColor(solid, varId, opts) ?? gradientPaintToColor(gradient);
+): Paint | undefined {
+  return pickColor(solid, varId, opts) ?? gradientPaintToPaint(gradient);
 }
 
 function colorsEquivalent(a: string, b: string): boolean {
@@ -465,12 +489,7 @@ function shadowFromRaw(n: RawNode): Shadow | undefined {
     y: px(effect.offset?.y ?? 0),
     blur: px(effect.radius ?? 0),
     spread: effect.spread ? px(effect.spread) : undefined,
-    color: {
-      color: rgbaHex(
-        effect.color,
-        typeof effect.color.a === "number" ? effect.color.a : 1,
-      ),
-    },
+    color: colorLiteral(effect.color, typeof effect.color.a === "number" ? effect.color.a : 1),
   };
 }
 
@@ -504,48 +523,33 @@ function buildBase(
   if (typeof n.rotation === "number" && Math.abs(n.rotation) >= 0.01)
     out.rotation = n.rotation;
   if (parent && n.layoutPositioning === "ABSOLUTE") {
-    out.positioning = Positioning.Absolute;
-    out.inset = { left: n.x ?? 0, top: n.y ?? 0 };
+    out.absolute = { inset: { left: px(n.x ?? 0), top: px(n.y ?? 0) } };
     if (
       parent &&
       typeof parent.width === "number" &&
       typeof n.width === "number"
     ) {
-      out.inset.right = parent.width - (n.x ?? 0) - n.width;
+      out.absolute.inset!.right = px(parent.width - (n.x ?? 0) - n.width);
     }
     if (
       parent &&
       typeof parent.height === "number" &&
       typeof n.height === "number"
     ) {
-      out.inset.bottom = parent.height - (n.y ?? 0) - n.height;
+      out.absolute.inset!.bottom = px(parent.height - (n.y ?? 0) - n.height);
     }
     if (n.constraints) {
       const h = anchorFromConstraint(n.constraints.horizontal);
       const v = anchorFromConstraint(n.constraints.vertical);
-      if (h || v) out.anchor = { horizontal: h, vertical: v };
+      if (h || v) out.absolute.anchor = { horizontal: h, vertical: v };
     }
-  }
-  if (
-    typeof n.layoutSizingHorizontal === "string" ||
-    typeof n.layoutSizingVertical === "string"
-  ) {
-    const swapAxes = isOrthogonalSwapRotation(n);
-    out.sizing = {
-      horizontal: sizingFromRaw(
-        swapAxes ? n.layoutSizingVertical : n.layoutSizingHorizontal,
-      ),
-      vertical: sizingFromRaw(
-        swapAxes ? n.layoutSizingHorizontal : n.layoutSizingVertical,
-      ),
-    };
   }
   out.renderBoundsOffset = renderBoundsOffsetFromRaw(n);
   return out;
 }
 
 function literalValue<T>(value: T): Value<T> {
-  return { kind: "literal", source: "raw", value };
+  return { kind: "literal", value };
 }
 
 function propValue(name: string): Value<never> {
@@ -554,6 +558,37 @@ function propValue(name: string): Value<never> {
 
 function publicComponentPropName(rawKey: string): string {
   return String(rawKey).replace(/#[^#]*$/, "").replace(/\s+/g, "");
+}
+
+function axisSize(n: RawNode, axis: "horizontal" | "vertical", opts: CompileOptions): AxisSize | undefined {
+  const rawSizing = axis === "horizontal" ? n.layoutSizingHorizontal : n.layoutSizingVertical;
+  const sizing = sizingFromRaw(rawSizing);
+  if (sizing === Sizing.Fill) return Sizing.Fill;
+  if (sizing === Sizing.Hug) return Sizing.Hug;
+  const value = axis === "horizontal" ? nodeWidth(n) : nodeHeight(n);
+  const variable = axis === "horizontal" ? nodeWidthVar(n) : nodeHeightVar(n);
+  return pickSize(value, variable, opts);
+}
+
+function fixedSize(n: RawNode, axis: "horizontal" | "vertical", opts: CompileOptions): LengthValue | undefined {
+  const value = axis === "horizontal" ? nodeWidth(n) : nodeHeight(n);
+  const variable = axis === "horizontal" ? nodeWidthVar(n) : nodeHeightVar(n);
+  return pickSize(value, variable, opts);
+}
+
+function nonZeroSize(size: LengthValue | undefined): LengthValue | undefined {
+  if (!size) return undefined;
+  if (typeof size !== "string" && size.kind === "literal" && Math.abs(size.value.value) < 0.001) return undefined;
+  return size;
+}
+
+function textStyleName(id: string | undefined, opts: CompileOptions): string | undefined {
+  if (!id) return undefined;
+  const map = opts.typographyMap;
+  if (!map) return undefined;
+  const exact = map[id];
+  if (exact) return exact;
+  return Object.entries(map).find(([key]) => key.startsWith(id))?.[1];
 }
 
 function directPaintBinding(n: RawNode, opts: CompileOptions): string | undefined {
@@ -632,17 +667,12 @@ function fieldConsumer(compiledChildren: DNode[], remBase = 16) {
       consumed.add(`${nodeId}\0${field}`);
       const node = byId.get(nodeId) ?? byBareId.get(stripPrefix(nodeId));
       if (!node) return undefined;
-      return normalizeConsumedField(node.readField(field), field, remBase);
+      return normalizeConsumedField(node.readField(field));
     },
   };
 }
 
-function normalizeConsumedField(value: unknown, field: string, remBase: number): unknown {
-  if ((field === "width" || field === "height") && value && typeof value === "object") {
-    const record = value as Record<string, unknown>;
-    if (typeof record.value === "number" && record.unit === "px") return pxToRem(record.value, remBase);
-    if (typeof record.tokenPath === "string") return record.tokenPath;
-  }
+function normalizeConsumedField(value: unknown): unknown {
   return normalizePropValue(value);
 }
 
@@ -650,14 +680,7 @@ function normalizePropValue(value: unknown): unknown {
   if (!value || typeof value !== "object") return value;
   if (Array.isArray(value)) return value.map(normalizePropValue);
   const record = value as Record<string, unknown>;
-  if (record.kind === "literal") {
-    if (record.source === "raw") return normalizePropValue(record.value);
-    if (record.source === "token") return record.path;
-  }
   if (record.kind === "expression") return undefined;
-  if (typeof record.tokenPath === "string") return record.tokenPath;
-  if (typeof record.color === "string") return record.color;
-  if (typeof record.value === "number" && record.unit === "px") return record.value;
   return value;
 }
 
@@ -707,14 +730,14 @@ function withInstanceOverrideFields(opts: CompileOptions, n: RawNode): CompileOp
   return { ...opts, overrideFields };
 }
 
-function renderBoundsOffsetFromRaw(n: RawNode): { x: number; y: number } | undefined {
+function renderBoundsOffsetFromRaw(n: RawNode): { x: LengthValue; y: LengthValue } | undefined {
   const bb = n.absoluteBoundingBox;
   const rb = n.absoluteRenderBounds;
   if (!bb || !rb) return undefined;
   const x = rb.x - bb.x;
   const y = rb.y - bb.y;
   if (Math.abs(x) < 0.001 && Math.abs(y) < 0.001) return undefined;
-  return { x, y };
+  return { x: px(x), y: px(y) };
 }
 
 function compileText(
@@ -727,7 +750,7 @@ function compileText(
   // Figma binds text-level fills via boundVariables.fills (may be array)
   // OR per-paint boundVariables.color on the SOLID paint itself.
   const colorVarId = varId(fill?.boundVariables, "color") ?? varId(bv, "fills");
-  const color = pickColor(fill, colorVarId, opts) ?? { color: "#000000" };
+  const color = pickColor(fill, colorVarId, opts) ?? literalValue({ r: 0, g: 0, b: 0 });
   const fontSize = pickSize(n.fontSize, varId(bv, "fontSize"), opts) ?? px(16);
   const lhRaw =
     n.lineHeight && n.lineHeight.unit === "PIXELS"
@@ -761,9 +784,19 @@ function compileText(
       ? TextAutoResize.Hug
       : n.textAutoResize === "HEIGHT"
         ? TextAutoResize.FixedWidth
-        : n.textAutoResize === "TRUNCATE"
-          ? TextAutoResize.Truncate
-          : TextAutoResize.FixedBoth;
+      : n.textAutoResize === "TRUNCATE"
+        ? TextAutoResize.Truncate
+        : TextAutoResize.FixedBoth;
+  const baseStyle: TextStyleValue | undefined = n.componentPropertyReferences?.textStyleId
+    ? propValue(publicComponentPropName(n.componentPropertyReferences.textStyleId))
+    : textStyleName(n.textStyleId, opts);
+  const textStyle: TextStyleValue = baseStyle ?? literalValue({
+    fontFamily: n.fontName?.family,
+    fontWeight: n.fontWeight,
+    fontSize,
+    lineHeight,
+    paragraphSpacing,
+  });
   const runs: DTextRun[] | undefined = n.styledTextSegments?.map(
     (seg: RawTextRun) => {
       const segFill = firstSolidFill(seg.fills);
@@ -794,20 +827,11 @@ function compileText(
     content: n.componentPropertyReferences?.characters
       ? propValue(publicComponentPropName(n.componentPropertyReferences.characters))
       : literalValue(sanitizeTextContent(n.characters ?? "")),
-    fontFamily: n.fontName?.family,
-    fontWeight: n.fontWeight,
-    fontSize,
-    lineHeight,
-    paragraphSpacing,
-    color: literalValue(color),
+    textStyle,
+    color,
     textDecoration: decoration,
     textAlign: align,
-    textStyleRef: n.componentPropertyReferences?.textStyleId
-      ? propValue(publicComponentPropName(n.componentPropertyReferences.textStyleId))
-      : n.textStyleId
-        ? literalValue(n.textStyleId)
-        : undefined,
-    width: n.width ?? 0,
+    width: axisSize(n, "horizontal", opts) ?? px(n.width ?? 0),
     autoResize,
     runs,
   };
@@ -829,9 +853,8 @@ async function compileShape(
     return {
       ...buildBase(n, opts, parent),
       kind: NodeKind.Image,
-      width: pickSize(nodeWidth(n), nodeWidthVar(n), opts) ?? px(0),
-      height:
-        pickSize(nodeHeight(n), nodeHeightVar(n), opts) ?? px(0),
+      width: fixedSize(n, "horizontal", opts) ?? px(0),
+      height: fixedSize(n, "vertical", opts) ?? px(0),
       dataUrl: imageFill.dataUrl,
       renderedDataUrl: n.renderedDataUrl,
       imageScaleMode: imageFill.scaleMode,
@@ -839,6 +862,7 @@ async function compileShape(
     };
   }
   const fill = firstSolidFill(n.fills);
+  const gradientFill = firstGradientFill(n.fills);
   const stroke = firstSolidFill(n.strokes);
   const gradientStroke = firstGradientFill(n.strokes);
   const fillVarId = varId(fill?.boundVariables, "color");
@@ -862,14 +886,14 @@ async function compileShape(
             : n.type === "POLYGON"
               ? ShapeKind.Polygon
               : ShapeKind.Star,
-    width: pickSize(nodeWidth(n), nodeWidthVar(n), opts) ?? px(0),
-    height:
-      pickSize(nodeHeight(n), nodeHeightVar(n), opts) ?? px(0),
-    fill: pickColor(fill, fillVarId, opts),
+    width: fixedSize(n, "horizontal", opts) ?? px(0),
+    height: fixedSize(n, "vertical", opts) ?? px(0),
+    fill: pickPaint(fill, gradientFill, fillVarId, opts),
     stroke: stroke || gradientStroke
       ? {
-          paint: pickPaintColor(stroke, gradientStroke, strokeVarId, opts) ?? {
-            color: "#000000",
+          paint: pickPaint(stroke, gradientStroke, strokeVarId, opts) ?? {
+            kind: "literal",
+            value: { r: 0, g: 0, b: 0 },
           },
           width:
             strokeWidth ??
@@ -898,7 +922,7 @@ async function compileShape(
 function cornerFromRaw(
   n: RawNode,
   opts: CompileOptions,
-): Size | CornerRadii | undefined {
+): LengthValue | CornerRadii | undefined {
   if (typeof n.cornerRadius === "number") {
     return pickSize(
       n.cornerRadius || undefined,
@@ -960,7 +984,7 @@ function overriddenField(n: RawNode, opts: CompileOptions, field: string): boole
 function solidFillOverride(n: RawNode, opts: CompileOptions): Color {
   const visible = (n.fills ?? []).filter((paint) => paint.visible !== false);
   if (visible.length === 0) {
-    return { color: "transparent" };
+    return literalValue({ r: 0, g: 0, b: 0, a: 0 });
   }
   if (visible.length !== 1 || visible[0]?.type !== "SOLID") {
     throw new Error(
@@ -1002,7 +1026,7 @@ async function compileVector(
       fill: fillProp
         ? { kind: "expression", type: "prop", name: fillProp }
         : fillOverride
-          ? literalValue(fillOverride)
+          ? fillOverride
           : undefined,
       svg,
       renderBoundsOffset: renderBoundsOffsetFromRaw(n),
@@ -1029,6 +1053,7 @@ async function compileContainer(
         ? "column"
         : "none";
   const fill = firstSolidFill(n.fills);
+  const gradientFill = firstGradientFill(n.fills);
   const stroke = firstSolidFill(n.strokes);
   const gradientStroke = firstGradientFill(n.strokes);
   const childRaws = (n.children ?? []).filter(
@@ -1043,10 +1068,11 @@ async function compileContainer(
     varId(n.boundVariables, "strokeWeight"),
     opts,
   );
+  const background = pickPaint(fill, gradientFill, bgVarId, opts);
   const common = {
     ...buildBase(n, opts, parent),
-    width: pickSize(nodeWidth(n), nodeWidthVar(n), opts),
-    height: pickSize(nodeHeight(n), nodeHeightVar(n), opts),
+    width: axisSize(n, "horizontal", opts),
+    height: axisSize(n, "vertical", opts),
     minWidth: pickSize(n.minWidth, varId(n.boundVariables, "minWidth"), opts),
     maxWidth: pickSize(n.maxWidth, varId(n.boundVariables, "maxWidth"), opts),
     minHeight: pickSize(
@@ -1060,13 +1086,12 @@ async function compileContainer(
       opts,
     ),
     padding: paddingFromRaw(n, opts),
-    background: pickColor(fill, bgVarId, opts)
-      ? literalValue(pickColor(fill, bgVarId, opts)!)
-      : undefined,
+    background,
     border: stroke || gradientStroke
       ? {
-          paint: pickPaintColor(stroke, gradientStroke, strokeVarId, opts) ?? {
-            color: "#000000",
+          paint: pickPaint(stroke, gradientStroke, strokeVarId, opts) ?? {
+            kind: "literal",
+            value: { r: 0, g: 0, b: 0 },
           },
           width:
             (n.strokeWeight as unknown) === "mixed"
@@ -1092,8 +1117,8 @@ async function compileContainer(
       : undefined,
     shadow: shadowFromRaw(n),
     cornerRadius: cornerFromRaw(n, opts),
-    cornerSmoothing: n.cornerSmoothing,
-    clip: n.clipsContent,
+    cornerSmoothing: typeof n.cornerSmoothing === "number" ? normalizeNumber(n.cornerSmoothing) : undefined,
+    clip: n.clipsContent ? true : undefined,
     children,
   };
   if (direction === "row") {
@@ -1101,19 +1126,13 @@ async function compileContainer(
       ...common,
       kind: NodeKind.Flex,
       direction: FlowDirection.Row,
-      gap: pickSize(
-        n.itemSpacing,
-        varId(n.boundVariables, "itemSpacing"),
-        opts,
-      ),
-      counterGap: pickSize(
-        n.counterAxisSpacing,
-        varId(n.boundVariables, "counterAxisSpacing"),
-        opts,
-      ),
+      gap: nonZeroSize(pickSize(n.itemSpacing, varId(n.boundVariables, "itemSpacing"), opts)),
+      counterGap: n.layoutWrap === "WRAP"
+        ? nonZeroSize(pickSize(n.counterAxisSpacing, varId(n.boundVariables, "counterAxisSpacing"), opts))
+        : undefined,
       align: alignFromRaw(n.counterAxisAlignItems),
       justify: justifyFromRaw(n.primaryAxisAlignItems),
-      wrap: n.layoutWrap === "WRAP",
+      wrap: n.layoutWrap === "WRAP" ? true : undefined,
     };
   }
   if (direction === "column") {
@@ -1121,19 +1140,13 @@ async function compileContainer(
       ...common,
       kind: NodeKind.Stack,
       direction: FlowDirection.Column,
-      gap: pickSize(
-        n.itemSpacing,
-        varId(n.boundVariables, "itemSpacing"),
-        opts,
-      ),
-      counterGap: pickSize(
-        n.counterAxisSpacing,
-        varId(n.boundVariables, "counterAxisSpacing"),
-        opts,
-      ),
+      gap: nonZeroSize(pickSize(n.itemSpacing, varId(n.boundVariables, "itemSpacing"), opts)),
+      counterGap: n.layoutWrap === "WRAP"
+        ? nonZeroSize(pickSize(n.counterAxisSpacing, varId(n.boundVariables, "counterAxisSpacing"), opts))
+        : undefined,
       align: alignFromRaw(n.counterAxisAlignItems),
       justify: justifyFromRaw(n.primaryAxisAlignItems),
-      wrap: n.layoutWrap === "WRAP",
+      wrap: n.layoutWrap === "WRAP" ? true : undefined,
     };
   }
   return { ...common, kind: NodeKind.Box };
@@ -1174,8 +1187,7 @@ function applyAbsoluteChildPosition(
   n: RawNode,
   parent: RawNode,
 ): void {
-  if (out.positioning === Positioning.Absolute) return;
-  out.positioning = Positioning.Absolute;
+  if (out.absolute) return;
   const left =
     typeof n.absoluteBoundingBox?.x === "number" &&
     typeof parent.absoluteBoundingBox?.x === "number"
@@ -1186,23 +1198,23 @@ function applyAbsoluteChildPosition(
     typeof parent.absoluteBoundingBox?.y === "number"
       ? n.absoluteBoundingBox.y - parent.absoluteBoundingBox.y
       : (n.y ?? 0);
-  out.inset = { left, top };
+  out.absolute = { inset: { left: px(left), top: px(top) } };
   if (
     typeof parent.width === "number" &&
     typeof n.width === "number"
   ) {
-    out.inset.right = parent.width - left - n.width;
+    out.absolute.inset!.right = px(parent.width - left - n.width);
   }
   if (
     typeof parent.height === "number" &&
     typeof n.height === "number"
   ) {
-    out.inset.bottom = parent.height - top - n.height;
+    out.absolute.inset!.bottom = px(parent.height - top - n.height);
   }
   if (n.constraints) {
     const h = anchorFromConstraint(n.constraints.horizontal);
     const v = anchorFromConstraint(n.constraints.vertical);
-    if (h || v) out.anchor = { horizontal: h, vertical: v };
+    if (h || v) out.absolute.anchor = { horizontal: h, vertical: v };
   }
 }
 
@@ -1254,8 +1266,8 @@ async function compileInstance(
     kind: NodeKind.Instance,
     componentName: entry.componentName,
     props,
-    width: pickSize(nodeWidth(n), nodeWidthVar(n), opts),
-    height: pickSize(nodeHeight(n), nodeHeightVar(n), opts),
+    width: axisSize(n, "horizontal", opts),
+    height: axisSize(n, "vertical", opts),
   };
   const layoutOverrides: NonNullable<DInstance["layoutOverrides"]> = {};
   let any = false;
@@ -1294,8 +1306,8 @@ function compileUnknown(
     ...buildBase(n, opts, parent),
     kind: NodeKind.Unknown,
     sourceType: n.type,
-    width: pickSize(nodeWidth(n), undefined, opts) ?? px(0),
-    height: pickSize(nodeHeight(n), undefined, opts) ?? px(0),
+    width: fixedSize(n, "horizontal", opts) ?? px(0),
+    height: fixedSize(n, "vertical", opts) ?? px(0),
   };
 }
 

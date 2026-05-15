@@ -21,13 +21,29 @@ export type DNode =
   | DInstance
   | DUnknown;
 
-export type LiteralValue<T> =
-  | { kind: "literal"; source: "raw"; value: T }
-  | { kind: "literal"; source: "token"; path: string };
+export type TokenRef = string;
+
+export type LiteralValue<T = unknown> = {
+  kind: "literal";
+  value: T;
+};
 
 export type ExpressionValue = { kind: "expression"; type: "prop"; name: string };
 
-export type Value<T> = LiteralValue<T> | ExpressionValue;
+export type ScalarValue<T> = TokenRef | LiteralValue<T> | ExpressionValue;
+
+export type AggregateValue<T extends object> =
+  | TokenRef
+  | LiteralValue<T>
+  | ({ base: TokenRef } & Partial<T>)
+  | ExpressionValue;
+
+export type Value<T> = ScalarValue<T>;
+
+export interface DataScopeEntry {
+  type: string;
+  default?: unknown;
+}
 
 /** Sizing semantic shared with auto-layout systems. */
 export enum Sizing {
@@ -35,6 +51,8 @@ export enum Sizing {
   Hug = "hug",
   Fill = "fill",
 }
+
+export type AxisSize = LengthValue | Sizing.Hug | Sizing.Fill;
 
 /** Anchor for absolutely-positioned children — controls how the child is
  *  pinned/stretched relative to its positioned ancestor. */
@@ -137,56 +155,78 @@ export enum NodeKind {
  * node; it scopes prop expressions into its child and emits the child directly. */
 export interface DDataScope extends DNodeBase {
   kind: NodeKind.DataScope;
+  data: Record<string, DataScopeEntry>;
   child: DNode;
 }
 
-/**
- * Size value — either a literal number with a unit (figma's design-px today;
- * future emitters may extend the unit set) or a design-token reference.
- *
- * Compiler picks `tokenPath` when the property is bound to a figma variable
- * AND the resolved intrinsic value matches the node's effective value.
- * Anything else (no binding, or scaled instance whose value drifted off the
- * token's intrinsic) falls back to the raw literal — that way emitters
- * always render the figma-authoritative pixel result.
- */
-export type Size = { value: number; unit: "px" } | { tokenPath: string };
+export interface Length {
+  value: number;
+  unit: "px";
+}
 
-/**
- * Color value — same dichotomy as `Size`. Tokens carry color names like
- * `content.standard.primary`; literals carry resolved hex/rgba.
- */
-export type Color =
-  | { color: string; opacity?: number }
-  | { tokenPath: string; opacity?: number };
+export type LengthValue = ScalarValue<Length>;
+
+export type ColorLiteral = {
+  r: number;
+  g: number;
+  b: number;
+  a?: number;
+};
+
+export type Color = ScalarValue<ColorLiteral>;
+
+export type GradientPaint = {
+  kind: "linearGradient";
+  angle: number;
+  stops: Array<{ offset: number; color: Color }>;
+};
+
+export type Paint = ScalarValue<ColorLiteral | GradientPaint>;
 
 export interface Padding {
-  top: Size;
-  right: Size;
-  bottom: Size;
-  left: Size;
+  top: LengthValue;
+  right: LengthValue;
+  bottom: LengthValue;
+  left: LengthValue;
 }
 
 export interface CornerRadii {
-  tl: Size;
-  tr: Size;
-  br: Size;
-  bl: Size;
+  tl: LengthValue;
+  tr: LengthValue;
+  br: LengthValue;
+  bl: LengthValue;
 }
 
 export interface Border {
-  paint: Color;
-  width: Size | { top: Size; right: Size; bottom: Size; left: Size };
+  paint: Paint;
+  width: LengthValue | { top: LengthValue; right: LengthValue; bottom: LengthValue; left: LengthValue };
   align?: StrokeAlign;
 }
 
 export interface Shadow {
-  x: Size;
-  y: Size;
-  blur: Size;
-  spread?: Size;
+  x: LengthValue;
+  y: LengthValue;
+  blur: LengthValue;
+  spread?: LengthValue;
   color: Color;
 }
+
+export interface AbsoluteLayout {
+  inset?: { left?: LengthValue; top?: LengthValue; right?: LengthValue; bottom?: LengthValue };
+  anchor?: { horizontal?: Anchor; vertical?: Anchor };
+}
+
+export type TextStyleName = TokenRef | ExpressionValue;
+
+export interface TextStyle {
+  fontFamily?: string;
+  fontWeight?: number;
+  fontSize?: LengthValue;
+  lineHeight?: LengthValue;
+  paragraphSpacing?: LengthValue;
+}
+
+export type TextStyleValue = AggregateValue<TextStyle>;
 
 /** Shared base — every AST node may carry source trace metadata, optional
  *  opacity/rotation, and may be positioned in absolute (overlay) mode. */
@@ -199,18 +239,10 @@ export interface DNodeBase {
   opacity?: number;
   /** Rotation in degrees CCW. */
   rotation?: number;
-  /** Positioning mode against the parent. */
-  positioning?: Positioning;
-  /** Distance from the positioned ancestor's edges, in design units.
-   *  Only meaningful when positioning === 'absolute'. */
-  inset?: { left?: number; top?: number; right?: number; bottom?: number };
-  /** Per-axis anchoring when positioning='absolute'. 'stretch' = pin both
-   *  edges (the underline-spans-tab-width pattern). */
-  anchor?: { horizontal?: Anchor; vertical?: Anchor };
-  /** Sibling sizing inside the parent container. */
-  sizing?: { horizontal?: Sizing; vertical?: Sizing };
+  /** Absolute positioning metadata. Omitted for ordinary flow children. */
+  absolute?: AbsoluteLayout;
   /** Offset from the node's design box to the exported render bounds. */
-  renderBoundsOffset?: { x: number; y: number };
+  renderBoundsOffset?: { x: LengthValue; y: LengthValue };
   /** Node visibility. When expression-valued, an owner component prop gates
    * this node without a parallel binding field. */
   visible?: Value<boolean>;
@@ -221,23 +253,23 @@ export interface DNodeBase {
 export interface DFlex extends DNodeBase {
   kind: NodeKind.Flex;
   direction: FlowDirection.Row;
-  width?: Size | ExpressionValue;
-  height?: Size | ExpressionValue;
-  minWidth?: Size;
-  maxWidth?: Size;
-  minHeight?: Size;
-  maxHeight?: Size;
+  width?: AxisSize;
+  height?: AxisSize;
+  minWidth?: LengthValue;
+  maxWidth?: LengthValue;
+  minHeight?: LengthValue;
+  maxHeight?: LengthValue;
   padding?: Padding;
-  gap?: Size;
+  gap?: LengthValue;
   /** Gap between wrapped lines, when `wrap` is true. */
-  counterGap?: Size;
+  counterGap?: LengthValue;
   align?: Align;
   justify?: Justify;
   wrap?: boolean;
-  background?: Value<Color>;
+  background?: Paint;
   border?: Border;
   shadow?: Shadow;
-  cornerRadius?: Size | CornerRadii;
+  cornerRadius?: LengthValue | CornerRadii;
   /** Squircle corner curvature (0..1). >0 means non-CSS corner — emitter
    *  must use a path/clip-path approximation. */
   cornerSmoothing?: number;
@@ -268,8 +300,8 @@ export interface DTextRun {
   color?: Color;
   fontFamily?: string;
   fontWeight?: number;
-  fontSize?: Size;
-  lineHeight?: Size;
+  fontSize?: LengthValue;
+  lineHeight?: LengthValue;
   textDecoration?: TextDecoration;
 }
 
@@ -277,21 +309,12 @@ export interface DTextRun {
 export interface DText extends DNodeBase {
   kind: NodeKind.Text;
   content: Value<string>;
-  fontFamily?: string;
-  /** CSS-style numeric weight (100..900). */
-  fontWeight?: number;
-  fontSize: Size;
-  lineHeight: Size;
-  /** Gap between paragraphs (newline-separated runs). */
-  paragraphSpacing?: Size;
-  color: Value<Color>;
+  textStyle: TextStyleValue;
+  color: Color;
   textDecoration?: TextDecoration;
   textAlign?: TextAlign;
-  /** Reference to an upstream typography style (e.g. figma textStyleId).
-   *  Emitter may map this to a typography component wrapper. */
-  textStyleRef?: Value<string>;
   /** Required when text needs to wrap. */
-  width: number | ExpressionValue;
+  width: AxisSize;
   autoResize: TextAutoResize;
   runs?: DTextRun[];
 }
@@ -300,28 +323,28 @@ export interface DText extends DNodeBase {
 export interface DShape extends DNodeBase {
   kind: NodeKind.Shape;
   shape: ShapeKind;
-  width: Size;
-  height: Size;
-  fill?: Color;
+  width: LengthValue;
+  height: LengthValue;
+  fill?: Paint;
   stroke?: {
-    paint: Color;
-    width: Size;
+    paint: Paint;
+    width: LengthValue;
     align?: StrokeAlign;
     /** End-cap shape on open paths (lines, vectors). */
     cap?: StrokeCap;
   };
-  cornerRadius?: Size | CornerRadii;
+  cornerRadius?: LengthValue | CornerRadii;
 }
 
 /** Inline vector (path or raw SVG). Resolved upstream from a vector source. */
 export interface DVector extends DNodeBase {
   kind: NodeKind.Vector;
-  width: Size;
-  height: Size;
+  width: LengthValue;
+  height: LengthValue;
   /** The vector paint source. When prop-bound, the emitter must drive the
    *  vector from that declared prop, not from target-specific style
    *  conventions such as CSS `color`. */
-  fill?: Value<Color>;
+  fill?: Paint;
   /** Inline SVG (raw `<svg>` content) or `data:image/svg+xml;base64,...` URL. */
   svg: string;
 }
@@ -329,8 +352,8 @@ export interface DVector extends DNodeBase {
 /** Raster image embedded as a vector asset (e.g. exported figma group SVG). */
 export interface DImage extends DNodeBase {
   kind: NodeKind.Image;
-  width: Size;
-  height: Size;
+  width: LengthValue;
+  height: LengthValue;
   /** `data:image/svg+xml;base64,...` URL. */
   dataUrl?: string;
   /** Figma-rendered PNG for bitmap image-fill nodes when scale/crop semantics
@@ -350,14 +373,14 @@ export interface DInstance extends DNodeBase {
   defaultProps?: Record<string, unknown>;
   /** Per-instance layout overrides (vs. master). */
   layoutOverrides?: {
-    paddingTop?: Size;
-    paddingRight?: Size;
-    paddingBottom?: Size;
-    paddingLeft?: Size;
-    gap?: Size;
+    paddingTop?: LengthValue;
+    paddingRight?: LengthValue;
+    paddingBottom?: LengthValue;
+    paddingLeft?: LengthValue;
+    gap?: LengthValue;
   };
-  width?: Size | ExpressionValue;
-  height?: Size | ExpressionValue;
+  width?: AxisSize;
+  height?: AxisSize;
   /** Per-instance-property bindings — { figmaPropKey: ownerPropKey }. The
    *  emitter passes these through as JSX attributes (e.g. `Type={iconType}`)
    *  so the parametric Generated FC swaps in the owner-component prop
@@ -373,6 +396,6 @@ export interface DUnknown extends DNodeBase {
   kind: NodeKind.Unknown;
   sourceType?: string;
   hidden?: boolean;
-  width: Size;
-  height: Size;
+  width: LengthValue;
+  height: LengthValue;
 }
