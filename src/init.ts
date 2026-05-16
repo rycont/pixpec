@@ -1185,7 +1185,7 @@ function makeCaseWithParser(
     initFieldConsumer(variant.ir, remBase),
   ) as Record<string, unknown>;
   return {
-    props: { ...props, ...rootSizeStyleProps(variant.raw, remBase, false) },
+    props,
     figmaId,
     render: parseRenderBox(variant.raw),
     sourceHash: hashRawNode(variant.raw),
@@ -1218,7 +1218,7 @@ function makeUsecaseWithParser(
     return undefined;
   }
   return {
-    props: { ...props, ...rootSizeStyleProps(usecase.raw, remBase, true) },
+    props,
     figmaId: usecase.figmaId,
     render: parseRenderBox(usecase.raw),
     sourceHash: hashRawNode(usecase.raw),
@@ -1498,27 +1498,6 @@ function parseRenderBox(n: RawNode): CaseRenderSpec | undefined {
   return { box };
 }
 
-function rootSizeStyleProps(
-  n: RawNode,
-  remBase: number,
-  standaloneInstance: boolean,
-): Record<string, string> {
-  const out: Record<string, string> = {};
-  if (
-    (standaloneInstance || n.layoutSizingHorizontal === "FIXED") &&
-    typeof n.width === "number"
-  ) {
-    out.width = pxToRem(n.width, remBase);
-  }
-  if (
-    (standaloneInstance || n.layoutSizingVertical === "FIXED") &&
-    typeof n.height === "number"
-  ) {
-    out.height = pxToRem(n.height, remBase);
-  }
-  return out;
-}
-
 function emptyStaticTokenMap(): StaticTokenMap {
   return Object.fromEntries(
     STATIC_CSS_PROPERTIES.map((property) => [property, new Set<string>()]),
@@ -1572,10 +1551,6 @@ function isStaticCssValue(value: string): boolean {
   return (
     value.startsWith("#") || value.startsWith("rgb") || /[0-9]/.test(value)
   );
-}
-
-function pxToRem(value: number, remBase: number): string {
-  return `${+(value / remBase).toFixed(6)}rem`;
 }
 
 function zodForDef(def: PropDef): string {

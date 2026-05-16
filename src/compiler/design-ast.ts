@@ -365,30 +365,13 @@ export interface DImage extends DNodeBase {
 }
 
 /** Reference to a registered design-system component. Emitter resolves the
- *  `componentName` to its target source (import + JSX call for React, etc.). */
+ *  `componentName` to its target source (import + JSX call for React, etc.).
+ *  All instance-level overrides (including layout: width/height/padding/gap,
+ *  and forwarded prop refs via expression values) flow through `props`. */
 export interface DInstance extends DNodeBase {
   kind: NodeKind.Instance;
   componentName: string;
   props: Record<string, unknown>;
-  /** Defaults so the emitter can elide redundant prop emissions on call sites. */
-  defaultProps?: Record<string, unknown>;
-  /** Per-instance layout overrides (vs. master). */
-  layoutOverrides?: {
-    paddingTop?: LengthValue;
-    paddingRight?: LengthValue;
-    paddingBottom?: LengthValue;
-    paddingLeft?: LengthValue;
-    gap?: LengthValue;
-  };
-  width?: AxisSize;
-  height?: AxisSize;
-  /** Per-instance-property bindings — { figmaPropKey: ownerPropKey }. The
-   *  emitter passes these through as JSX attributes (e.g. `Type={iconType}`)
-   *  so the parametric Generated FC swaps in the owner-component prop
-   *  instead of the master literal value. */
-  instancePropBindings?: Record<string, string>;
-  /** Open extension slot for emitter plugins to attach their own data. */
-  [extension: string]: unknown;
 }
 
 /** Fallback for nodes the compiler couldn't classify. Emitter chooses a

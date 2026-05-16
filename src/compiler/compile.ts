@@ -695,9 +695,9 @@ function indexDNodes(nodes: DNode[]): Map<string, DNodeClass> {
 
 function exposedProps(
   raw: RawNode,
-  compiledChildren: DNode[],
+  tree: DNode,
 ): Record<string, unknown> {
-  const byId = indexDNodes(compiledChildren);
+  const byId = indexDNodes([tree]);
   const out: Record<string, unknown> = {};
   for (const exposed of raw.exposedInstances ?? []) {
     const node = byId.get(exposed.id);
@@ -707,9 +707,10 @@ function exposedProps(
   return out;
 }
 
-function fieldConsumer(compiledChildren: DNode[], remBase = 16) {
-  const byId = indexDNodes(compiledChildren);
-  const byBareId = indexDNodesByBareId(compiledChildren);
+function fieldConsumer(tree: DNode, remBase = 16) {
+  const byId = indexDNodes([tree]);
+  byId.set("$root", materializeDNode(tree));
+  const byBareId = indexDNodesByBareId([tree]);
   const consumed = new Set<string>();
   return {
     consumed,
@@ -734,15 +735,26 @@ function normalizePropValue(value: unknown): unknown {
   return value;
 }
 
+/** Returns true when usage has visualDiff vs master that propsFromFigma did
+ *  not consume — i.e. an instance override that the variant catalog's
+ *  promotion pipeline didn't surface. That uncovered divergence means the
+ *  instance can't be faithfully emitted as `<Component prop=…/>`, so the
+ *  caller falls back to a detached raw subtree. Consumed diffs (promoted
+ *  + actually surfaced as props) are fine — they flow through. */
 function hasUnconsumedDNodeDiff(
   master: DNode | undefined,
-  usageChildren: DNode[],
+  usage: DNode | undefined,
   consumedFields: Set<string>,
 ): boolean {
-  if (!master) return usageChildren.length > 0;
-  const masterNodes = indexDNodes(containerChildren(master));
-  const usageNodes = indexDNodes(usageChildren);
-  const usageNodesByBareId = indexDNodesByBareId(usageChildren);
+  if (!master) return !!usage;
+  if (!usage) return true;
+  const masterRoot = containerRoot(master);
+  if (!masterRoot) return true;
+  const masterNodes = indexDNodes([masterRoot]);
+  masterNodes.set("$root", materializeDNode(masterRoot));
+  const usageNodes = indexDNodes([usage]);
+  usageNodes.set("$root", materializeDNode(usage));
+  const usageNodesByBareId = indexDNodesByBareId([usage]);
   for (const [nodeId, masterNode] of masterNodes) {
     const usageNode =
       usageNodes.get(nodeId) ?? usageNodesByBareId.get(stripPrefix(nodeId));
@@ -753,6 +765,12 @@ function hasUnconsumedDNodeDiff(
     }
   }
   return false;
+}
+
+function containerRoot(node: DNode): DNode | undefined {
+  if (node.kind === NodeKind.DataScope)
+    return containerRoot((node as DDataScope).child);
+  return node;
 }
 
 function indexDNodesByBareId(nodes: DNode[]): Map<string, DNodeClass> {
@@ -1351,64 +1369,31 @@ async function compileInstance(
     n.mainComponent?.key,
     n.mainComponent?.name,
   );
-  const compiledChildren = await compileChildren(
-    (n.children ?? []).filter(
-      (c) => c.visible !== false && (c.isMask || !isInvisibleShape(c)),
-    ),
-    childOpts,
-    n,
-    false,
-    false,
-  );
-  let props: Record<string, unknown> = {};
-  const fields = fieldConsumer(compiledChildren, opts.remBase);
-  props =
+  // Compile the whole instance (root + descendants) as a container so that
+  // root-level componentPropertyReferences (e.g. root.fills bound to
+  // BorderColor) and root-level promotions ($root.padding.top etc) are
+  // available to propsFromFigma via the field consumer's "$root" lookup.
+  const compiledRoot = await compileContainer(n, childOpts, parent, false);
+  const fields = fieldConsumer(compiledRoot, opts.remBase);
+  const props: Record<string, unknown> =
     variant?.propsFromFigma?.(
       exactComponentProps(n),
-      exposedProps(n, compiledChildren),
+      exposedProps(n, compiledRoot),
       fields,
     ) ?? {};
-  if (hasUnconsumedDNodeDiff(variant?.ast, compiledChildren, fields.consumed))
+  if (hasUnconsumedDNodeDiff(variant?.ast, compiledRoot, fields.consumed))
     return compileContainer(
       n,
       { ...opts, detachRootInstance: true },
       parent,
       false,
     );
-  const out: DInstance = {
+  return {
     ...buildBase(n, opts, parent),
     kind: NodeKind.Instance,
     componentName: entry.componentName,
     props,
-    width: axisSize(n, "horizontal", opts),
-    height: axisSize(n, "vertical", opts),
   };
-  const layoutOverrides: NonNullable<DInstance["layoutOverrides"]> = {};
-  let any = false;
-  for (const k of [
-    "paddingTop",
-    "paddingRight",
-    "paddingBottom",
-    "paddingLeft",
-  ] as const) {
-    const v = (n as unknown as Record<string, unknown>)[k] as
-      | number
-      | undefined;
-    if (typeof v === "number" && v !== 0) {
-      layoutOverrides[k] = pickSize(v, varId(n.boundVariables, k), opts);
-      any = true;
-    }
-  }
-  if (typeof n.itemSpacing === "number" && n.itemSpacing !== 0) {
-    layoutOverrides.gap = pickSize(
-      n.itemSpacing,
-      varId(n.boundVariables, "itemSpacing"),
-      opts,
-    );
-    any = true;
-  }
-  if (any) out.layoutOverrides = layoutOverrides;
-  return out;
 }
 
 function compileUnknown(

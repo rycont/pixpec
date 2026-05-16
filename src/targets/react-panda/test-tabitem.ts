@@ -56,12 +56,12 @@ const inner: DNode = {
             sourceId: '2127:1819',
             sourceName: 'Icon',
             componentName: 'Icon',
-            props: { Type: 'check' },
-            defaultProps: { Type: 'check' },
+            props: {
+                Type: { kind: 'expression', type: 'prop', name: 'iconType' },
+                _fill: { kind: 'expression', type: 'prop', name: 'iconFill' },
+            },
             sizing: { horizontal: Sizing.Fixed, vertical: Sizing.Fixed },
             visible: { kind: 'expression', type: 'prop', name: 'leftIcon' },
-            // extension: instance prop bindings.
-            instancePropBindings: { Type: 'iconType', _fill: 'iconFill' },
         } as DNode,
         // Label text
         {

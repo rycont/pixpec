@@ -1,4 +1,4 @@
-import { Sizing, type DInstance } from "../design-ast.ts";
+import type { DInstance } from "../design-ast.ts";
 import { DNodeClass } from "./base.ts";
 
 export class DInstanceNode extends DNodeClass<DInstance> {
@@ -14,9 +14,6 @@ export class DInstanceNode extends DNodeClass<DInstance> {
   }
 
   protected visualFields(): string[] {
-    const fields = [...super.visualFields(), ...Object.keys(this.node.props).map((key) => `component.${key}`)];
-    if (this.node.width && this.node.width !== Sizing.Fill && this.node.width !== Sizing.Hug) fields.push("width");
-    if (this.node.height && this.node.height !== Sizing.Fill && this.node.height !== Sizing.Hug) fields.push("height");
-    return fields;
+    return [...super.visualFields(), ...Object.keys(this.node.props).map((key) => `component.${key}`)];
   }
 }
