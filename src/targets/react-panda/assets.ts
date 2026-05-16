@@ -35,17 +35,29 @@ function targetSidecarRelativePath(ctx: Ctx, filename: string): string {
     return `.pixpec/assets/${filename}`
 }
 
-/** Build a relative import path from `<outputDir>` to the shared asset file. */
+/** Build a relative import path from `<outputDir>` to the shared asset file.
+ *  `filename` is what the compile-side writeAsset returned — typically just a
+ *  bare hash filename, but generate.ts prefixes it with `pixpec-assets/` to
+ *  match the GPUI runtime convention. Either form is treated as
+ *  outputDir-relative and routed straight through (with a leading `./`). */
 export function assetImportPathFromOutput(filename: string, ctx: Ctx): string {
+    const normalized = filename.split(nodePath.sep).join('/')
+    if (normalized.startsWith('./') || normalized.startsWith('../')) {
+        return normalized
+    }
+    if (normalized.includes('/')) {
+        return `./${normalized}`
+    }
+    // Bare filename — resolve against assetsDir if present, otherwise the
+    // target-local sidecar dir.
     const outDir = ctx.env.outputDir
     const assetsDir = ctx.env.assetsDir
     if (!outDir || !assetsDir) {
-        // Without context, fall back to a target-local sidecar path.
-        return targetSidecarRelativePath(ctx, filename)
+        return targetSidecarRelativePath(ctx, normalized)
     }
-    const rel = nodePath.relative(outDir, nodePath.join(assetsDir, filename))
-    const normalized = rel.split(nodePath.sep).join('/')
-    return normalized.startsWith('.') ? normalized : `./${normalized}`
+    const rel = nodePath.relative(outDir, nodePath.join(assetsDir, normalized))
+    const relNormalized = rel.split(nodePath.sep).join('/')
+    return relNormalized.startsWith('.') ? relNormalized : `./${relNormalized}`
 }
 
 /** `new URL('<importPath>', import.meta.url).href` — the canonical way to
