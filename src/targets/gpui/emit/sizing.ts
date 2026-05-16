@@ -26,14 +26,24 @@ export function addSizing(
   // - Hug / fixed sizes inside a flex parent get `flex_shrink_0` so a sibling
   //   marked Fill cannot steal pixels by squeezing them below their intrinsic
   //   size — Figma autolayout never shrinks Hug children to satisfy Fill.
-  if (mainAxisFillHorizontal) chain.method('flex_1')
+  if (mainAxisFillHorizontal) {
+    chain.method('flex_1')
+    // Without min_w(0), taffy/flex defaults min-width to MIN-CONTENT, so a
+    // flex_1 box never shrinks below its widest child even when figma sized
+    // the parent narrower. That made the root-frame right pane widen past
+    // its figma w=872 and reveal content figma's export had clipped.
+    if (!n.minWidth) chain.method('min_w', 'px(0.0)')
+  }
   else if (fillHorizontal && !crossAxisFillHorizontal) chain.method('w_full')
   else {
     if (isAxisLength(n.width)) chain.method('w', lengthExpr(n.width, ctx))
     if (parentDirection === FlowDirection.Row) chain.method('flex_shrink_0')
   }
 
-  if (mainAxisFillVertical) chain.method('flex_1')
+  if (mainAxisFillVertical) {
+    chain.method('flex_1')
+    if (!n.minHeight) chain.method('min_h', 'px(0.0)')
+  }
   else if (fillVertical && !crossAxisFillVertical) chain.method('h_full')
   else {
     if (isAxisLength(n.height)) chain.method('h', lengthExpr(n.height, ctx))

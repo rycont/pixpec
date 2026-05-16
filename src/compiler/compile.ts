@@ -117,6 +117,12 @@ export interface CompileOptions {
   typographyMap?: Record<string, string>;
   remBase?: number;
   paintOpacityMultiplier?: number;
+  /** Asset-extraction callback. Called whenever the compiler encounters an
+   *  inline asset (image fill, SVG markup, raster bytes) — the callback
+   *  persists the bytes to disk under a content-addressed filename and
+   *  returns that filename, which compile stores in the IR. When omitted,
+   *  the compiler throws on encountering an asset (no asset persistence). */
+  writeAsset?: (bytes: Uint8Array, ext: string) => Promise<string>;
 }
 
 /** Subtree predicate: every descendant (including the node itself) must
@@ -447,13 +453,76 @@ function gradientCssAngle(paint: RawGradientPaint): number {
   return +(((deg % 360) + 360) % 360).toFixed(3);
 }
 
-function pickPaint(
+async function pickPaint(
   solid: RawSolidPaint | null | undefined,
   gradient: RawGradientPaint | null | undefined,
   varId: string | undefined,
   opts: CompileOptions,
-): Paint | undefined {
-  return pickColor(solid, varId, opts) ?? gradientPaintToPaint(gradient);
+  image?: RawImagePaint | null,
+): Promise<Paint | undefined> {
+  return (
+    pickColor(solid, varId, opts) ??
+    gradientPaintToPaint(gradient) ??
+    (await imagePaintToPaint(image, opts))
+  );
+}
+
+async function imagePaintToPaint(
+  image: RawImagePaint | null | undefined,
+  opts: CompileOptions,
+): Promise<Paint | undefined> {
+  if (!image) return undefined;
+  const asset = await persistImageAsset(image, opts);
+  if (!asset) return undefined;
+  return {
+    kind: "literal",
+    value: {
+      kind: "image",
+      asset,
+      scaleMode: image.scaleMode,
+      ...(image.scaleMode === "CROP" && image.imageTransform
+        ? { imageTransform: image.imageTransform }
+        : {}),
+    },
+  };
+}
+
+/** Decode a `data:` URL and persist its bytes via the caller's writeAsset
+ *  hook. Returns the sidecar filename. */
+async function persistDataUrl(
+  dataUrl: string | undefined,
+  opts: CompileOptions,
+): Promise<string | undefined> {
+  if (!opts.writeAsset || !dataUrl) return undefined;
+  const parsed = parseDataUrl(dataUrl);
+  if (!parsed) return undefined;
+  return opts.writeAsset(parsed.bytes, parsed.ext);
+}
+
+const persistImageAsset = (image: RawImagePaint, opts: CompileOptions) =>
+  persistDataUrl(image.dataUrl, opts);
+
+function parseDataUrl(
+  dataUrl: string,
+): { bytes: Uint8Array; ext: string } | undefined {
+  const match = /^data:([^;,]+);base64,(.*)$/s.exec(dataUrl);
+  if (!match) return undefined;
+  const mime = (match[1] ?? "").toLowerCase();
+  const ext = ASSET_EXT_BY_MIME[mime];
+  if (!ext) return undefined;
+  return { bytes: base64ToBytes(match[2] ?? ""), ext };
+}
+
+const ASSET_EXT_BY_MIME: Record<string, string> = {
+  "image/png": "png",
+  "image/jpeg": "jpg",
+  "image/gif": "gif",
+  "image/webp": "webp",
+  "image/svg+xml": "svg",
+};
+
+function base64ToBytes(b64: string): Uint8Array {
+  return Uint8Array.from(Buffer.from(b64, "base64"));
 }
 
 function colorsEquivalent(a: string, b: string): boolean {
@@ -938,15 +1007,29 @@ async function compileShape(
 ): Promise<DShape | DImage> {
   const imageFill = firstImageFill(n.fills);
   if (imageFill?.dataUrl) {
+    // CROP mode replicates figma's per-fill transform/crop semantics. CSS
+    // can't reliably reproduce that, so we use figma's pre-rendered PNG
+    // (n.renderedDataUrl) instead of the source bytes. Other modes use
+    // the source bytes directly.
+    const useRendered =
+      imageFill.scaleMode === "CROP" && typeof n.renderedDataUrl === "string";
+    const source = useRendered ? n.renderedDataUrl : imageFill.dataUrl;
+    const asset = await persistDataUrl(source, opts);
+    if (!asset) {
+      throw new Error(
+        `pixpec compile: image fill on ${n.name} (${n.id}) but no writeAsset hook provided`,
+      );
+    }
     return {
       ...buildBase(n, opts, parent),
       kind: NodeKind.Image,
       width: fixedSize(n, "horizontal", opts) ?? px(0),
       height: fixedSize(n, "vertical", opts) ?? px(0),
-      dataUrl: imageFill.dataUrl,
-      renderedDataUrl: n.renderedDataUrl,
+      asset,
       imageScaleMode: imageFill.scaleMode,
-      imageTransform: imageFill.imageTransform,
+      ...(imageFill.scaleMode === "CROP" && imageFill.imageTransform
+        ? { imageTransform: imageFill.imageTransform }
+        : {}),
     };
   }
   const fill = firstSolidFill(n.fills);
@@ -961,6 +1044,14 @@ async function compileShape(
     strokeWidthVarId,
     opts,
   );
+  const shapeFill = await pickPaint(fill, gradientFill, fillVarId, opts);
+  const shapeStrokePaint =
+    stroke || gradientStroke
+      ? (await pickPaint(stroke, gradientStroke, strokeVarId, opts)) ?? {
+          kind: "literal" as const,
+          value: { r: 0, g: 0, b: 0 },
+        }
+      : undefined;
   const out: DShape = {
     ...buildBase(n, opts, parent),
     kind: NodeKind.Shape,
@@ -976,14 +1067,11 @@ async function compileShape(
               : ShapeKind.Star,
     width: fixedSize(n, "horizontal", opts) ?? px(0),
     height: fixedSize(n, "vertical", opts) ?? px(0),
-    fill: pickPaint(fill, gradientFill, fillVarId, opts),
+    fill: shapeFill,
     stroke:
-      stroke || gradientStroke
+      shapeStrokePaint
         ? {
-            paint: pickPaint(stroke, gradientStroke, strokeVarId, opts) ?? {
-              kind: "literal",
-              value: { r: 0, g: 0, b: 0 },
-            },
+            paint: shapeStrokePaint,
             width:
               strokeWidth ??
               px(typeof n.strokeWeight === "number" ? n.strokeWeight : 1),
@@ -1111,6 +1199,12 @@ async function compileVector(
     svg = await exportSvgForRawNode(n, opts);
   }
   if (svg) {
+    const asset = await persistSvgString(svg, opts);
+    if (!asset) {
+      throw new Error(
+        `pixpec compile: SVG on ${n.name} (${n.id}) but no writeAsset hook provided`,
+      );
+    }
     return {
       ...buildBase(n, opts, parent),
       kind: NodeKind.Vector,
@@ -1121,7 +1215,7 @@ async function compileVector(
         : fillOverride
           ? fillOverride
           : undefined,
-      svg,
+      asset,
       renderBoundsOffset: renderBoundsOffsetFromRaw(n),
     };
   }
@@ -1130,7 +1224,17 @@ async function compileVector(
     kind: NodeKind.Image,
     width: w,
     height: h,
+    asset: "",
   };
+}
+
+async function persistSvgString(
+  svg: string,
+  opts: CompileOptions,
+): Promise<string | undefined> {
+  if (!opts.writeAsset) return undefined;
+  const bytes = new TextEncoder().encode(svg);
+  return opts.writeAsset(bytes, "svg");
 }
 
 async function compileContainer(
@@ -1147,6 +1251,7 @@ async function compileContainer(
         : "none";
   const fill = firstSolidFill(n.fills);
   const gradientFill = firstGradientFill(n.fills);
+  const imageFill = firstImageFill(n.fills);
   const stroke = firstSolidFill(n.strokes);
   const gradientStroke = firstGradientFill(n.strokes);
   const childRaws = (n.children ?? []).filter(
@@ -1167,7 +1272,14 @@ async function compileContainer(
     varId(n.boundVariables, "strokeWeight"),
     opts,
   );
-  const background = pickPaint(fill, gradientFill, bgVarId, opts);
+  const background = await pickPaint(fill, gradientFill, bgVarId, opts, imageFill);
+  const borderPaint =
+    stroke || gradientStroke
+      ? (await pickPaint(stroke, gradientStroke, strokeVarId, opts)) ?? {
+          kind: "literal" as const,
+          value: { r: 0, g: 0, b: 0 },
+        }
+      : undefined;
   const common = {
     ...buildBase(n, opts, parent),
     width: axisSize(n, "horizontal", opts),
@@ -1187,12 +1299,9 @@ async function compileContainer(
     padding: paddingFromRaw(n, opts),
     background,
     border:
-      stroke || gradientStroke
+      borderPaint
         ? {
-            paint: pickPaint(stroke, gradientStroke, strokeVarId, opts) ?? {
-              kind: "literal",
-              value: { r: 0, g: 0, b: 0 },
-            },
+            paint: borderPaint,
             width:
               (n.strokeWeight as unknown) === "mixed"
                 ? {
@@ -1438,6 +1547,12 @@ async function compileNode(
     if (safe === true) {
       try {
         const svg = await exportSvgForRawNode(n, opts);
+        const asset = await persistSvgString(svg, opts);
+        if (!asset) {
+          throw new Error(
+            `pixpec compile: folded SVG on ${n.name} (${n.id}) but no writeAsset hook provided`,
+          );
+        }
         const fillProp = foldedPaintBinding(n, opts);
         return {
           ...buildBase(n, opts, parent),
@@ -1451,7 +1566,7 @@ async function compileNode(
           fill: fillProp
             ? { kind: "expression", type: "prop", name: fillProp }
             : undefined,
-          svg,
+          asset,
           renderBoundsOffset: renderBoundsOffsetFromRaw(n),
         };
       } catch {

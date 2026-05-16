@@ -182,7 +182,18 @@ export type GradientPaint = {
   stops: Array<{ offset: number; color: Color }>;
 };
 
-export type Paint = ScalarValue<ColorLiteral | GradientPaint>;
+export type ImagePaint = {
+  kind: "image";
+  /** Sidecar filename (no path). Compile writes the bytes to a shared
+   *  assets directory; target codegen builds the import path. */
+  asset: string;
+  scaleMode?: "FILL" | "FIT" | "CROP" | "TILE";
+  /** Only meaningful for `scaleMode: "CROP"` — the 2×3 transform that
+   *  maps the source image into the fill box. */
+  imageTransform?: number[][];
+};
+
+export type Paint = ScalarValue<ColorLiteral | GradientPaint | ImagePaint>;
 
 export interface Padding {
   top: LengthValue;
@@ -346,8 +357,9 @@ export interface DVector extends DNodeBase {
    *  vector from that declared prop, not from target-specific style
    *  conventions such as CSS `color`. */
   fill?: Paint;
-  /** Inline SVG (raw `<svg>` content) or `data:image/svg+xml;base64,...` URL. */
-  svg: string;
+  /** Sidecar filename for the SVG content. Compile writes the bytes to a
+   *  shared assets directory; target codegen builds the import path. */
+  asset: string;
 }
 
 /** Raster image embedded as a vector asset (e.g. exported figma group SVG). */
@@ -355,11 +367,10 @@ export interface DImage extends DNodeBase {
   kind: NodeKind.Image;
   width: LengthValue;
   height: LengthValue;
-  /** `data:image/svg+xml;base64,...` URL. */
-  dataUrl?: string;
-  /** Figma-rendered PNG for bitmap image-fill nodes when scale/crop semantics
-   *  need exact source-renderer output. */
-  renderedDataUrl?: string;
+  /** Sidecar filename for the image bytes. For `CROP` scaleMode this is the
+   *  figma-rendered PNG (the crop already applied) rather than the source
+   *  image; for other modes it's the source bytes. */
+  asset: string;
   imageScaleMode?: string;
   imageTransform?: [[number, number, number], [number, number, number]];
 }

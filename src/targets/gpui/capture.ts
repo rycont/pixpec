@@ -188,12 +188,21 @@ export async function captureGpuiGeneratedWithRuntime(opts: {
     PIXPEC_GPUI_OUT_PATH: opts.outPath,
     PIXPEC_GPUI_ASSETS_DIR: resolve(opts.generatedPath, '..'),
   }
-  await execFileStrict('cargo', ['build', '--offline'], { cwd: opts.runtime.runtimeDir, env })
+  // --jobs=1 caps rustc parallelism so the cargo build subprocess stays
+   // within the 2 GB working-set target (parallel rustc instances each load
+   // the full crate graph; 2-4 of them blow past 4 GB on this codebase).
+  const tBuild = Date.now()
+  await execFileStrict('cargo', ['build', '--offline', '--jobs', '1'], { cwd: opts.runtime.runtimeDir, env })
+  const tRender = Date.now()
   await execFileStrict(
     resolve(opts.runtime.runtimeDir, 'target/debug/pixpec-gpui-capture'),
     [],
     { cwd: opts.runtime.runtimeDir, env },
   )
+  const tDone = Date.now()
+  if (process.env.PIXPEC_GPUI_TIMING === '1') {
+    console.log(`    [gpui:capture] build=${tRender - tBuild}ms render=${tDone - tRender}ms`)
+  }
 }
 
 async function writeFileIfChanged(path: string, content: string): Promise<void> {
@@ -706,7 +715,11 @@ function sharedCargoEnv(
 
 async function forceSymlink(target: string, path: string): Promise<void> {
   await unlink(path).catch(() => undefined)
-  await symlink(target, path)
+  // Parallel workers can race on the same library path; tolerate EEXIST when
+  // another worker won the create.
+  await symlink(target, path).catch((e) => {
+    if ((e as NodeJS.ErrnoException).code !== 'EEXIST') throw e
+  })
 }
 
 function execFileStrict(

@@ -5,7 +5,8 @@
  * delegates per-node target output to the normal generate flow.
  */
 
-import { mkdir, rm, writeFile } from 'node:fs/promises'
+import { existsSync } from 'node:fs'
+import { mkdir, readFile, rm, writeFile } from 'node:fs/promises'
 import { relative, resolve } from 'node:path'
 import { dump, type RawNode } from './dumper/index.ts'
 import { loadConfig } from './init.ts'
@@ -68,7 +69,23 @@ export async function runBreakdown(
     const tab = tabs.find((t) => t.key === fileKey)
     if (!tab) throw new Error(`pixpec breakdown: no open figma tab matches fileKey ${fileKey}`)
 
-    const raw = await dump({ cfigmaBin: cfg.cfigmaBin ?? 'cfigma', tab: tab.key, nodeId })
+    // Cached figma dump. The cfigma dump for a 900-node tree costs a few
+    // seconds upfront on every invocation, and the data is deterministic per
+    // (fileKey, nodeId). Stash it under viewRoot/.pixpec-dump/<safeId>.json
+    // so subsequent runs (which dominate codegen iteration) skip the round
+    // trip entirely. PIXPEC_BREAKDOWN_REFRESH_DUMP=1 forces a re-dump when
+    // the Figma file has actually changed.
+    const dumpCacheDir = resolve(viewRoot, '.pixpec-dump')
+    const dumpCacheKey = `${fileKey}_${nodeId}`.replace(/[^A-Za-z0-9._-]/g, '_')
+    const dumpCachePath = resolve(dumpCacheDir, `${dumpCacheKey}.json`)
+    let raw: RawNode
+    if (existsSync(dumpCachePath) && process.env.PIXPEC_BREAKDOWN_REFRESH_DUMP !== '1') {
+        raw = JSON.parse(await readFile(dumpCachePath, 'utf8')) as RawNode
+    } else {
+        raw = await dump({ cfigmaBin: cfg.cfigmaBin ?? 'cfigma', tab: tab.key, nodeId })
+        await mkdir(dumpCacheDir, { recursive: true })
+        await writeFile(dumpCachePath, JSON.stringify(raw))
+    }
     const viewName = toPascalIdentifier(opts.name ?? raw.name, nodeId)
     const viewDir = resolve(viewRoot, viewName)
     const breakdownDir = resolve(viewDir, 'breakdown')
@@ -83,6 +100,16 @@ export async function runBreakdown(
         await rm(resolve(targetDir, '.pixpec'), { recursive: true, force: true })
     }
 
+    // Index every subtree by id once so per-entry codegen below can hand the
+    // pre-dumped slice to `runGenerate` and skip the per-entry cfigma round
+    // trip (~250-500ms each). With 900+ entries this dominates breakdown time.
+    const rawById = new Map<string, RawNode>()
+    const indexRaw = (n: RawNode) => {
+      rawById.set(n.id, n)
+      for (const c of n.children ?? []) indexRaw(c)
+    }
+    indexRaw(raw)
+
     const rootOutputs: Record<string, string> = {}
     for (const target of targets) {
         const outDir = resolve(viewDir, 'impl', target, 'generated')
@@ -94,6 +121,8 @@ export async function runBreakdown(
             detachInstances: opts.detachInstances,
             renderScale,
             viewConfig,
+            raw,
+            tabKey: tab.key,
         })
         rootOutputs[target] = relativeFrom(viewDir, r.outPath)
     }
@@ -171,21 +200,31 @@ export async function runBreakdown(
                 outputs: {},
                 captureSkip: node.type === 'TEXT' ? 'text leaf' : undefined,
             }
-            for (const target of targets) {
-                try {
-                    const r = await runGenerate(`${fileKey}:${node.id}`, {
-                        target,
-                        componentName: `${viewName}_${seq}`,
-                        outputDir: resolve(viewDir, 'impl', target, 'breakdown'),
-                        propsFile: null,
-                        detachInstances: opts.detachInstances,
-                        detachRootInstance: !opts.detachInstances && node.type === 'INSTANCE',
-                        renderScale,
-                        viewConfig,
-                    })
-                    entry.outputs[target] = relativeFrom(viewDir, r.outPath)
-                } catch (e) {
-                    entry.error = e instanceof Error ? e.stack ?? e.message : String(e)
+            // Skip codegen entirely for entries the user is not verifying when
+            // a single sourceId is targeted — otherwise the breakdown would
+            // re-run runGenerate (which dumps each subtree via cfigma) for all
+            // 900+ entries to feed one verify pass.
+            const willVerifyThis = !opts.verifySourceId || node.id === opts.verifySourceId
+            if (willVerifyThis) {
+                for (const target of targets) {
+                    try {
+                        const subtree = rawById.get(node.id)
+                        const r = await runGenerate(`${fileKey}:${node.id}`, {
+                            target,
+                            componentName: `${viewName}_${seq}`,
+                            outputDir: resolve(viewDir, 'impl', target, 'breakdown'),
+                            propsFile: null,
+                            detachInstances: opts.detachInstances,
+                            detachRootInstance: !opts.detachInstances && node.type === 'INSTANCE',
+                            renderScale,
+                            viewConfig,
+                            raw: subtree,
+                            tabKey: tab.key,
+                        })
+                        entry.outputs[target] = relativeFrom(viewDir, r.outPath)
+                    } catch (e) {
+                        entry.error = e instanceof Error ? e.stack ?? e.message : String(e)
+                    }
                 }
             }
             entries.push(entry)

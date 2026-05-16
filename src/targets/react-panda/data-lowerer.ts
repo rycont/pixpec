@@ -4,6 +4,7 @@ import type {
     CornerRadii,
     ExpressionValue,
     GradientPaint,
+    ImagePaint,
     Length,
     LengthValue,
     LiteralValue,
@@ -122,13 +123,15 @@ export function paintToProp(paint: Paint | undefined): string | undefined {
     if (typeof paint === 'string') {
         return paint
     }
-    if (isLiteralValue<ColorLiteral | GradientPaint>(paint)) {
+    if (isLiteralValue<ColorLiteral | GradientPaint | ImagePaint>(paint)) {
         return paintLiteralToProp(paint.value)
     }
     return undefined
 }
 
-export function paintLiteralToProp(paint: ColorLiteral | GradientPaint): string | undefined {
+export function paintLiteralToProp(
+    paint: ColorLiteral | GradientPaint | ImagePaint,
+): string | undefined {
     if (isColorLiteralObject(paint)) {
         return colorLiteralToCss(paint)
     }
@@ -141,7 +144,23 @@ export function paintLiteralToProp(paint: ColorLiteral | GradientPaint): string 
             .join(', ')
         return `linear-gradient(${paint.angle}deg, ${stops})`
     }
+    // Image paints are routed through container/codegen lowerer with sidecar
+    // registration — not inlined here. Return undefined so the caller emits
+    // the image fill via `backgroundImage: url(<sidecar>)` instead.
     return undefined
+}
+
+export function isImagePaintLiteral(
+    paint: Paint | undefined,
+): paint is { kind: 'literal'; value: ImagePaint } {
+    if (!paint || typeof paint === 'string') {
+        return false
+    }
+    if (!isLiteralValue<ColorLiteral | GradientPaint | ImagePaint>(paint)) {
+        return false
+    }
+    const v = paint.value as { kind?: string }
+    return v.kind === 'image'
 }
 
 export function isGradientPaint(v: unknown): v is GradientPaint {

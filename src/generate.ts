@@ -7,8 +7,30 @@
  */
 
 import { existsSync } from 'node:fs'
+import { createHash } from 'node:crypto'
 import { mkdir, readFile, writeFile } from 'node:fs/promises'
 import { dirname, join, resolve } from 'node:path'
+
+function makeGenerateAssetWriter(assetsDir: string) {
+  const seen = new Set<string>()
+  return async (bytes: Uint8Array, ext: string): Promise<string> => {
+    const hash = createHash('sha1').update(bytes).digest('hex').slice(0, 16)
+    const kind = ext === 'svg' ? 'svg' : 'image'
+    const filename = `${kind}_${hash}.${ext}`
+    if (!seen.has(filename)) {
+      await mkdir(assetsDir, { recursive: true })
+      await writeFile(join(assetsDir, filename), bytes)
+      seen.add(filename)
+    }
+    // Return path relative to the GPUI capture asset base
+    // (`<generated_dir>`). The compile-time SVG fold persists bytes under
+    // `<generated_dir>/pixpec-assets/`, matching codegen's putTextAsset
+    // convention; without the prefix, runtime resolves to the wrong dir and
+    // the image silently fails to load (e.g. star/rating icons missing in
+    // the composed root frame).
+    return `pixpec-assets/${filename}`
+  }
+}
 import { dump, exportNodeSvg } from './dumper/index.ts'
 import type { RawNode } from './dumper/raw-node.ts'
 import { compile, loadRegistry, type Registry } from './compiler/index.ts'
@@ -45,6 +67,13 @@ export interface GenerateOptions {
   /** Already-compiled Design AST. Used by init so target codegen consumes the
    * exact IR it just wrote, instead of redumping/recompiling the Figma node. */
   ast?: DNode
+  /** Pre-dumped raw figma subtree. When set, generate skips the cfigma dump
+   * step (~250-500ms per call). Breakdown dumps the full tree once and slices
+   * subtrees out for each entry. */
+  raw?: RawNode
+  /** Pre-resolved figma tab key. Used alongside `raw` so the dump-skip path
+   * still has a tab handle for SVG exports. */
+  tabKey?: string
   /** Preloaded component registry. Init passes this so per-variant generation
    * does not repeatedly load the component tree it is currently writing. */
   registry?: Registry
@@ -155,10 +184,16 @@ export async function runGeneratePrepared(
   let ast = opts.ast
   let tab: { key: string } | undefined
   if (!ast) {
-    const tabs = await listFigmaTabs({ cfigmaBin: cfg.cfigmaBin })
-    tab = tabs.find((t) => t.key === fileKey)
-    if (!tab) throw new Error(`pixpec generate: no open figma tab matches fileKey ${fileKey}`)
-    const raw = await dump({ cfigmaBin: cfg.cfigmaBin ?? 'cfigma', tab: tab.key, nodeId })
+    let raw: RawNode
+    if (opts.raw && opts.tabKey) {
+      raw = opts.raw
+      tab = { key: opts.tabKey }
+    } else {
+      const tabs = await listFigmaTabs({ cfigmaBin: cfg.cfigmaBin })
+      tab = tabs.find((t) => t.key === fileKey)
+      if (!tab) throw new Error(`pixpec generate: no open figma tab matches fileKey ${fileKey}`)
+      raw = await dump({ cfigmaBin: cfg.cfigmaBin ?? 'cfigma', tab: tab.key, nodeId })
+    }
     if (!opts.detachInstances) {
       registry = await ensureRegistryForRaw(raw, {
         registry,
@@ -170,6 +205,14 @@ export async function runGeneratePrepared(
     context.registry = registry
     context.targetRegistry = toTargetRegistry(registry)
     const tabKey = tab.key
+    const safeIdForAssets = (fileKey + '_' + nodeId).replace(/[^A-Za-z0-9]/g, '_')
+    // Write under <generated_dir>/pixpec-assets/ so the runtime's
+    // AssetSource (rooted at the generated_dir) can resolve the relative
+    // path the codegen emits.
+    const assetsOutDir = opts.outputDir
+      ? join(opts.outputDir, 'pixpec-assets')
+      : resolve(componentsDir, componentName, 'generated', 'pixpec-assets')
+    void safeIdForAssets
     ast = await compile(raw, {
       registry,
       tokenMap: context.tokenMap,
@@ -179,6 +222,7 @@ export async function runGeneratePrepared(
       detachInstances: opts.detachInstances,
       detachRootInstance: opts.detachRootInstance,
       detachUnregisteredInstances: true,
+      writeAsset: makeGenerateAssetWriter(assetsOutDir),
     })
   }
   const target = getTarget(targetName)

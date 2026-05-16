@@ -3,7 +3,7 @@
 import * as nodePath from 'node:path'
 import * as ast from '@typescript/native-preview/ast'
 import * as f from '@typescript/native-preview/ast/factory'
-import type { DImage } from '../../compiler/design-ast.ts'
+import type { DImage, ImagePaint } from '../../compiler/design-ast.ts'
 import { stringLiteral } from './ast.ts'
 import type { LowererCtx as Ctx, Uses } from './lowerer-types.ts'
 import { nodeSourceId } from './sizing.ts'
@@ -54,12 +54,36 @@ export function imageAssetUrlMarker(n: DImage, ctx: Ctx, uses: Uses): ast.Expres
     if (!n.dataUrl) {
         return undefined
     }
-    const match = /^data:([^;,]+);base64,(.*)$/s.exec(n.dataUrl)
+    return registerImageSidecarFromDataUrl(n.dataUrl, nodeSourceId(n), ctx, uses)
+}
+
+/** Register a container-background image fill as an asset sidecar and return
+ *  the `new URL('./image__…', import.meta.url).href` expression to embed in
+ *  generated code. */
+export function imagePaintUrlMarker(
+    paint: ImagePaint,
+    sourceId: string,
+    ctx: Ctx,
+    uses: Uses,
+): ast.Expression | undefined {
+    if (!paint.dataUrl) {
+        return undefined
+    }
+    return registerImageSidecarFromDataUrl(paint.dataUrl, sourceId, ctx, uses)
+}
+
+function registerImageSidecarFromDataUrl(
+    dataUrl: string,
+    sourceId: string,
+    ctx: Ctx,
+    uses: Uses,
+): ast.Expression | undefined {
+    const match = /^data:([^;,]+);base64,(.*)$/s.exec(dataUrl)
     if (!match) {
         return undefined
     }
     const mime = match[1] ?? ''
-    const filename = imageFilename(nodeSourceId(n), mime)
+    const filename = imageFilename(sourceId, mime)
     if (!filename) {
         return undefined
     }

@@ -46,7 +46,11 @@ export async function emitContainer(
   let squircleBg: { radius: number; smoothing: number; color: string } | undefined
   if (useSquircleBg) {
     stylesNode = { ...stylesNode, background: undefined, cornerRadius: undefined }
-    chain.method('relative')
+    // GPUI's `absolute()` already establishes a positioning context for
+    // descendants — appending `.relative()` would silently override that and
+    // collapse the node back into normal flow, breaking any absolutely-
+    // positioned child placement (e.g. slider handles).
+    if (!n.absolute) chain.method('relative')
     squircleBg = {
       radius: lengthNumber(radiusValue as Parameters<typeof lengthNumber>[0], ctx),
       smoothing,

@@ -13,7 +13,6 @@ import {
     numberOrExpressionToProp,
     sizeToProp,
 } from '../sizing.ts'
-import { fillStyleExpression } from '../styles.ts'
 
 const LINE_BREAK_RE = new RegExp('[\\r\\u2028\\u2029]', 'g')
 
@@ -99,9 +98,9 @@ export function emitText(n: DText, ctx: Ctx, parent: ParentCtx): LowerResult {
     }
     const colorProp = expressionPropName(n.color)
     if (colorProp) {
-        attrs.push(
-            f.createJsxAttribute(f.createIdentifier('style'), fillStyleExpression(colorProp)),
-        )
+        // Use Panda's JSX color prop (token-aware) instead of style={…} so
+        // design-token strings resolve to CSS variables.
+        attrs.push(f.createJsxAttribute(f.createIdentifier('color'), propExpression(colorProp)))
     }
     const contentProp = expressionPropName(n.content)
     const contentPropExpr = contentProp ? propExpression(contentProp) : undefined

@@ -12,6 +12,11 @@ export interface Env {
     readonly rootDir?: string
     readonly componentsDir?: string
     readonly propsFile?: string
+    /** Directory where compile-written assets (SVG, image bytes) live.
+     *  Lowerers read source content from here when they need to derive
+     *  metadata (e.g. SVG dimensions) or produce target-specific sidecar
+     *  variants (e.g. tinted SVG). */
+    readonly assetsDir?: string
     readonly viewConfig: NonNullable<CodegenContext['viewConfig']>
 }
 

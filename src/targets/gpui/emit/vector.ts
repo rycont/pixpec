@@ -7,9 +7,16 @@ import { lengthExpr } from './values.ts'
 
 export function emitVector(n: DVector, ctx: GpuiEmitContext, indent: number): string {
   const sourceId = n.sourceId ?? 'vector'
-  const path = n.svg.startsWith('data:')
-    ? dataUrlAsset(ctx, sourceId, n.svg)
-    : putTextAsset(ctx, sourceId, 'svg', n.svg)
+  // DVector carries `asset` (a sidecar filename produced by compile's
+  // persistSvgString). Legacy code expected `svg` (inline string) which no
+  // longer exists; the SVG-fold path (compile.ts ~1554) already persists the
+  // SVG bytes to disk and only references them by filename here.
+  const asset = (n as DVector & { svg?: string }).svg
+  const path = asset
+    ? asset.startsWith('data:')
+      ? dataUrlAsset(ctx, sourceId, asset)
+      : putTextAsset(ctx, sourceId, 'svg', asset)
+    : n.asset
   if (!path) return div(indent).toString()
 
   const chain = image(indent, path)

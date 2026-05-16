@@ -216,6 +216,12 @@ export async function init(opts: {
   const componentName = pascalize(component.name);
   const componentDir = join(componentsDir, componentName);
   await mkdir(componentDir, { recursive: true });
+  // Master variant assets: shared, "owned" by the component definition.
+  const masterAssetsDir = join(componentDir, "assets");
+  // Per-case override assets: not owned by any variant — stored under .pixpec.
+  const caseAssetsDir = join(componentDir, ".pixpec", "case-assets");
+  await rm(masterAssetsDir, { recursive: true, force: true });
+  await rm(caseAssetsDir, { recursive: true, force: true });
   const analysisRegistry = component.key
     ? new Map([...registry].filter(([key]) => key !== component.key))
     : registry;
@@ -246,6 +252,7 @@ export async function init(opts: {
           usageRaw,
           analysisRegistry,
           designContext,
+          caseAssetsDir,
         ),
         render: parseRenderBox(usageRaw),
       });
@@ -547,7 +554,7 @@ async function buildComponentSource(
         ...compileComponentRefDefaults(variantRaw),
       },
       raw: variantRaw,
-      ir: await compileForInit(variantRaw, registry, designContext),
+      ir: await compileForInit(variantRaw, registry, designContext, masterAssetsDir),
       render: parseRenderBox(variantRaw),
     });
   }
@@ -564,6 +571,7 @@ async function compileForInit(
   raw: RawNode,
   registry: Awaited<ReturnType<typeof loadRegistry>>,
   design: CompileDesignContext,
+  assetsDir: string,
 ): Promise<DNode> {
   return compile(raw, {
     registry,
@@ -572,6 +580,7 @@ async function compileForInit(
     tokenValueMap: design.tokenValueMap,
     tokenColorMap: design.tokenColorMap,
     typographyMap: design.typographyMap,
+    writeAsset: makeAssetWriter(assetsDir),
   });
 }
 
@@ -579,6 +588,7 @@ async function compileUsageForInit(
   raw: RawNode,
   registry: Awaited<ReturnType<typeof loadRegistry>>,
   design: CompileDesignContext,
+  assetsDir: string,
 ): Promise<DNode> {
   return compile(raw, {
     registry,
@@ -588,7 +598,26 @@ async function compileUsageForInit(
     tokenValueMap: design.tokenValueMap,
     tokenColorMap: design.tokenColorMap,
     typographyMap: design.typographyMap,
+    writeAsset: makeAssetWriter(assetsDir),
   });
+}
+
+/** Build a writeAsset hook that persists bytes to `<dir>/<kind>_<hash>.<ext>`
+ *  and returns the bare filename. Identical bytes dedupe to a single file.
+ *  The hook writes lazily — once per filename per process. */
+function makeAssetWriter(assetsDir: string) {
+  const seen = new Set<string>();
+  return async (bytes: Uint8Array, ext: string): Promise<string> => {
+    const hash = createHash("sha1").update(bytes).digest("hex").slice(0, 16);
+    const kind = ext === "svg" ? "svg" : "image";
+    const filename = `${kind}_${hash}.${ext}`;
+    if (!seen.has(filename)) {
+      await mkdir(assetsDir, { recursive: true });
+      await writeFile(join(assetsDir, filename), bytes);
+      seen.add(filename);
+    }
+    return filename;
+  };
 }
 
 async function loadCompileDesignContext(

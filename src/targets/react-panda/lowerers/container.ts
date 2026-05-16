@@ -12,16 +12,18 @@ import type {
     Value,
 } from '../../../compiler/design-ast.ts'
 import { Align, Justify, NodeKind, Sizing, StrokeAlign } from '../../../compiler/design-ast.ts'
-import { attrsFromObject, compactPaddingStyles, jsxEl } from '../ast.ts'
+import { attrsFromObject, compactPaddingStyles, jsxEl, propAccess } from '../ast.ts'
 import {
     cssColorLiteral,
     isCornerRadii,
+    isImagePaintLiteral,
     isPerSideWidth,
     paintToProp,
     px2rem,
     shadowToCss,
     sizeToPx,
 } from '../data-lowerer.ts'
+import { imagePaintUrlMarker } from '../assets.ts'
 import type { LowererCtx as Ctx, LowerResult, ParentCtx } from '../lowerer-types.ts'
 import { boxCtx, emptyUses, flexCtx, LocalCtx, mergeUses, stackCtx } from '../lowerer-types.ts'
 import {
@@ -36,7 +38,6 @@ import {
     borderPaintStyleExpression,
     boxShadowAppendStyleExpression,
     boxShadowStyleExpression,
-    fillBackgroundStyleExpression,
     sanitizeKey,
     squircleFillBackgroundStyleExpression,
     squircleRefExpression,
@@ -155,10 +156,20 @@ export function emitContainer(n: DFlex | DStack | DBox, ctx: Ctx, parent: Parent
     }
 
     // background + opacity + render-bounds offset
+    let imageBgExpr: ast.Expression | undefined
     if (n.background) {
-        const bg = paintToProp(n.background)
-        if (bg !== undefined) {
-            styles.background = bg
+        if (isImagePaintLiteral(n.background)) {
+            imageBgExpr = imagePaintUrlMarker(
+                n.background.value,
+                nodeSourceId(n),
+                ctx,
+                uses,
+            )
+        } else {
+            const bg = paintToProp(n.background)
+            if (bg !== undefined) {
+                styles.background = bg
+            }
         }
     }
     if (n.opacity !== undefined) {
@@ -326,11 +337,20 @@ export function emitContainer(n: DFlex | DStack | DBox, ctx: Ctx, parent: Parent
         const baseShadow = typeof styles.boxShadow === 'string' ? styles.boxShadow : undefined
         pushStyle(borderPaintStyleExpression(borderPaintProp, background, shadowProp, baseShadow))
     } else if (backgroundProp) {
-        pushStyle(
-            squircleHook
-                ? squircleFillBackgroundStyleExpression(backgroundProp, squircleHook.key)
-                : fillBackgroundStyleExpression(backgroundProp),
-        )
+        if (squircleHook) {
+            pushStyle(squircleFillBackgroundStyleExpression(backgroundProp, squircleHook.key))
+        } else {
+            // Use Panda's JSX prop (token-aware) instead of style={…} so
+            // design-token strings (e.g. "components.fill.standard.primary")
+            // resolve to CSS variables instead of getting written as raw
+            // (invalid) color strings.
+            attrs.push(
+                f.createJsxAttribute(
+                    f.createIdentifier('background'),
+                    f.createJsxExpression(undefined, propAccess(backgroundProp)),
+                ),
+            )
+        }
     } else if (squircleHook) {
         pushStyle(squircleStyleExpression(squircleHook.key))
     }
@@ -344,6 +364,51 @@ export function emitContainer(n: DFlex | DStack | DBox, ctx: Ctx, parent: Parent
                 ? boxShadowAppendStyleExpression(baseShadow, shadowProp)
                 : boxShadowStyleExpression(shadowProp),
         )
+    }
+    if (imageBgExpr) {
+        const urlTemplate = f.createTemplateExpression(
+            f.createTemplateHead('url(', 'url(', undefined),
+            [
+                f.createTemplateSpan(
+                    imageBgExpr,
+                    f.createTemplateTail(')', ')', undefined),
+                ),
+            ],
+        )
+        const styleObj = f.createObjectLiteralExpression(
+            [
+                f.createPropertyAssignment(
+                    undefined,
+                    f.createIdentifier('backgroundImage'),
+                    undefined,
+                    undefined,
+                    urlTemplate,
+                ),
+                f.createPropertyAssignment(
+                    undefined,
+                    f.createIdentifier('backgroundSize'),
+                    undefined,
+                    undefined,
+                    f.createStringLiteral('cover', false),
+                ),
+                f.createPropertyAssignment(
+                    undefined,
+                    f.createIdentifier('backgroundPosition'),
+                    undefined,
+                    undefined,
+                    f.createStringLiteral('center', false),
+                ),
+                f.createPropertyAssignment(
+                    undefined,
+                    f.createIdentifier('backgroundRepeat'),
+                    undefined,
+                    undefined,
+                    f.createStringLiteral('no-repeat', false),
+                ),
+            ],
+            false,
+        )
+        pushStyle(f.createJsxExpression(undefined, styleObj))
     }
     const childParent: ParentCtx =
         direction === 'row'

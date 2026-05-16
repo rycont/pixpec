@@ -92,7 +92,17 @@ export async function runInteractiveBreakdownVerify(opts: BreakdownVerifyOptions
   const runtimeDir = resolve(outRoot, 'runtime')
   const resultsPath = resolve(outRoot, 'results.json')
   if (process.env.PIXPEC_BREAKDOWN_VERIFY_PRESERVE !== '1') {
-    await rm(outRoot, { recursive: true, force: true })
+    // Preserve runtimeDir AND figmaDir across runs:
+    //   - runtimeDir: cargo target cache keeps Rust builds incremental.
+    //   - figmaDir: figma exports are deterministic per node, no need to
+    //     re-export every run (~150ms × 900 entries saved).
+    // PIXPEC_BREAKDOWN_VERIFY_REFRESH_FIGMA=1 forces re-export when the
+    // Figma file has actually changed.
+    await Promise.all([
+      rm(dstDir, { recursive: true, force: true }),
+      rm(measureRoot, { recursive: true, force: true }),
+      rm(resultsPath, { force: true }),
+    ])
   }
   await mkdir(figmaDir, { recursive: true })
   await mkdir(dstDir, { recursive: true })
@@ -126,6 +136,21 @@ export async function runInteractiveBreakdownVerify(opts: BreakdownVerifyOptions
     skipped?: string
   }> = []
 
+  // Crash-recovery sidecar: each verifyEntry appends one line here so the
+  // total per-entry cost stays O(1) instead of the O(n) `JSON.stringify` of
+  // the whole records array that the old writeResults() performed. The full
+  // results.json is materialized once in finalize().
+  const recordsJsonlPath = resolve(outRoot, 'results.jsonl')
+  let recordsJsonlInit = false
+  async function appendRecord(record: typeof records[number]): Promise<void> {
+    if (!recordsJsonlInit) {
+      await mkdir(outRoot, { recursive: true })
+      await writeFile(recordsJsonlPath, '')
+      recordsJsonlInit = true
+    }
+    const { appendFile } = await import('node:fs/promises')
+    await appendFile(recordsJsonlPath, `${JSON.stringify(record)}\n`)
+  }
   async function writeResults(): Promise<void> {
     await mkdir(outRoot, { recursive: true })
     await writeFile(
@@ -150,8 +175,9 @@ export async function runInteractiveBreakdownVerify(opts: BreakdownVerifyOptions
 
   async function verifyEntry(entry: BreakdownVerifyEntry): Promise<{ ok: boolean; skipped?: string; error?: string }> {
     if (entry.captureSkip) {
-      records.push({ entry: summarize(entry), ok: true, skipped: entry.captureSkip })
-      await writeResults()
+      const rec = { entry: summarize(entry), ok: true, skipped: entry.captureSkip }
+      records.push(rec)
+      await appendRecord(rec)
       console.log(
         `[breakdown verify:${opts.target}] ${entry.index}/${opts.totalEntries} ${entry.sourceId} skipped: ${entry.captureSkip}`,
       )
@@ -162,8 +188,9 @@ export async function runInteractiveBreakdownVerify(opts: BreakdownVerifyOptions
     const generatedRel = entry.outputs[opts.target]
     if (!generatedRel) {
       const error = `breakdown verify: entry ${entry.index} has no ${opts.target} output`
-      records.push({ entry: summarize(entry), ok: false, error })
-      await writeResults()
+      const rec = { entry: summarize(entry), ok: false, error }
+      records.push(rec)
+      await appendRecord(rec)
       return { ok: false, error }
     }
 
@@ -233,8 +260,9 @@ export async function runInteractiveBreakdownVerify(opts: BreakdownVerifyOptions
         blobThreshold: opts.blobThreshold,
       })
       const ok = measure.blob_max_size <= maxBlob
-      records.push({ entry: summarize(entry), ok, measure })
-      await writeResults()
+      const rec = { entry: summarize(entry), ok, measure }
+      records.push(rec)
+      await appendRecord(rec)
       console.log(
         `  ${ok ? 'pass' : 'fail'} blob=${measure.blob_max_size} max=${measure.dE00_max.toFixed(2)} sum=${measure.dE00.toFixed(0)}`,
       )
@@ -247,12 +275,15 @@ export async function runInteractiveBreakdownVerify(opts: BreakdownVerifyOptions
       return { ok: true }
     } catch (error) {
       const message = error instanceof Error ? error.stack ?? error.message : String(error)
+      let rec: typeof records[number]
       if (records.at(-1)?.entry.index !== entry.index) {
-        records.push({ entry: summarize(entry), ok: false, error: message })
-      } else if (records.at(-1)) {
+        rec = { entry: summarize(entry), ok: false, error: message }
+        records.push(rec)
+      } else {
         records[records.length - 1]!.error = message
+        rec = records[records.length - 1]!
       }
-      await writeResults()
+      await appendRecord(rec)
       return { ok: false, error: message }
     }
   }
@@ -300,7 +331,17 @@ export async function runBreakdownVerify(opts: BreakdownVerifyOptions): Promise<
   const runtimeDir = resolve(outRoot, 'runtime')
   const resultsPath = resolve(outRoot, 'results.json')
   if (process.env.PIXPEC_BREAKDOWN_VERIFY_PRESERVE !== '1') {
-    await rm(outRoot, { recursive: true, force: true })
+    // Preserve runtimeDir AND figmaDir across runs:
+    //   - runtimeDir: cargo target cache keeps Rust builds incremental.
+    //   - figmaDir: figma exports are deterministic per node, no need to
+    //     re-export every run (~150ms × 900 entries saved).
+    // PIXPEC_BREAKDOWN_VERIFY_REFRESH_FIGMA=1 forces re-export when the
+    // Figma file has actually changed.
+    await Promise.all([
+      rm(dstDir, { recursive: true, force: true }),
+      rm(measureRoot, { recursive: true, force: true }),
+      rm(resultsPath, { force: true }),
+    ])
   }
   await mkdir(figmaDir, { recursive: true })
   await mkdir(dstDir, { recursive: true })
@@ -542,7 +583,10 @@ async function exportSourcePng(opts: {
   caseName: string
 }): Promise<string> {
   const target = resolve(opts.outDir, `${opts.caseName}.png`)
-  if (process.env.PIXPEC_BREAKDOWN_VERIFY_CACHE_FIGMA === '1' && existsSync(target)) {
+  // Figma exports are deterministic per (nodeId, scale); reuse the prior run's
+  // PNG when present. PIXPEC_BREAKDOWN_VERIFY_REFRESH_FIGMA=1 forces a refresh
+  // when the Figma file has actually changed.
+  if (existsSync(target) && process.env.PIXPEC_BREAKDOWN_VERIFY_REFRESH_FIGMA !== '1') {
     return target
   }
   await retryFigmaControl(() =>

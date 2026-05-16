@@ -3,6 +3,7 @@ import type { CodegenContext, CodegenResult } from '../types.ts'
 import type { GpuiEmitContext } from './emit/context.ts'
 import { emitNode } from './emit/node.ts'
 import { putTextAsset } from './emit/assets.ts'
+import { pad } from './emit/rust.ts'
 
 export async function codegenGpui(root: DNode, ctx: CodegenContext): Promise<CodegenResult> {
   const sourceId = ctx.sourceId ?? root.sourceId ?? 'root'
@@ -43,12 +44,13 @@ export async function codegenGpui(root: DNode, ctx: CodegenContext): Promise<Cod
     const outsideRing = outsideBorderRing(root, emitCtx, offset)
     let innerOverride = inner
     if (outsideRing) {
-      // Strip the inner div's own border emission so the colors don't stack —
-      // Figma draws the border exactly once at the outer ring.
-      innerOverride = inner
-        .split('\n')
-        .filter((line) => !/\.border(?:_[trbl])?\(px\(/.test(line) && !/\.border_color\(/.test(line))
-        .join('\n')
+      // Strip the inner div's OWN border emission so the colors don't stack —
+      // Figma draws the border exactly once at the outer ring. The regex
+      // must run only on the ROOT div's chain methods (the leading run of
+      // `.method(...)` lines at the root indent before any `.child(`); a
+      // global filter also removed every descendant's borders, which made
+      // unchecked radio/checkbox outlines vanish in the composed root frame.
+      innerOverride = stripRootOwnBorder(inner)
       const smoothing = (root as { cornerSmoothing?: number }).cornerSmoothing ?? 0
       if (smoothing > 0 && outsideRing.rounded !== undefined) {
         // Continuous-curvature corner: paint the border ring as a squircle
@@ -182,6 +184,54 @@ function exprToCssColor(expr: string): string | undefined {
     return `rgba(${r},${g},${b},${a.toFixed(3)})`
   }
   return undefined
+}
+
+function outsideBorderRingBorderPx(root: DNode, ctx: GpuiEmitContext): number {
+  const r = root as DNode & { border?: { width?: unknown; align?: string } }
+  if (r.border?.align !== 'outside') return 0
+  return lengthToNum(r.border.width, ctx)
+}
+
+function stripRootOwnBorder(inner: string): string {
+  // The first line containing `div()` is the root div. Subsequent lines with
+  // a deeper indent than that div() are chain methods on the root, UNTIL we
+  // see `.child(` at that same chain-method indent — past that, we're inside
+  // descendants and must leave their borders alone.
+  const lines = inner.split('\n')
+  const divLineIdx = lines.findIndex((l) => /\bdiv\(\)/.test(l))
+  if (divLineIdx < 0) return inner
+  const divIndent = (lines[divLineIdx]!.match(/^( *)/)?.[1].length) ?? 0
+  // Root chain methods are indented `divIndent + 4` typically; detect from
+  // the next non-empty line that begins with `.`.
+  let chainIndent = divIndent + 4
+  for (let i = divLineIdx + 1; i < lines.length; i += 1) {
+    const m = lines[i]!.match(/^( *)\./)
+    if (m) {
+      chainIndent = m[1].length
+      break
+    }
+  }
+  const out: string[] = []
+  let inRootChain = false
+  for (let i = 0; i < lines.length; i += 1) {
+    const line = lines[i]!
+    if (i === divLineIdx) {
+      out.push(line)
+      inRootChain = true
+      continue
+    }
+    if (inRootChain) {
+      const indent = line.match(/^( *)/)?.[1].length ?? 0
+      if (indent === chainIndent && /^ *\.child\(/.test(line)) {
+        inRootChain = false
+      } else if (indent === chainIndent && (/^ *\.border(?:_[trbl])?\(px\(/.test(line) || /^ *\.border_color\(/.test(line))) {
+        // skip — root's own border
+        continue
+      }
+    }
+    out.push(line)
+  }
+  return out.join('\n')
 }
 
 function outsideBorderRing(
