@@ -620,12 +620,23 @@ function reusableWorkdir(): string {
 }
 
 async function prepareGpuiFontDir(runtimeDir: string): Promise<string | undefined> {
-  const source = process.env.PIXPEC_GPUI_FONT_DIR
-  if (!source) return undefined
-  if (!existsSync(source)) return source
+  // Sources: explicit env override + auto-discovered project fonts dir.
+  // Auto-discovery lets users keep their project's typography (incl. woff2
+  // files like goorm-sans-code) without having to install them system-wide
+  // or set PIXPEC_GPUI_FONT_DIR; the GPUI App loads everything we stage via
+  // `text_system().add_fonts(bytes)`.
+  const sources: string[] = []
+  if (process.env.PIXPEC_GPUI_FONT_DIR) sources.push(process.env.PIXPEC_GPUI_FONT_DIR)
+  const projectFonts = resolve(process.cwd(), 'src/fonts')
+  if (existsSync(projectFonts) && !sources.includes(projectFonts)) sources.push(projectFonts)
+  if (sources.length === 0) return undefined
 
-  const files = await collectFontPaths(source)
-  if (files.length === 0) return source
+  const files: string[] = []
+  for (const s of sources) {
+    if (!existsSync(s)) continue
+    files.push(...(await collectFontPaths(s)))
+  }
+  if (files.length === 0) return sources[0]
 
   const dir = resolve(runtimeDir, 'gpui-fonts')
   await rm(dir, { recursive: true, force: true })
@@ -633,21 +644,42 @@ async function prepareGpuiFontDir(runtimeDir: string): Promise<string | undefine
 
   for (const file of files) {
     const hash = createHash('sha1').update(file).digest('hex').slice(0, 10)
-    const ext = file.split('.').pop() ?? 'ttf'
+    let ext = file.split('.').pop()?.toLowerCase() ?? 'ttf'
     const base = file
       .split(/[\\/]/)
       .pop()
       ?.replace(/\.[^.]+$/, '')
       .replace(/[^A-Za-z0-9._-]/g, '_') ?? 'font'
-    let instantiated = false
 
-    if (ext.toLowerCase() === 'ttf' && (await hasSfntTable(file, 'fvar'))) {
+    // GPUI's font loader (cosmic-text) accepts ttf/otf; decompress woff2
+    // upstream so codebases that vendor woff2-only fonts still resolve.
+    let sourceFile = file
+    if (ext === 'woff2') {
+      const decompressed = resolve(dir, `${base}-${hash}.ttf`)
+      try {
+        await execFileStrict(fonttoolsBin(), [
+          'ttLib.woff2',
+          'decompress',
+          '-o',
+          decompressed,
+          file,
+        ])
+        sourceFile = decompressed
+        ext = 'ttf'
+      } catch {
+        await rm(decompressed, { force: true }).catch(() => undefined)
+        continue
+      }
+    }
+
+    let instantiated = false
+    if (ext === 'ttf' && (await hasSfntTable(sourceFile, 'fvar'))) {
       for (const weight of GPUI_STATIC_FONT_WEIGHTS) {
         const out = resolve(dir, `${base}-${hash}-wght-${weight}.ttf`)
         try {
           await execFileStrict(fonttoolsBin(), [
             'varLib.instancer',
-            file,
+            sourceFile,
             `wght=${weight}`,
             '--output',
             out,
@@ -657,9 +689,14 @@ async function prepareGpuiFontDir(runtimeDir: string): Promise<string | undefine
           await rm(out, { force: true }).catch(() => undefined)
         }
       }
+      if (instantiated && sourceFile !== file) {
+        // Static instances replace the variable source — drop the staged
+        // variable to keep the asset list small.
+        await rm(sourceFile, { force: true }).catch(() => undefined)
+      }
     }
 
-    if (!instantiated) {
+    if (!instantiated && sourceFile === file) {
       await copyFile(file, resolve(dir, `${base}-${hash}.${ext}`))
     }
   }
@@ -681,7 +718,7 @@ async function collectFontPaths(dir: string): Promise<string[]> {
     const info = await stat(path).catch(() => undefined)
     if (!info) continue
     if (info.isDirectory()) files.push(...(await collectFontPaths(path)))
-    else if (/\.(ttf|otf)$/i.test(entry)) files.push(path)
+    else if (/\.(ttf|otf|woff2)$/i.test(entry)) files.push(path)
   }
   return files
 }

@@ -179,6 +179,9 @@ export async function runBreakdown(
     // Track in-flight verify promises so codegen can keep pumping while N
     // capture workers process previous entries in parallel. fail-fast: the
     // first failed promise sets `firstFailure` and the codegen loop exits.
+    // PIXPEC_BREAKDOWN_CONTINUE_ON_FAIL=1 disables fail-fast for diagnostic
+    // runs (gather all failing entries in one pass).
+    const continueOnFail = process.env.PIXPEC_BREAKDOWN_CONTINUE_ON_FAIL === '1'
     const inflight: Promise<unknown>[] = []
     let firstFailure: Error | undefined
     try {
@@ -234,10 +237,12 @@ export async function runBreakdown(
                 const p = interactive
                     .verifyEntry(captured as never)
                     .then((r) => {
-                        if (!r.ok && !firstFailure) {
+                        if (!r.ok && !firstFailure && !continueOnFail) {
                             firstFailure = new Error(
                                 r.error ?? `breakdown verify failed at entry ${captured.index} ${captured.sourceId}`,
                             )
+                        } else if (!r.ok && continueOnFail) {
+                            console.log(`[continue-on-fail] entry ${captured.index} ${captured.sourceId} FAILED: ${r.error}`)
                         }
                         // Remove this promise from the in-flight set once
                         // settled, so the backpressure check below sees an
