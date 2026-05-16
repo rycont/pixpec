@@ -58,7 +58,6 @@ export interface GenerateContext {
   tokenColorMap: Record<string, string>
   typographyMap: Record<string, string>
   fontManifest?: unknown
-  plugins: unknown[]
   registry: Registry
   targetRegistry: Map<string, { componentName: string; dir: string; hasProps: boolean }>
 }
@@ -76,7 +75,6 @@ export async function prepareGenerateContext(opts: {
   const { tokenMap, tokenValueMap, tokenColorMap } = await loadTokenMaps(root)
   const typographyMap = await loadTypographyMap(componentsDir)
   const fontManifest = await loadFontManifest(root)
-  const plugins = await loadPlugins(root)
   const registry = opts.registry ?? await loadRegistry(componentsDir)
   return {
     cfg,
@@ -87,7 +85,6 @@ export async function prepareGenerateContext(opts: {
     tokenColorMap,
     typographyMap,
     fontManifest,
-    plugins,
     registry,
     targetRegistry: toTargetRegistry(registry),
   }
@@ -192,7 +189,6 @@ export async function runGeneratePrepared(
       fonts: context.fontManifest,
     },
     registry: context.targetRegistry,
-    plugins: context.plugins as never,
     remBase: cfg.remBase,
     renderScale: opts.renderScale ?? cfg.scale,
     propKeys: opts.propKeys,
@@ -343,17 +339,6 @@ async function loadFontManifest(root: string): Promise<unknown> {
     return JSON.parse(await readFile(resolve(root, 'src/fonts/__pixpec-fonts.json'), 'utf8'))
   } catch {
     return undefined
-  }
-}
-
-async function loadPlugins(root: string): Promise<unknown[]> {
-  try {
-    const cfgPath = resolve(root, 'pixpec.config.ts')
-    if (!existsSync(cfgPath)) return []
-    const mod = (await import(cfgPath)) as { default?: { plugins?: unknown[] }; plugins?: unknown[] }
-    return mod.default?.plugins ?? mod.plugins ?? []
-  } catch {
-    return []
   }
 }
 

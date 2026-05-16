@@ -299,6 +299,7 @@ export async function init(opts: {
     variant,
     ast: dataScopeAst(
       variant,
+      componentName,
       component.defs,
       exposedSlots,
       promotionsByVariant.get(variant.key ?? "") ?? [],
@@ -770,14 +771,15 @@ function normalizePromotedValue(value: unknown): unknown {
 
 function dataScopeAst(
   variant: VariantSource,
+  componentName: string,
   defs: Record<string, PropDef>,
   exposedSlots: Record<string, ExposedSlot>,
   promotions: PromotedField[],
 ): DNode {
   const data = dataScopeEntries(variant, defs, exposedSlots, promotions);
-  if (Object.keys(data).length === 0) return variant.ir;
   return {
     kind: NodeKind.DataScope,
+    componentName,
     data,
     child: applyPromotedExpressions(variant.ir, promotions),
   };

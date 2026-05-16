@@ -155,6 +155,7 @@ export enum NodeKind {
  * node; it scopes prop expressions into its child and emits the child directly. */
 export interface DDataScope extends DNodeBase {
   kind: NodeKind.DataScope;
+  componentName: string;
   data: Record<string, DataScopeEntry>;
   child: DNode;
 }

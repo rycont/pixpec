@@ -1,66 +1,122 @@
-import type * as ast from "@typescript/native-preview/ast";
-import type { CodegenPlugin } from "../../types.ts";
-import type { DNode } from "../../compiler/design-ast.ts";
-import { Sizing } from "../../compiler/design-ast.ts";
-import type { CodegenContext, TargetComponentMeta } from "../types.ts";
+import type * as ast from '@typescript/native-preview/ast'
+import type { DNode } from '../../compiler/design-ast.ts'
+import type { CodegenContext, TargetComponentMeta } from '../types.ts'
+
+// Read-only build environment. Lowerers may read but must not mutate.
+export interface Env {
+    readonly remBase: number
+    readonly registry: Map<string, TargetComponentMeta>
+    readonly tokenMap: Record<string, string>
+    readonly typographyMap: Record<string, string>
+    readonly outputDir?: string
+    readonly rootDir?: string
+    readonly componentsDir?: string
+    readonly propsFile?: string
+    readonly viewConfig: NonNullable<CodegenContext['viewConfig']>
+}
+
+// Bottom-up accumulator. Each lowerer starts with `emptyUses()`, merges its
+// children's, and adds its own. Squircle hooks are keyed by node sourceId so
+// the final numeric id can be assigned post-merge in buildSource.
+export interface Uses {
+    usedJsxPatterns: Set<string>
+    usedTypography: Set<string>
+    usedComponents: Set<string>
+    usesCss: boolean
+    svgSidecars: Map<string, { alias: string; content: string; importPath: string }>
+    imageSidecars: Map<string, { content: Uint8Array }>
+    squircleHooks: Array<{ key: string; radiusPx: number; smoothing: number }>
+    usesTinting: boolean
+    tintFilterId: string
+}
 
 export interface LowererCtx {
-  remBase: number;
-  componentName: string;
-  registry: Map<string, TargetComponentMeta>;
-  tokenMap: Record<string, string>;
-  tokenValueMap: Record<string, number>;
-  tokenColorMap: Record<string, string>;
-  typographyMap: Record<string, string>;
-  plugins: CodegenPlugin[];
-  usedJsxPatterns: Set<string>;
-  usedTypography: Set<string>;
-  usedComponents: Set<string>;
-  usedPropBindings: Set<string>;
-  usesCss: boolean;
-  outputDir?: string;
-  rootDir?: string;
-  componentsDir?: string;
-  propsFile?: string;
-  viewConfig: NonNullable<CodegenContext["viewConfig"]>;
-  repetitionComponents: Array<{
-    name: string;
-    props: Record<string, unknown[]>;
-    jsx: ast.JsxChild;
-  }>;
-  repetitionMarkers: Map<string, string>;
-  repetitionCounter: number;
-  svgSidecars: Map<
-    string,
-    { alias: string; content: string; importPath: string }
-  >;
-  imageSidecars: Map<string, { content: Uint8Array }>;
-  assetUrls: Map<string, string>;
-  squircleHooks: Array<{ id: number; radiusPx: number; smoothing: number }>;
-  usesTinting: boolean;
-  tintFilterId: string;
+    readonly env: Env
 }
 
-export interface ParentCtx {
-  dir: "row" | "column" | "none";
-  mainSizing: Sizing;
-  isRoot?: boolean;
+export interface LowerResult {
+    jsx: ast.JsxChild
+    uses: Uses
 }
 
-export interface RepetitionComponent {
-  name: string;
-  props: Record<string, unknown[]>;
-  jsx: ast.JsxChild;
+// Parent-supplied context flags. A child cannot reference its parent object;
+// it only sees the flags the parent chose to grant. Invariants (e.g. Flex/Stack
+// are mutually exclusive) are upheld by the factory functions below — do not
+// construct a ParentCtx directly outside this module.
+export enum LocalCtx {
+    Root, // direct child of the top-level component scaffold
+    Flex, // parent lays out children on the row main axis
+    Stack, // parent lays out children on the column main axis
+    // No Flex and no Stack → parent is Box (no auto-layout).
+    MainAxisHug, // parent's main axis is Hug-sized (vs Fixed/Fill)
 }
 
-export const ROOT_PARENT: ParentCtx = {
-  dir: "none",
-  mainSizing: Sizing.Fixed,
-  isRoot: true,
-};
+export type ParentCtx = ReadonlySet<LocalCtx>
 
-export type NodeLowerer = (
-  node: DNode,
-  ctx: LowererCtx,
-  parent: ParentCtx,
-) => ast.JsxChild;
+export function flexCtx(opts: { mainAxisHug: boolean }): ParentCtx {
+    const s = new Set<LocalCtx>([LocalCtx.Flex])
+    if (opts.mainAxisHug) {
+        s.add(LocalCtx.MainAxisHug)
+    }
+    return s
+}
+
+export function stackCtx(opts: { mainAxisHug: boolean }): ParentCtx {
+    const s = new Set<LocalCtx>([LocalCtx.Stack])
+    if (opts.mainAxisHug) {
+        s.add(LocalCtx.MainAxisHug)
+    }
+    return s
+}
+
+export function boxCtx(): ParentCtx {
+    return new Set()
+}
+
+export const ROOT_PARENT: ParentCtx = new Set([LocalCtx.Root])
+
+export type NodeLowerer = (node: DNode, ctx: LowererCtx, parent: ParentCtx) => LowerResult
+
+export function emptyUses(): Uses {
+    return {
+        usedJsxPatterns: new Set(),
+        usedTypography: new Set(),
+        usedComponents: new Set(),
+        usesCss: false,
+        svgSidecars: new Map(),
+        imageSidecars: new Map(),
+        squircleHooks: [],
+        usesTinting: false,
+        tintFilterId: '',
+    }
+}
+
+export function mergeUses(into: Uses, ...froms: Uses[]): void {
+    for (const from of froms) {
+        for (const v of from.usedJsxPatterns) {
+            into.usedJsxPatterns.add(v)
+        }
+        for (const v of from.usedTypography) {
+            into.usedTypography.add(v)
+        }
+        for (const v of from.usedComponents) {
+            into.usedComponents.add(v)
+        }
+        if (from.usesCss) {
+            into.usesCss = true
+        }
+        for (const [k, v] of from.svgSidecars) {
+            into.svgSidecars.set(k, v)
+        }
+        for (const [k, v] of from.imageSidecars) {
+            into.imageSidecars.set(k, v)
+        }
+        into.squircleHooks.push(...from.squircleHooks)
+        if (from.usesTinting) {
+            into.usesTinting = true
+        }
+        if (from.tintFilterId && !into.tintFilterId) {
+            into.tintFilterId = from.tintFilterId
+        }
+    }
+}
