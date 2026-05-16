@@ -43,9 +43,21 @@ export async function emitContainer(
   const radiusValue = n.cornerRadius
   const hasUniformRadius = !!radiusValue && (typeof radiusValue === 'string' || (typeof radiusValue === 'object' && 'kind' in radiusValue))
   const useSquircleBg = smoothing > 0 && hasUniformRadius && !!n.background
-  let squircleBg: { radius: number; smoothing: number; color: string } | undefined
+  // When the node also has a stroke we route the border through the same
+  // squircle path (instead of GPUI's rectangular `.border()`) so the stroke
+  // (a) follows the squircle curve at the corners and (b) is painted on
+  // top of the squircle fill in one canvas pass — matching figma's
+  // `align: INSIDE` compositing where the alpha stroke blends with the
+  // fill, not with the parent frame's bg.
+  const useSquircleBorder = useSquircleBg && !!n.border
+  let squircleBg: { radius: number; smoothing: number; color: string; borderWidth?: number; borderColor?: string } | undefined
   if (useSquircleBg) {
-    stylesNode = { ...stylesNode, background: undefined, cornerRadius: undefined }
+    const next: typeof stylesNode = { ...stylesNode, background: undefined, cornerRadius: undefined }
+    if (useSquircleBorder) {
+      // Strip the rectangular border emission — squircle helper paints it.
+      ;(next as { border?: unknown }).border = undefined
+    }
+    stylesNode = next
     // GPUI's `absolute()` already establishes a positioning context for
     // descendants — appending `.relative()` would silently override that and
     // collapse the node back into normal flow, breaking any absolutely-
@@ -55,6 +67,16 @@ export async function emitContainer(
       radius: lengthNumber(radiusValue as Parameters<typeof lengthNumber>[0], ctx),
       smoothing,
       color: colorExpr(n.background!, ctx),
+    }
+    if (useSquircleBorder && n.border) {
+      const w = n.border.width
+      // Use a uniform stroke width — per-side widths are rare on
+      // rounded-with-smoothing frames and would need a separate path each.
+      const widthValue = typeof w === 'object' && w !== null && 'kind' in w
+        ? lengthNumber(w as Parameters<typeof lengthNumber>[0], ctx)
+        : 1
+      squircleBg.borderWidth = widthValue
+      squircleBg.borderColor = colorExpr(n.border.paint, ctx)
     }
   }
   addContainerStyles(chain, stylesNode, ctx)
@@ -73,9 +95,15 @@ export async function emitContainer(
   }
 
   if (squircleBg) {
-    chain.child(
-      `${pad(indent + 2)}super::pixpec_squircle_bg(${rustFloat(squircleBg.radius)}, ${rustFloat(squircleBg.smoothing)}, ${squircleBg.color})`,
-    )
+    if (squircleBg.borderWidth !== undefined && squircleBg.borderColor) {
+      chain.child(
+        `${pad(indent + 2)}super::pixpec_squircle_bg_with_border(${rustFloat(squircleBg.radius)}, ${rustFloat(squircleBg.smoothing)}, Some(${squircleBg.color}), ${rustFloat(squircleBg.borderWidth)}, ${squircleBg.borderColor})`,
+      )
+    } else {
+      chain.child(
+        `${pad(indent + 2)}super::pixpec_squircle_bg(${rustFloat(squircleBg.radius)}, ${rustFloat(squircleBg.smoothing)}, ${squircleBg.color})`,
+      )
+    }
   }
   for (const child of n.children) {
     chain.child(await emitChild(child, ctx, indent + 2, direction))

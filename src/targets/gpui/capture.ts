@@ -320,6 +320,21 @@ fn pixpec_squircle_params(corner_radius: f32, smoothing: f32, budget: f32) -> Pi
 }
 
 fn pixpec_squircle_path(width: f32, height: f32, corner_radius: f32, smoothing: f32, origin: Point<Pixels>) -> Path<Pixels> {
+    pixpec_squircle_path_builder(PathBuilder::fill(), width, height, corner_radius, smoothing, origin)
+}
+
+fn pixpec_squircle_stroke_path(width: f32, height: f32, corner_radius: f32, smoothing: f32, stroke_width: f32, origin: Point<Pixels>) -> Path<Pixels> {
+    pixpec_squircle_path_builder(PathBuilder::stroke(px(stroke_width)), width, height, corner_radius, smoothing, origin)
+}
+
+fn pixpec_squircle_path_builder(
+    mut path: PathBuilder,
+    width: f32,
+    height: f32,
+    corner_radius: f32,
+    smoothing: f32,
+    origin: Point<Pixels>,
+) -> Path<Pixels> {
     let budget = (width.min(height)) / 2.0;
     let r = corner_radius.min(budget).max(0.0);
     let params = pixpec_squircle_params(r, smoothing.max(0.0), budget);
@@ -333,8 +348,6 @@ fn pixpec_squircle_path(width: f32, height: f32, corner_radius: f32, smoothing: 
     let ox: f32 = origin.x.into();
     let oy: f32 = origin.y.into();
     let mk = |x: f32, y: f32| point(px(ox + x), px(oy + y));
-
-    let mut path = PathBuilder::fill();
     // M (width - p) 0
     let mut x = width - p;
     let mut y = 0.0_f32;
@@ -380,18 +393,69 @@ fn pixpec_squircle_path(width: f32, height: f32, corner_radius: f32, smoothing: 
 }
 
 pub fn pixpec_squircle_bg(corner_radius: f32, smoothing: f32, color: impl Into<Hsla>) -> impl IntoElement {
-    let hsla = color.into();
+    pixpec_squircle(corner_radius, smoothing, Some(color.into()), 0.0, Hsla::default())
+}
+
+/// Squircle bg with an optional matching stroke along the SAME path so the
+/// border curve aligns with the fill. Figma's INSIDE-aligned stroke is drawn
+/// inside the frame on top of the bg fill; we replicate that by painting the
+/// fill first, then a stroke at half the stroke width (so the stroke center
+/// rides along the squircle boundary — the inner half overlays the fill, the
+/// outer half sits at the box edge). When stroke_color has alpha it composites
+/// over the fill the same way figma does.
+pub fn pixpec_squircle_bg_with_border(
+    corner_radius: f32,
+    smoothing: f32,
+    fill_color: Option<impl Into<Hsla>>,
+    stroke_width: f32,
+    stroke_color: impl Into<Hsla>,
+) -> impl IntoElement {
+    pixpec_squircle(
+        corner_radius,
+        smoothing,
+        fill_color.map(|c| c.into()),
+        stroke_width,
+        stroke_color.into(),
+    )
+}
+
+fn pixpec_squircle(
+    corner_radius: f32,
+    smoothing: f32,
+    fill: Option<Hsla>,
+    stroke_width: f32,
+    stroke_color: Hsla,
+) -> impl IntoElement {
     canvas(
         |_bounds, _window, _cx| {},
         move |bounds: Bounds<Pixels>, _state, window, _cx| {
-            let path = pixpec_squircle_path(
-                bounds.size.width.into(),
-                bounds.size.height.into(),
-                corner_radius,
-                smoothing,
-                bounds.origin,
-            );
-            window.paint_path(path, hsla);
+            let w: f32 = bounds.size.width.into();
+            let h: f32 = bounds.size.height.into();
+            if let Some(fill_color) = fill {
+                let path = pixpec_squircle_path(w, h, corner_radius, smoothing, bounds.origin);
+                window.paint_path(path, fill_color);
+            }
+            if stroke_width > 0.0 {
+                // INSIDE-aligned stroke: the squircle path follows the outer
+                // edge of the frame; PathBuilder centers the stroke on the
+                // path. Shift the path inward by stroke_width/2 so the entire
+                // stroke lies inside the frame, matching figma's behavior.
+                let half = stroke_width / 2.0;
+                let inset_origin = point(
+                    bounds.origin.x + px(half),
+                    bounds.origin.y + px(half),
+                );
+                let inset_radius = (corner_radius - half).max(0.0);
+                let stroke_path = pixpec_squircle_stroke_path(
+                    (w - stroke_width).max(0.0),
+                    (h - stroke_width).max(0.0),
+                    inset_radius,
+                    smoothing,
+                    stroke_width,
+                    inset_origin,
+                );
+                window.paint_path(stroke_path, stroke_color);
+            }
         },
     )
     .absolute()
