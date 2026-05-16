@@ -9,6 +9,7 @@ import { switchToPageContaining } from './cfigma-meta.ts'
 import { exportFigmaNodes } from './figma.ts'
 import {
   captureGpuiGeneratedWithRuntime,
+  prepareGpuiCapturePool,
   prepareGpuiCaptureRuntime,
 } from './targets/gpui/capture.ts'
 
@@ -51,6 +52,228 @@ interface MeasureRecord {
   blob_max_size: number
   blob_max_bbox: [number, number, number, number]
   artifacts: { figma: string; impl: string }
+}
+
+export interface InteractiveBreakdownVerify {
+  verifyEntry: (entry: BreakdownVerifyEntry) => Promise<{ ok: boolean; skipped?: string; error?: string }>
+  finalize: () => Promise<{ pass: number; fail: number; skipped: number; total: number }>
+  close: () => Promise<void>
+}
+
+/**
+ * Streaming variant of {@link runBreakdownVerify}. The caller drives the loop
+ * by feeding one entry at a time (typically right after that entry's codegen
+ * completes), so a failure short-circuits the surrounding breakdown without
+ * forcing it to first generate every other node's source.
+ *
+ * The function batch-prefetches source PNGs for `expectedSourceIds` upfront,
+ * matching the throughput optimization of the non-interactive path.
+ */
+export async function runInteractiveBreakdownVerify(opts: BreakdownVerifyOptions & {
+  figmaId: string
+  viewName: string
+  expectedSourceIds: string[]
+  totalEntries: number
+  workerCount?: number
+}): Promise<InteractiveBreakdownVerify> {
+  if (opts.target !== 'gpui' && opts.target !== 'react-panda') {
+    throw new Error(`breakdown verify: target ${opts.target} is not supported yet`)
+  }
+  const fileKey = opts.figmaId.slice(0, opts.figmaId.indexOf(':'))
+  const maxBlob = opts.maxBlob ?? 25
+  const gpuiOutputScale = Math.max(
+    1,
+    Number(process.env.PIXPEC_BREAKDOWN_VERIFY_OUTPUT_SCALE ?? 1),
+  )
+  const outRoot = resolve(opts.viewDir, 'breakdown', 'verify', opts.target)
+  const figmaDir = resolve(outRoot, 'figma')
+  const dstDir = resolve(outRoot, 'dst')
+  const measureRoot = resolve(outRoot, 'measure')
+  const runtimeDir = resolve(outRoot, 'runtime')
+  const resultsPath = resolve(outRoot, 'results.json')
+  if (process.env.PIXPEC_BREAKDOWN_VERIFY_PRESERVE !== '1') {
+    await rm(outRoot, { recursive: true, force: true })
+  }
+  await mkdir(figmaDir, { recursive: true })
+  await mkdir(dstDir, { recursive: true })
+  await mkdir(measureRoot, { recursive: true })
+
+  const workerCount = Math.max(1, opts.workerCount ?? Number(process.env.PIXPEC_GPUI_WORKERS ?? 1))
+  // For gpui, always go through the pool — even at N=1 the pool's semaphore
+  // serializes concurrent verifyEntry calls onto the single runtime so the
+  // shared `src/generated.rs` swap stays race-free.
+  const runtime =
+    opts.target === 'gpui'
+      ? await prepareGpuiCapturePool(runtimeDir, workerCount)
+      : await (await import('./targets/react-panda/capture.ts')).prepareReactPandaGeneratedCaptureRuntime({
+          runtimeDir,
+          rootDir: opts.rootDir ?? resolve(opts.viewDir, '../../..'),
+          remBase: opts.cfg.remBase,
+        })
+
+  const prefetched = await prefetchSourcePngs({
+    cfg: opts.cfg,
+    fileKey,
+    entries: opts.expectedSourceIds.map((sourceId) => ({ sourceId })),
+    figmaDir,
+  })
+
+  const records: Array<{
+    entry: Pick<BreakdownVerifyEntry, 'index' | 'sourceId' | 'sourceName' | 'sourceType'>
+    ok: boolean
+    measure?: MeasureRecord
+    error?: string
+    skipped?: string
+  }> = []
+
+  async function writeResults(): Promise<void> {
+    await mkdir(outRoot, { recursive: true })
+    await writeFile(
+      resultsPath,
+      `${JSON.stringify(
+        {
+          viewName: opts.viewName,
+          target: opts.target,
+          maxBlob,
+          stoppedAt: records.find((r) => !r.ok)?.entry ?? null,
+          pass: records.filter((r) => r.ok && !r.skipped).length,
+          fail: records.filter((r) => !r.ok).length,
+          skipped: records.filter((r) => r.skipped).length,
+          totalChecked: records.length,
+          records,
+        },
+        null,
+        2,
+      )}\n`,
+    )
+  }
+
+  async function verifyEntry(entry: BreakdownVerifyEntry): Promise<{ ok: boolean; skipped?: string; error?: string }> {
+    if (entry.captureSkip) {
+      records.push({ entry: summarize(entry), ok: true, skipped: entry.captureSkip })
+      await writeResults()
+      console.log(
+        `[breakdown verify:${opts.target}] ${entry.index}/${opts.totalEntries} ${entry.sourceId} skipped: ${entry.captureSkip}`,
+      )
+      return { ok: true, skipped: entry.captureSkip }
+    }
+
+    const caseName = `${String(entry.index).padStart(4, '0')}_${safeName(entry.sourceId)}`
+    const generatedRel = entry.outputs[opts.target]
+    if (!generatedRel) {
+      const error = `breakdown verify: entry ${entry.index} has no ${opts.target} output`
+      records.push({ entry: summarize(entry), ok: false, error })
+      await writeResults()
+      return { ok: false, error }
+    }
+
+    console.log(`[breakdown verify:${opts.target}] ${entry.index}/${opts.totalEntries} ${entry.sourceId}`)
+    try {
+      const generatedPath = resolve(opts.viewDir, generatedRel)
+      if (!existsSync(generatedPath)) {
+        throw new Error(`missing generated file: ${generatedPath}`)
+      }
+
+      const sourcePng = prefetched.get(entry.sourceId) ?? await exportSourcePng({
+        cfg: opts.cfg,
+        fileKey,
+        nodeId: entry.sourceId,
+        outDir: figmaDir,
+        caseName,
+      })
+      const targetPng = resolve(figmaDir, `${caseName}.png`)
+      if (sourcePng !== targetPng && !existsSync(targetPng)) {
+        await copyFile(sourcePng, targetPng)
+      }
+      const sharp = (await import('sharp')).default
+      const meta = await sharp(sourcePng).metadata()
+      const width = Math.max(1, meta.width ?? 0, Math.ceil(entry.sourceWidth ?? 0))
+      const height = Math.max(1, meta.height ?? 0, Math.ceil(entry.sourceHeight ?? 0))
+      const dstPng = resolve(dstDir, `${caseName}.png`)
+      if (opts.target === 'gpui') {
+        const capturePng = gpuiOutputScale > 1
+          ? resolve(dstDir, `${caseName}@${gpuiOutputScale}x.png`)
+          : dstPng
+        const captureOpts = {
+          generatedPath,
+          width,
+          height,
+          outputScale: gpuiOutputScale,
+          outPath: capturePng,
+        }
+        if ('capture' in runtime && typeof (runtime as { capture?: unknown }).capture === 'function') {
+          await (runtime as { capture: (o: typeof captureOpts) => Promise<void> }).capture(captureOpts)
+        } else {
+          await captureGpuiGeneratedWithRuntime({
+            runtime: runtime as Awaited<ReturnType<typeof prepareGpuiCaptureRuntime>>,
+            caseDir: resolve(runtimeDir, caseName),
+            ...captureOpts,
+          })
+        }
+        if (capturePng !== dstPng) {
+          await downsampleCopy(capturePng, dstPng, width, height)
+        }
+      } else {
+        const { captureReactPandaGeneratedWithRuntime } = await import('./targets/react-panda/capture.ts')
+        await captureReactPandaGeneratedWithRuntime({
+          runtime: runtime as never,
+          generatedPath,
+          width,
+          height,
+          outputScale: opts.cfg.scale ?? 2,
+          outPath: dstPng,
+        })
+      }
+
+      const measure = await measurePair({
+        caseName,
+        sourcePng,
+        dstPng,
+        measureRoot,
+        blobThreshold: opts.blobThreshold,
+      })
+      const ok = measure.blob_max_size <= maxBlob
+      records.push({ entry: summarize(entry), ok, measure })
+      await writeResults()
+      console.log(
+        `  ${ok ? 'pass' : 'fail'} blob=${measure.blob_max_size} max=${measure.dE00_max.toFixed(2)} sum=${measure.dE00.toFixed(0)}`,
+      )
+      if (!ok) {
+        return {
+          ok: false,
+          error: `breakdown verify failed at entry ${entry.index} ${entry.sourceId}: blob=${measure.blob_max_size} > maxBlob=${maxBlob}`,
+        }
+      }
+      return { ok: true }
+    } catch (error) {
+      const message = error instanceof Error ? error.stack ?? error.message : String(error)
+      if (records.at(-1)?.entry.index !== entry.index) {
+        records.push({ entry: summarize(entry), ok: false, error: message })
+      } else if (records.at(-1)) {
+        records[records.length - 1]!.error = message
+      }
+      await writeResults()
+      return { ok: false, error: message }
+    }
+  }
+
+  async function close(): Promise<void> {
+    if ('close' in runtime && typeof (runtime as { close?: () => Promise<void> }).close === 'function') {
+      await (runtime as { close: () => Promise<void> }).close()
+    }
+  }
+
+  async function finalize(): Promise<{ pass: number; fail: number; skipped: number; total: number }> {
+    await writeResults()
+    return {
+      pass: records.filter((r) => r.ok && !r.skipped).length,
+      fail: records.filter((r) => !r.ok).length,
+      skipped: records.filter((r) => r.skipped).length,
+      total: records.length,
+    }
+  }
+
+  return { verifyEntry, finalize, close }
 }
 
 export async function runBreakdownVerify(opts: BreakdownVerifyOptions): Promise<{
@@ -113,6 +336,16 @@ export async function runBreakdownVerify(opts: BreakdownVerifyOptions): Promise<
     throw new Error(`breakdown verify: no manifest entry for sourceId ${opts.sourceId}`)
   }
 
+  // Prefetch all source PNGs in one batched cfigma export. Per-node cfigma
+  // calls were a 0.3s baseline tax; one batched call lands all PNGs in
+  // ~100ms/node and lets the verify loop skip the network/IPC round-trip.
+  const prefetched = await prefetchSourcePngs({
+    cfg: opts.cfg,
+    fileKey,
+    entries,
+    figmaDir,
+  })
+
   try {
   for (const entry of entries) {
     if (entry.captureSkip) {
@@ -142,13 +375,19 @@ export async function runBreakdownVerify(opts: BreakdownVerifyOptions): Promise<
         throw new Error(`missing generated file: ${generatedPath}`)
       }
 
-      const sourcePng = await exportSourcePng({
+      const sourcePng = prefetched.get(entry.sourceId) ?? await exportSourcePng({
         cfg: opts.cfg,
         fileKey,
         nodeId: entry.sourceId,
         outDir: figmaDir,
         caseName,
       })
+      // If prefetched and the target caseName.png isn't laid out yet, copy now
+      // so downstream measure/storage layouts find it where they expect.
+      const targetPng = resolve(figmaDir, `${caseName}.png`)
+      if (sourcePng !== targetPng && !existsSync(targetPng)) {
+        await copyFile(sourcePng, targetPng)
+      }
       const sharp = (await import('sharp')).default
       const meta = await sharp(sourcePng).metadata()
       const width = Math.max(1, meta.width ?? 0, Math.ceil(entry.sourceWidth ?? 0))
@@ -256,6 +495,42 @@ export async function runBreakdownVerify(opts: BreakdownVerifyOptions): Promise<
         2,
       )}\n`,
     )
+  }
+}
+
+async function prefetchSourcePngs(opts: {
+  cfg: PixpecConfig
+  fileKey: string
+  entries: Array<{ sourceId: string; captureSkip?: string }>
+  figmaDir: string
+}): Promise<Map<string, string>> {
+  const nodeIds = opts.entries.filter((e) => !e.captureSkip).map((e) => e.sourceId)
+  if (nodeIds.length === 0) return new Map()
+  // cfigma's batch export silently scales differently depending on the nodes
+  // in the selection (some get 2× the requested scale, some get 1×); without
+  // a deterministic rule we cannot resize PNGs back to design pixels reliably.
+  // Skip the optimization and let the verify loop call exportSourcePng
+  // per-entry, where single-id exports respect --scale exactly.
+  if (nodeIds.length > 1) return new Map()
+  try {
+    return await retryFigmaControl(() =>
+      exportFigmaNodes({
+        tabPattern: opts.fileKey,
+        nodeIds,
+        outDir: opts.figmaDir,
+        scale: opts.cfg.scale ?? 2,
+        bridge: opts.cfg.bridge,
+        cfigmaBin: opts.cfg.cfigmaBin,
+      }),
+    )
+  } catch (error) {
+    // Batch export is a best-effort optimization. If it fails (e.g. nodes
+    // span pages that need a switchToPageContaining first), fall back to the
+    // per-entry path that the verify loop already supports.
+    console.error(
+      `[breakdown verify] batch source export failed; falling back to per-entry exports. cause: ${error instanceof Error ? error.message : String(error)}`,
+    )
+    return new Map()
   }
 }
 

@@ -3,7 +3,7 @@ import { dataUrlAsset, putBinaryAssetWithSuffix } from "./assets.ts";
 import { div, image } from "./chain.ts";
 import type { GpuiEmitContext } from "./context.ts";
 import { addNodeLayout } from "./layout.ts";
-import { sizeExpr, sizeValue } from "./values.ts";
+import { lengthExpr, lengthNumber } from "./values.ts";
 
 export async function emitImage(
   n: DImage,
@@ -12,8 +12,8 @@ export async function emitImage(
 ): Promise<string> {
   if (!n.dataUrl) {
     const chain = div(indent)
-      .method("w", sizeExpr(n.width, ctx))
-      .method("h", sizeExpr(n.height, ctx));
+      .method("w", lengthExpr(n.width, ctx))
+      .method("h", lengthExpr(n.height, ctx));
     addNodeLayout(chain, n, ctx);
     return chain.toString();
   }
@@ -21,15 +21,15 @@ export async function emitImage(
   const path = await imageAsset(ctx, n);
   if (!path) {
     const chain = div(indent)
-      .method("w", sizeExpr(n.width, ctx))
-      .method("h", sizeExpr(n.height, ctx));
+      .method("w", lengthExpr(n.width, ctx))
+      .method("h", lengthExpr(n.height, ctx));
     addNodeLayout(chain, n, ctx);
     return chain.toString();
   }
 
   const chain = image(indent, path)
-    .method("w", sizeExpr(n.width, ctx))
-    .method("h", sizeExpr(n.height, ctx))
+    .method("w", lengthExpr(n.width, ctx))
+    .method("h", lengthExpr(n.height, ctx))
     .method("object_fit", "ObjectFit::Fill");
   addNodeLayout(chain, n, ctx);
   return chain.toString();
@@ -71,8 +71,8 @@ async function imageAsset(
       top + 1,
       meta.height,
     );
-    const targetWidth = Math.round(sizeValue(n.width, ctx) * ctx.renderScale);
-    const targetHeight = Math.round(sizeValue(n.height, ctx) * ctx.renderScale);
+    const targetWidth = Math.round(lengthNumber(n.width, ctx) * ctx.renderScale);
+    const targetHeight = Math.round(lengthNumber(n.height, ctx) * ctx.renderScale);
     let pipeline = sharp(input).extract({
       left,
       top,

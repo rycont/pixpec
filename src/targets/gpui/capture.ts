@@ -56,61 +56,162 @@ export interface GpuiCaptureRuntime {
   gpuiPreviewDir: string
   cargoLockPath: string
   fontDir?: string
+  xvfbDisplay?: string
+  xvfbProcess?: import('node:child_process').ChildProcess
+  close?: () => Promise<void>
+}
+
+export interface GpuiCapturePool {
+  runtimeDir: string
+  workers: GpuiCaptureRuntime[]
+  capture: (opts: {
+    generatedPath: string
+    width: number
+    height: number
+    outputScale: number
+    outPath: string
+  }) => Promise<void>
+  close: () => Promise<void>
+}
+
+/**
+ * Build a worker pool of independent capture runtimes. Each worker owns its
+ * own cargo project rooted at `<runtimeDir>/w<i>/`; cargo's per-project locks
+ * stop concurrent builds in the same directory from racing, so true parallel
+ * capture requires per-worker dirs. Deps still compile cold once per worker
+ * (~30s), which is the price of admission — amortized across hundreds of
+ * subsequent ~1s incremental builds it pays for itself by N=2.
+ */
+export async function prepareGpuiCapturePool(
+  runtimeDir: string,
+  workerCount: number,
+): Promise<GpuiCapturePool> {
+  if (workerCount < 1) workerCount = 1
+  const workers = await Promise.all(
+    Array.from({ length: workerCount }, (_, i) =>
+      prepareGpuiCaptureRuntime(resolve(runtimeDir, `w${i}`)),
+    ),
+  )
+  const free: GpuiCaptureRuntime[] = [...workers]
+  const waiters: Array<(w: GpuiCaptureRuntime) => void> = []
+  const acquire = (): Promise<GpuiCaptureRuntime> =>
+    new Promise((resolveAcquire) => {
+      const next = free.shift()
+      if (next) resolveAcquire(next)
+      else waiters.push(resolveAcquire)
+    })
+  const release = (w: GpuiCaptureRuntime): void => {
+    const waiter = waiters.shift()
+    if (waiter) waiter(w)
+    else free.push(w)
+  }
+  return {
+    runtimeDir,
+    workers,
+    capture: async (opts) => {
+      const w = await acquire()
+      try {
+        await captureGpuiGeneratedWithRuntime({ runtime: w, ...opts })
+      } finally {
+        release(w)
+      }
+    },
+    close: async () => {
+      for (const w of workers) {
+        if (w.close) await w.close()
+      }
+    },
+  }
 }
 
 export async function prepareGpuiCaptureRuntime(runtimeDir: string): Promise<GpuiCaptureRuntime> {
   const gpuiPreviewDir = await ensurePatchedGpui()
-  return {
+  const runtime: GpuiCaptureRuntime = {
     runtimeDir,
     libDir: await ensureLinkerLibs(),
     gpuiPreviewDir,
     cargoLockPath: resolve(gpuiPreviewDir, 'Cargo.lock'),
     fontDir: await prepareGpuiFontDir(runtimeDir),
   }
+  // Lay down a single cargo project at runtimeDir; main.rs is content-stable
+  // across cases so cargo's incremental cache only rebuilds the `generated`
+  // module + final link as `src/generated.rs` is swapped per case.
+  await writeSharedRuntimeProject({
+    runtimeDir,
+    gpuiPath: resolve(runtime.gpuiPreviewDir, 'vendor/gpui'),
+    cargoLockPath: runtime.cargoLockPath,
+  })
+  return runtime
+}
+
+async function startXvfb(): Promise<{ display: string; process: import('node:child_process').ChildProcess } | undefined> {
+  if (process.env.PIXPEC_GPUI_DISABLE_XVFB) return undefined
+  const { spawn } = await import('node:child_process')
+  // Pick a high display number unlikely to collide.
+  const display = `:${99 + Math.floor(Math.random() * 100)}`
+  // -nolisten tcp avoids opening a TCP port; -screen 0 ... sets the virtual
+  // display size large enough for any capture viewport we render into.
+  const proc = spawn('Xvfb', [display, '-nolisten', 'tcp', '-screen', '0', '4096x4096x24'], {
+    stdio: 'ignore',
+    detached: false,
+  })
+  // Wait until Xvfb has created its socket file (then it is accepting clients).
+  const socket = `/tmp/.X11-unix/X${display.slice(1)}`
+  const deadline = Date.now() + 5000
+  while (Date.now() < deadline) {
+    if (existsSync(socket)) return { display, process: proc }
+    await new Promise((r) => setTimeout(r, 25))
+  }
+  proc.kill('SIGTERM')
+  throw new Error(`Xvfb failed to start on display ${display} within 5s`)
 }
 
 export async function captureGpuiGeneratedWithRuntime(opts: {
   runtime: GpuiCaptureRuntime
-  caseDir: string
+  /** Unused now (kept for caller compatibility) — the shared runtime owns the
+   *  cargo project; per-case state is conveyed via env vars. */
+  caseDir?: string
   generatedPath: string
   width: number
   height: number
   outputScale: number
   outPath: string
 }): Promise<void> {
-  await mkdir(resolve(opts.caseDir, 'src'), { recursive: true })
-  await writeRuntimeProject({
-    caseDir: opts.caseDir,
-    generatedPath: opts.generatedPath,
-    gpuiPath: resolve(opts.runtime.gpuiPreviewDir, 'vendor/gpui'),
-    cargoLockPath: opts.runtime.cargoLockPath,
-    width: opts.width,
-    height: opts.height,
-    outputScale: opts.outputScale,
-    outPath: opts.outPath,
-  })
-  await execFileStrict('cargo', ['build'], {
-    cwd: opts.caseDir,
-    env: sharedCargoEnv(opts.runtime.runtimeDir, opts.runtime.libDir),
-  })
-  await execFileStrict(resolve(opts.runtime.runtimeDir, 'target/debug/pixpec-gpui-capture'), [], {
-    cwd: opts.caseDir,
-    env: sharedCargoEnv(opts.runtime.runtimeDir, opts.runtime.libDir, opts.runtime.fontDir),
-  })
+  // Swap in this case's generated source. Cargo treats this as a change to
+  // the `generated` module only — main.rs and all deps stay cached.
+  await copyFile(opts.generatedPath, resolve(opts.runtime.runtimeDir, 'src/generated.rs'))
+  const env: Record<string, string> = {
+    ...sharedCargoEnv(opts.runtime.runtimeDir, opts.runtime.libDir, opts.runtime.fontDir),
+    PIXPEC_GPUI_WIDTH: String(opts.width),
+    PIXPEC_GPUI_HEIGHT: String(opts.height),
+    PIXPEC_GPUI_OUTPUT_SCALE: String(opts.outputScale),
+    PIXPEC_GPUI_OUT_PATH: opts.outPath,
+    PIXPEC_GPUI_ASSETS_DIR: resolve(opts.generatedPath, '..'),
+  }
+  await execFileStrict('cargo', ['build', '--offline'], { cwd: opts.runtime.runtimeDir, env })
+  await execFileStrict(
+    resolve(opts.runtime.runtimeDir, 'target/debug/pixpec-gpui-capture'),
+    [],
+    { cwd: opts.runtime.runtimeDir, env },
+  )
 }
 
-async function writeRuntimeProject(opts: {
-  caseDir: string
-  generatedPath: string
+async function writeFileIfChanged(path: string, content: string): Promise<void> {
+  try {
+    const current = await readFile(path, 'utf8')
+    if (current === content) return
+  } catch {}
+  await writeFile(path, content)
+}
+
+async function writeSharedRuntimeProject(opts: {
+  runtimeDir: string
   gpuiPath: string
   cargoLockPath: string
-  width: number
-  height: number
-  outputScale: number
-  outPath: string
 }): Promise<void> {
-  await writeFile(
-    resolve(opts.caseDir, 'Cargo.toml'),
+  await mkdir(resolve(opts.runtimeDir, 'src'), { recursive: true })
+  await writeFileIfChanged(
+    resolve(opts.runtimeDir, 'Cargo.toml'),
     `[package]
 name = "pixpec-gpui-capture"
 version = "0.1.0"
@@ -120,16 +221,36 @@ edition = "2021"
 anyhow = "1.0"
 gpui = { path = ${JSON.stringify(opts.gpuiPath)} }
 image = { version = "0.25.9", default-features = false, features = ["png"] }
+
+# Linker is the long pole of every incremental rebuild. Stripping debug info
+# from the dev profile cuts the linker step from ~700ms to ~250ms on this
+# project — we never debug the capture binary, we just run it and read its
+# framebuffer dump.
+[profile.dev]
+debug = 0
+strip = "debuginfo"
 `,
   )
-  await copyFile(opts.cargoLockPath, resolve(opts.caseDir, 'Cargo.lock'))
-  const generatedHash = createHash('sha1')
-    .update(await readFile(opts.generatedPath))
-    .digest('hex')
-  await writeFile(
-    resolve(opts.caseDir, 'src/main.rs'),
-    `// generated source hash: ${generatedHash}
-use anyhow::Result;
+  await copyFile(opts.cargoLockPath, resolve(opts.runtimeDir, 'Cargo.lock'))
+  // Ensure src/generated.rs exists so a fresh `cargo check` after prepare can
+  // succeed even before the first case is captured. Real content is filled in
+  // per case via copyFile in captureGpuiGeneratedWithRuntime.
+  const generatedRs = resolve(opts.runtimeDir, 'src/generated.rs')
+  if (!existsSync(generatedRs)) {
+    await writeFile(
+      generatedRs,
+      `use gpui::{div, Context, IntoElement, Render, Window};
+use gpui::prelude::*;
+pub struct Generated;
+impl Render for Generated {
+    fn render(&mut self, _w: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement { div() }
+}
+`,
+    )
+  }
+  await writeFileIfChanged(
+    resolve(opts.runtimeDir, 'src/main.rs'),
+    `use anyhow::Result;
 use gpui::{
     px, point, size, App, Application, AssetSource, Bounds, SharedString, WindowBounds,
     WindowKind, WindowOptions,
@@ -140,7 +261,6 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-#[path = ${JSON.stringify(opts.generatedPath)}]
 mod generated;
 
 struct CaptureAssets {
@@ -170,13 +290,25 @@ impl AssetSource for CaptureAssets {
     }
 }
 
-fn main() {
-    let generated_dir = PathBuf::from(${JSON.stringify(opts.generatedPath)})
-        .parent()
-        .expect("generated source path has parent directory")
-        .to_path_buf();
+fn env_f32(name: &str) -> f32 {
+    std::env::var(name)
+        .unwrap_or_else(|_| panic!("missing env var {}", name))
+        .parse()
+        .unwrap_or_else(|_| panic!("env var {} is not a valid f32", name))
+}
 
-    Application::new().with_assets(CaptureAssets { base: generated_dir }).run(|cx: &mut App| {
+fn env_path(name: &str) -> PathBuf {
+    PathBuf::from(std::env::var_os(name).unwrap_or_else(|| panic!("missing env var {}", name)))
+}
+
+fn main() {
+    let viewport_w: f32 = env_f32("PIXPEC_GPUI_WIDTH");
+    let viewport_h: f32 = env_f32("PIXPEC_GPUI_HEIGHT");
+    let output_scale: f32 = env_f32("PIXPEC_GPUI_OUTPUT_SCALE");
+    let out_path: PathBuf = env_path("PIXPEC_GPUI_OUT_PATH");
+    let assets_dir: PathBuf = env_path("PIXPEC_GPUI_ASSETS_DIR");
+
+    Application::new().with_assets(CaptureAssets { base: assets_dir }).run(move |cx: &mut App| {
         if let Some(font_dir) = std::env::var_os("PIXPEC_GPUI_FONT_DIR").map(PathBuf::from) {
             let mut fonts = Vec::new();
             collect_font_files(&font_dir, &mut fonts);
@@ -193,10 +325,7 @@ fn main() {
         };
         let bounds = Bounds::new(
             origin,
-            size(
-                px(${float(opts.width)} * ${float(opts.outputScale)}),
-                px(${float(opts.height)} * ${float(opts.outputScale)}),
-            ),
+            size(px(viewport_w * output_scale), px(viewport_h * output_scale)),
         );
         let handle = cx.open_window(
             WindowOptions {
@@ -213,13 +342,13 @@ fn main() {
         .unwrap();
 
         cx.spawn(async move |cx| {
-            cx.background_executor().timer(Duration::from_millis(750)).await;
+            cx.background_executor().timer(Duration::from_millis(50)).await;
             let result = handle.update(cx, |_view, window, _cx| {
                 let Some((width, height, mut bgra)) = window.capture_frame() else {
                     anyhow::bail!("GPUI capture_frame returned None");
                 };
-                let target_width = (${float(opts.width)}_f32 * ${float(opts.outputScale)}_f32).round().max(1.0) as u32;
-                let target_height = (${float(opts.height)}_f32 * ${float(opts.outputScale)}_f32).round().max(1.0) as u32;
+                let target_width = (viewport_w * output_scale).round().max(1.0) as u32;
+                let target_height = (viewport_h * output_scale).round().max(1.0) as u32;
                 let frame_scale_x = width as f32 / target_width as f32;
                 let frame_scale_y = height as f32 / target_height as f32;
                 let can_resample = width >= target_width &&
@@ -257,7 +386,7 @@ fn main() {
                         image::imageops::FilterType::Lanczos3,
                     )
                 };
-                image.save(Path::new(${JSON.stringify(opts.outPath)}))?;
+                image.save(out_path.as_path())?;
                 Ok::<_, anyhow::Error>(())
             });
             let result = result

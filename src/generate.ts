@@ -34,6 +34,10 @@ export interface GenerateOptions {
   propsFile?: string | null
   /** Compile INSTANCE nodes as detached raw subtrees. */
   detachInstances?: boolean
+  /** Compile only the root INSTANCE as its resolved raw subtree, inlining any
+   * component prop refs with their concrete override values. Intended for
+   * breakdown sub-entry standalone rendering. */
+  detachRootInstance?: boolean
   /** Override pixpec.toml scale for generated target code. */
   renderScale?: number
   /** Normalized view.config.json data for view-level semantic codegen. */
@@ -155,12 +159,14 @@ export async function runGeneratePrepared(
     tab = tabs.find((t) => t.key === fileKey)
     if (!tab) throw new Error(`pixpec generate: no open figma tab matches fileKey ${fileKey}`)
     const raw = await dump({ cfigmaBin: cfg.cfigmaBin ?? 'cfigma', tab: tab.key, nodeId })
-    registry = await ensureRegistryForRaw(raw, {
-      registry,
-      componentsDir,
-      cfigmaBin: cfg.cfigmaBin,
-      cwd: root,
-    })
+    if (!opts.detachInstances) {
+      registry = await ensureRegistryForRaw(raw, {
+        registry,
+        componentsDir,
+        cfigmaBin: cfg.cfigmaBin,
+        cwd: root,
+      })
+    }
     context.registry = registry
     context.targetRegistry = toTargetRegistry(registry)
     const tabKey = tab.key
@@ -170,7 +176,8 @@ export async function runGeneratePrepared(
       tokenValueMap: context.tokenValueMap,
       tokenColorMap: context.tokenColorMap,
       exportSvg: (id) => exportNodeSvg({ cfigmaBin: cfg.cfigmaBin ?? 'cfigma', tab: tabKey, nodeId: id }),
-      detachInstances: opts.detachInstances || targetName === 'gpui',
+      detachInstances: opts.detachInstances,
+      detachRootInstance: opts.detachRootInstance,
       detachUnregisteredInstances: true,
     })
   }

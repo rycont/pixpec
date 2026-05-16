@@ -5,7 +5,7 @@ import type { GpuiEmitContext } from './context.ts'
 import { addNodeLayout } from './layout.ts'
 import { addSizing } from './sizing.ts'
 import { addContainerStyles } from './styles.ts'
-import { sizeExpr } from './values.ts'
+import { lengthExpr } from './values.ts'
 
 export async function emitContainer(
   n: DFlex | DStack | DBox,
@@ -28,11 +28,16 @@ export async function emitContainer(
   }
   addSizing(chain, n, ctx, parentDirection)
   addNodeLayout(chain, n, ctx)
-  addContainerStyles(chain, n, ctx)
+  // Padding on an empty container only exists in Figma as a hit-area hint
+  // and never widens the visible box, so emitting it as real padding here
+  // would inflate the GPUI box without any content using the space.
+  const stylesNode = n.children.length === 0 ? { ...n, padding: undefined } : n
+  addContainerStyles(chain, stylesNode, ctx)
 
   if (direction) {
     const flex = n as DFlex | DStack
-    if (flex.gap) chain.method('gap', sizeExpr(flex.gap, ctx))
+    if (flex.wrap) chain.method('flex_wrap')
+    if (flex.gap) chain.method('gap', lengthExpr(flex.gap, ctx))
     if (flex.align === Align.Center) chain.method('items_center')
     else if (flex.align === Align.End) chain.method('items_end')
     else chain.method('items_start')

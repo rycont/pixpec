@@ -2,6 +2,7 @@ import type { DNode } from '../../compiler/design-ast.ts'
 import type { CodegenContext, CodegenResult } from '../types.ts'
 import type { GpuiEmitContext } from './emit/context.ts'
 import { emitNode } from './emit/node.ts'
+import { putTextAsset } from './emit/assets.ts'
 
 export async function codegenGpui(root: DNode, ctx: CodegenContext): Promise<CodegenResult> {
   const sourceId = ctx.sourceId ?? root.sourceId ?? 'root'
@@ -12,7 +13,85 @@ export async function codegenGpui(root: DNode, ctx: CodegenContext): Promise<Cod
     fonts: parseFontManifest(ctx.designSystem?.fonts),
     assets: new Map(),
   }
-  const body = await emitNode(root, emitCtx, 2)
+  // Figma's PNG export of a node uses its absolute render bounds, which may
+  // extend past the node's design box when a child overflows (e.g. an absolute
+  // child anchored with negative inset). The capture window mirrors that
+  // render-bounds size, so the root content needs to shift down/right by the
+  // negative renderBoundsOffset to land at the same pixel coordinates.
+  const offset = rootRenderBoundsOffset(root, emitCtx)
+  let body: string
+  if (offset) {
+    const inner = await emitNode(root, emitCtx, 4)
+    const lines = ['        div()']
+    // Mirror the top/left padding on the bottom/right so the wrapper matches
+    // the symmetric render-bounds expansion Figma uses when a child overflows
+    // (the AST only carries the top-left offset, but Figma extends both ends
+    // by the same amount for centered overflow).
+    if (offset.top > 0) {
+      lines.push(`            .pt(px(${rustFloat(offset.top)}))`)
+      lines.push(`            .pb(px(${rustFloat(offset.top)}))`)
+    }
+    if (offset.left > 0) {
+      lines.push(`            .pl(px(${rustFloat(offset.left)}))`)
+      lines.push(`            .pr(px(${rustFloat(offset.left)}))`)
+    }
+    // When the root has a Figma "outside"-aligned border, the render bounds
+    // expansion equals the border width — exactly the ring that Figma fills
+    // with the border paint. GPUI's border-box border can't escape its box,
+    // so paint the wrapper with the border color (and matching rounded
+    // corners) to simulate an outside border ring around the inner content.
+    const outsideRing = outsideBorderRing(root, emitCtx, offset)
+    let innerOverride = inner
+    if (outsideRing) {
+      // If the root carries Figma cornerSmoothing > 0 the corner curve is a
+      // squircle, not a circular arc. GPUI only knows circular rounded(); to
+      // match Figma's exact pixel placement we paint a single SVG with both
+      // the outer ring (border color) and the inner fill (bg color) using
+      // figma-squircle-generated paths. The wrapper becomes a plain rectangle
+      // and the squircle bg renders via an absolute img layer.
+      const squircleAsset = await tryGenerateSquircleAsset(root, emitCtx, offset, outsideRing)
+      if (squircleAsset) {
+        lines.push(`            .overflow_hidden()`)
+        // Strip wrapper bg/rounded — SVG paints them.
+        lines.push('            .child(')
+        lines.push(`                img(r"${squircleAsset.path}")`)
+        lines.push(`                    .w(px(${rustFloat(squircleAsset.width)}))`)
+        lines.push(`                    .h(px(${rustFloat(squircleAsset.height)}))`)
+        lines.push('                    .absolute()')
+        lines.push('                    .left(px(0.0))')
+        lines.push('                    .top(px(0.0))')
+        lines.push('            )')
+        // Strip inner's bg, border, rounded — SVG covers them.
+        innerOverride = inner
+          .split('\n')
+          .filter((line) =>
+            !/\.bg\(/.test(line) &&
+            !/\.border(?:_[trbl])?\(px\(/.test(line) &&
+            !/\.border_color\(/.test(line) &&
+            !/\.rounded\(/.test(line),
+          )
+          .join('\n')
+      } else {
+        lines.push(`            .bg(${outsideRing.colorExpr})`)
+        if (outsideRing.rounded !== undefined) {
+          lines.push(`            .rounded(px(${rustFloat(outsideRing.rounded)}))`)
+        }
+        // The wrapper now renders the border ring. Strip the inner div's own
+        // border emission so the colors don't stack — Figma draws the border
+        // exactly once at the outer 8px.
+        innerOverride = inner
+          .split('\n')
+          .filter((line) => !/\.border(?:_[trbl])?\(px\(/.test(line) && !/\.border_color\(/.test(line))
+          .join('\n')
+      }
+    }
+    lines.push('            .child(')
+    lines.push(innerOverride)
+    lines.push('            )')
+    body = lines.join('\n')
+  } else {
+    body = await emitNode(root, emitCtx, 2)
+  }
   const renderScale = Number.isFinite(emitCtx.renderScale) ? emitCtx.renderScale : 1
 
   return {
@@ -43,22 +122,217 @@ function rustFloat(value: number): string {
   return Number.isInteger(value) ? `${value}.0` : `${+value.toFixed(6)}`
 }
 
+async function tryGenerateSquircleAsset(
+  root: DNode,
+  ctx: GpuiEmitContext,
+  offset: { top: number; left: number },
+  ring: { colorExpr: string; rounded?: number },
+): Promise<{ path: string; width: number; height: number } | undefined> {
+  const r = root as DNode & {
+    cornerSmoothing?: number
+    cornerRadius?: unknown
+    border?: { paint?: unknown; width?: unknown }
+    background?: unknown
+    width?: unknown
+    height?: unknown
+  }
+  const smoothing = r.cornerSmoothing ?? 0
+  if (smoothing <= 0) return undefined
+  const innerWidth = lengthToNum(r.width, ctx)
+  const innerHeight = lengthToNum(r.height, ctx)
+  if (innerWidth <= 0 || innerHeight <= 0) return undefined
+  const outerWidth = innerWidth + offset.left * 2
+  const outerHeight = innerHeight + offset.top * 2
+  const innerRadius = lengthToNum(r.cornerRadius, ctx)
+  if (innerRadius <= 0) return undefined
+  const outerRadius = ring.rounded ?? innerRadius
+  const innerBg = paintToCssColor(r.background, ctx)
+  if (!innerBg) return undefined
+  const outerColor = exprToCssColor(ring.colorExpr)
+  if (!outerColor) return undefined
+  let getSvgPath: typeof import('figma-squircle').getSvgPath
+  try {
+    ;({ getSvgPath } = await import('figma-squircle'))
+  } catch {
+    return undefined
+  }
+  const outerPath = getSvgPath({
+    cornerRadius: outerRadius,
+    cornerSmoothing: smoothing,
+    width: outerWidth,
+    height: outerHeight,
+    preserveSmoothing: true,
+  })
+  const innerPath = getSvgPath({
+    cornerRadius: innerRadius,
+    cornerSmoothing: smoothing,
+    width: innerWidth,
+    height: innerHeight,
+    preserveSmoothing: true,
+  })
+  const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="${outerWidth}" height="${outerHeight}" viewBox="0 0 ${outerWidth} ${outerHeight}"><path d="${outerPath}" fill="${outerColor}"/><g transform="translate(${offset.left}, ${offset.top})"><path d="${innerPath}" fill="${innerBg}"/></g></svg>`
+  const path = putTextAsset(ctx, `${root.sourceId ?? 'root'}_squircle`, 'svg', svg)
+  return { path, width: outerWidth, height: outerHeight }
+}
+
+function paintToCssColor(paint: unknown, ctx: GpuiEmitContext): string | undefined {
+  if (!paint || typeof paint !== 'object') return undefined
+  if (typeof (paint as { kind?: unknown }).kind === 'string') {
+    const lit = paint as { kind: string; value?: unknown }
+    if (lit.kind === 'literal') {
+      const v = lit.value as { r?: number; g?: number; b?: number; a?: number } | undefined
+      if (!v) return undefined
+      const r = clamp255(Math.round(v.r ?? 0))
+      const g = clamp255(Math.round(v.g ?? 0))
+      const b = clamp255(Math.round(v.b ?? 0))
+      const a = v.a === undefined ? 1 : v.a
+      return a >= 0.999 ? `rgb(${r},${g},${b})` : `rgba(${r},${g},${b},${a.toFixed(3)})`
+    }
+  }
+  if (typeof paint === 'string') return ctx.tokenColorMap[paint]
+  return undefined
+}
+
+function exprToCssColor(expr: string): string | undefined {
+  const rgb = /^rgb\(0x([0-9a-fA-F]{2})([0-9a-fA-F]{2})([0-9a-fA-F]{2})\)$/.exec(expr)
+  if (rgb) return `rgb(${parseInt(rgb[1]!, 16)},${parseInt(rgb[2]!, 16)},${parseInt(rgb[3]!, 16)})`
+  const rgba = /^rgba\(0x([0-9a-fA-F]{2})([0-9a-fA-F]{2})([0-9a-fA-F]{2})([0-9a-fA-F]{2})\)$/.exec(expr)
+  if (rgba) {
+    const r = parseInt(rgba[1]!, 16)
+    const g = parseInt(rgba[2]!, 16)
+    const b = parseInt(rgba[3]!, 16)
+    const a = parseInt(rgba[4]!, 16) / 255
+    return `rgba(${r},${g},${b},${a.toFixed(3)})`
+  }
+  return undefined
+}
+
+function outsideBorderRing(
+  root: DNode,
+  ctx: GpuiEmitContext,
+  offset: { top: number; left: number },
+): { colorExpr: string; rounded?: number } | undefined {
+  const r = root as DNode & {
+    border?: {
+      paint?: unknown
+      width?: unknown
+      align?: string
+    }
+    cornerRadius?: unknown
+  }
+  if (r.border?.align !== 'outside') return undefined
+  const paint = r.border.paint
+  if (!paint || typeof paint !== 'object') return undefined
+  const colorExpr = paintToColorExpr(paint, ctx)
+  if (!colorExpr) return undefined
+  const borderWidth = lengthToNum(r.border.width, ctx)
+  // Only treat as a synthetic ring when the wrapper expansion matches the
+  // border width — otherwise the wrapper carries unrelated layout overflow
+  // and painting the ring would smear color across regions that should be
+  // transparent.
+  if (Math.abs(borderWidth - offset.top) > 0.5 || Math.abs(borderWidth - offset.left) > 0.5) {
+    return undefined
+  }
+  const innerRadius = lengthToNum(r.cornerRadius, ctx)
+  const rounded = innerRadius > 0 ? innerRadius + borderWidth : undefined
+  return { colorExpr, rounded }
+}
+
+function lengthToNum(value: unknown, ctx: GpuiEmitContext): number {
+  if (typeof value === 'string') return ctx.tokenValueMap[value] ?? 0
+  if (value && typeof value === 'object' && 'kind' in value) {
+    const lv = value as { kind: string; value?: { value?: number } }
+    if (lv.kind === 'literal') return lv.value?.value ?? 0
+  }
+  return 0
+}
+
+function paintToColorExpr(paint: unknown, ctx: GpuiEmitContext): string | undefined {
+  if (!paint || typeof paint !== 'object') return undefined
+  if (typeof (paint as { kind?: unknown }).kind === 'string') {
+    const lit = paint as { kind: string; value?: unknown; source?: string; path?: string }
+    if (lit.kind === 'literal') {
+      const v = lit.value as { r?: number; g?: number; b?: number; a?: number } | undefined
+      if (!v) return undefined
+      const r = clamp255(Math.round(v.r ?? 0))
+      const g = clamp255(Math.round(v.g ?? 0))
+      const b = clamp255(Math.round(v.b ?? 0))
+      const a = v.a === undefined ? 255 : clamp255(Math.round(v.a * 255))
+      if (a === 255) return `rgb(0x${hex(r)}${hex(g)}${hex(b)})`
+      return `rgba(0x${hex(r)}${hex(g)}${hex(b)}${hex(a)})`
+    }
+  }
+  if (typeof paint === 'string') {
+    const css = ctx.tokenColorMap[paint as string]
+    if (!css) return undefined
+    return cssToRgbExpr(css)
+  }
+  return undefined
+}
+
+function hex(n: number): string { return Math.max(0, Math.min(255, n)).toString(16).padStart(2, '0') }
+function clamp255(n: number): number { return Math.max(0, Math.min(255, n)) }
+function cssToRgbExpr(css: string): string | undefined {
+  const rgba = /^rgba?\((\d+),\s*(\d+),\s*(\d+)(?:,\s*([0-9.]+))?\)$/.exec(css)
+  if (rgba) {
+    const r = clamp255(Number(rgba[1]))
+    const g = clamp255(Number(rgba[2]))
+    const b = clamp255(Number(rgba[3]))
+    const a = rgba[4] !== undefined ? clamp255(Math.round(Number(rgba[4]) * 255)) : 255
+    return a === 255 ? `rgb(0x${hex(r)}${hex(g)}${hex(b)})` : `rgba(0x${hex(r)}${hex(g)}${hex(b)}${hex(a)})`
+  }
+  const hx = /^#([0-9a-fA-F]{6})([0-9a-fA-F]{2})?$/.exec(css)
+  if (hx) {
+    const main = hx[1]!
+    if (hx[2]) return `rgba(0x${main}${hx[2]})`
+    return `rgb(0x${main})`
+  }
+  return undefined
+}
+
+function rootRenderBoundsOffset(
+  root: DNode,
+  ctx: GpuiEmitContext,
+): { top: number; left: number } | undefined {
+  const off = (root as DNode & { renderBoundsOffset?: { x: unknown; y: unknown } }).renderBoundsOffset
+  if (!off) return undefined
+  const toNum = (v: unknown): number => {
+    if (typeof v === 'string') return ctx.tokenValueMap[v] ?? 0
+    if (v && typeof v === 'object' && 'kind' in v) {
+      const lv = v as { kind: string; value?: { value?: number } }
+      if (lv.kind === 'literal') return lv.value?.value ?? 0
+    }
+    return 0
+  }
+  const x = toNum(off.x)
+  const y = toNum(off.y)
+  // renderBoundsOffset is `render - design`. A negative offset means the
+  // render bounds extend before the design box, so the design content must
+  // shift by `-offset` to align with the capture window's top/left.
+  const top = Math.max(0, -y) * ctx.renderScale
+  const left = Math.max(0, -x) * ctx.renderScale
+  if (top === 0 && left === 0) return undefined
+  return { top, left }
+}
+
 function parseFontManifest(value: unknown): GpuiEmitContext['fonts'] {
   if (!value || typeof value !== 'object') return undefined
   const fonts = (value as { fonts?: unknown }).fonts
   if (!Array.isArray(fonts)) return undefined
   return {
     fonts: fonts
-      .filter((font): font is { family: string; xShift?: Record<string, number>; yShift?: Record<string, number> } =>
-        !!font &&
-        typeof font === 'object' &&
-        typeof (font as { family?: unknown }).family === 'string',
-      )
-      .map((font) => ({
-        family: font.family,
-        xShift: numericRecord(font.xShift),
-        yShift: numericRecord(font.yShift),
-      })),
+      .filter((font): font is { family: string } => !!font && typeof font === 'object' && typeof (font as { family?: unknown }).family === 'string')
+      .map((font) => {
+        // Per-target calibration overrides the manifest's top-level shift tables.
+        // pixpec-fonts.json keeps target-neutral defaults at the root (where
+        // they have historically lived for react-panda), but each target may
+        // contribute its own {xShift, yShift} under `targets.<name>` because
+        // renderers disagree on baseline placement for the same font + size.
+        const target = (font as { targets?: Record<string, { xShift?: unknown; yShift?: unknown }> }).targets?.gpui
+        const xShift = numericRecord(target?.xShift) ?? numericRecord((font as { xShift?: unknown }).xShift)
+        const yShift = numericRecord(target?.yShift) ?? numericRecord((font as { yShift?: unknown }).yShift)
+        return { family: font.family, xShift, yShift }
+      }),
   }
 }
 

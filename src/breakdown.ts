@@ -12,7 +12,7 @@ import { loadConfig } from './init.ts'
 import { listFigmaTabs } from './cfigma-meta.ts'
 import { resolveConfiguredTargets } from './targets/index.ts'
 import { runGenerate } from './generate.ts'
-import { runBreakdownVerify } from './breakdown-verify.ts'
+import { runBreakdownVerify, runInteractiveBreakdownVerify, type InteractiveBreakdownVerify } from './breakdown-verify.ts'
 import { loadViewCodegenConfig } from './view-config.ts'
 
 export interface BreakdownOptions {
@@ -100,89 +100,153 @@ export async function runBreakdown(
 
     const entries: BreakdownEntry[] = []
     const nodes = collectPostOrder(raw, !!opts.detachInstances)
-    for (let index = 0; index < nodes.length; index += 1) {
-        const { node, depth } = nodes[index]
-        const seq = String(index + 1).padStart(4, '0')
-        const viewId = `${viewName}:${seq}_${safeFilename(node.id)}`
-        const entry: BreakdownEntry = {
-            index: index + 1,
-            sourceId: node.id,
-            sourceName: node.name,
-            sourceType: node.type,
-            sourceWidth: sourceWidth(node),
-            sourceHeight: sourceHeight(node),
-            depth,
-            childCount: node.children?.length ?? 0,
-            viewId,
-            outputs: {},
-            captureSkip: node.type === 'TEXT' ? 'text leaf' : undefined,
-        }
-        for (const target of targets) {
-            try {
-                const r = await runGenerate(`${fileKey}:${node.id}`, {
-                    target,
-                    componentName: `${viewName}_${seq}`,
-                    outputDir: resolve(viewDir, 'impl', target, 'breakdown'),
-                    propsFile: null,
-                    detachInstances: opts.detachInstances,
-                    renderScale,
-                    viewConfig,
-                })
-                entry.outputs[target] = relativeFrom(viewDir, r.outPath)
-            } catch (e) {
-                entry.error = e instanceof Error ? e.stack ?? e.message : String(e)
-            }
-        }
-        entries.push(entry)
-    }
-
-    const viewPath = resolve(viewDir, 'view.json')
-    await writeFile(
-        viewPath,
-        `${JSON.stringify(
-            {
-                name: viewName,
-                layerName: raw.name,
-                figmaId,
-                sourceId: raw.id,
-                sourceType: raw.type,
-                targets,
-                outputs: rootOutputs,
-                breakdownManifest: 'breakdown/manifest.json',
-            },
-            null,
-            4,
-        )}\n`,
-    )
-
+    const verifyTarget = targets[0] ?? 'gpui'
     const manifestPath = resolve(breakdownDir, 'manifest.json')
-    await writeFile(
-        manifestPath,
-        `${JSON.stringify(
-            {
-                viewName,
-                layerName: raw.name,
-                figmaId,
-                targets,
-                count: entries.length,
-                entries,
-            },
-            null,
-            4,
-        )}\n`,
-    )
+    const viewPath = resolve(viewDir, 'view.json')
 
-    const verify = opts.verify
-        ? await runBreakdownVerify({
+    // When --verify is set, drive codegen and verify in lock-step so a verify
+    // failure aborts immediately — no need to wait for the remaining hundreds
+    // of nodes to codegen before learning the iteration was wasted.
+    let interactive: InteractiveBreakdownVerify | undefined
+    const workerCount = Math.max(1, Number(process.env.PIXPEC_GPUI_WORKERS ?? 1))
+    if (opts.verify) {
+        const expectedSourceIds = nodes
+            .filter(({ node }) => node.type !== 'TEXT' && (!opts.verifySourceId || node.id === opts.verifySourceId))
+            .map(({ node }) => node.id)
+        interactive = await runInteractiveBreakdownVerify({
             viewDir,
             manifestPath,
-            target: targets[0] ?? 'gpui',
+            target: verifyTarget,
             cfg: { ...cfg, scale: renderScale },
             maxBlob: opts.maxBlob,
             blobThreshold: opts.blobThreshold,
-            sourceId: opts.verifySourceId,
+            figmaId,
+            viewName,
+            expectedSourceIds,
+            totalEntries: nodes.length,
+            workerCount,
         })
-        : undefined
+    }
+
+    const writeManifest = async () => {
+        await writeFile(
+            manifestPath,
+            `${JSON.stringify(
+                {
+                    viewName,
+                    layerName: raw.name,
+                    figmaId,
+                    targets,
+                    count: entries.length,
+                    entries,
+                },
+                null,
+                4,
+            )}\n`,
+        )
+    }
+
+    let verify: { pass: number; fail: number; total: number; skipped: number } | undefined
+    // Track in-flight verify promises so codegen can keep pumping while N
+    // capture workers process previous entries in parallel. fail-fast: the
+    // first failed promise sets `firstFailure` and the codegen loop exits.
+    const inflight: Promise<unknown>[] = []
+    let firstFailure: Error | undefined
+    try {
+        for (let index = 0; index < nodes.length; index += 1) {
+            if (firstFailure) break
+            const { node, depth } = nodes[index]
+            const seq = String(index + 1).padStart(4, '0')
+            const viewId = `${viewName}:${seq}_${safeFilename(node.id)}`
+            const entry: BreakdownEntry = {
+                index: index + 1,
+                sourceId: node.id,
+                sourceName: node.name,
+                sourceType: node.type,
+                sourceWidth: sourceWidth(node),
+                sourceHeight: sourceHeight(node),
+                depth,
+                childCount: node.children?.length ?? 0,
+                viewId,
+                outputs: {},
+                captureSkip: node.type === 'TEXT' ? 'text leaf' : undefined,
+            }
+            for (const target of targets) {
+                try {
+                    const r = await runGenerate(`${fileKey}:${node.id}`, {
+                        target,
+                        componentName: `${viewName}_${seq}`,
+                        outputDir: resolve(viewDir, 'impl', target, 'breakdown'),
+                        propsFile: null,
+                        detachInstances: opts.detachInstances,
+                        detachRootInstance: !opts.detachInstances && node.type === 'INSTANCE',
+                        renderScale,
+                        viewConfig,
+                    })
+                    entry.outputs[target] = relativeFrom(viewDir, r.outPath)
+                } catch (e) {
+                    entry.error = e instanceof Error ? e.stack ?? e.message : String(e)
+                }
+            }
+            entries.push(entry)
+
+            if (interactive && (!opts.verifySourceId || node.id === opts.verifySourceId)) {
+                const captured = entry
+                const p = interactive
+                    .verifyEntry(captured as never)
+                    .then((r) => {
+                        if (!r.ok && !firstFailure) {
+                            firstFailure = new Error(
+                                r.error ?? `breakdown verify failed at entry ${captured.index} ${captured.sourceId}`,
+                            )
+                        }
+                        // Remove this promise from the in-flight set once
+                        // settled, so the backpressure check below sees an
+                        // accurate count.
+                        const i = inflight.indexOf(p)
+                        if (i >= 0) inflight.splice(i, 1)
+                    })
+                inflight.push(p)
+                // Bounded look-ahead: capture pool's semaphore already limits
+                // concurrent rendering to `workerCount`, but cfigma codegen
+                // shouldn't sprint a thousand entries ahead. When in-flight
+                // hits 2× workers, wait for any to drain before queueing more.
+                while (inflight.length >= workerCount * 2 && !firstFailure) {
+                    await Promise.race(inflight.map((x) => x.catch(() => undefined)))
+                }
+            }
+        }
+
+        // Drain remaining verifies before checking final failure.
+        await Promise.allSettled(inflight)
+        if (firstFailure) {
+            await writeManifest()
+            if (interactive) verify = await interactive.finalize()
+            throw firstFailure
+        }
+
+        await writeFile(
+            viewPath,
+            `${JSON.stringify(
+                {
+                    name: viewName,
+                    layerName: raw.name,
+                    figmaId,
+                    sourceId: raw.id,
+                    sourceType: raw.type,
+                    targets,
+                    outputs: rootOutputs,
+                    breakdownManifest: 'breakdown/manifest.json',
+                },
+                null,
+                4,
+            )}\n`,
+        )
+        await writeManifest()
+        if (interactive) verify = await interactive.finalize()
+    } finally {
+        if (interactive) await interactive.close()
+    }
 
     return {
         viewName,

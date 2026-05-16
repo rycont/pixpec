@@ -39,7 +39,7 @@ async function main() {
     case 'generate': {
       const componentId = rest[0]
       if (!componentId || !componentId.includes(':')) {
-        console.error('usage: pixpec generate <fileKey>:<nodeId> [--target NAME] [--name Comp]')
+        console.error('usage: pixpec generate <fileKey>:<nodeId> [--target NAME] [--name Comp] [--detach-instances]')
         process.exit(2)
       }
       const targetIdx = rest.indexOf('--target')
@@ -47,6 +47,7 @@ async function main() {
       const results = await runGenerateTargets(componentId, {
         target: targetIdx >= 0 ? rest[targetIdx + 1] : undefined,
         componentName: nameIdx >= 0 ? rest[nameIdx + 1] : undefined,
+        detachInstances: rest.includes('--detach-instances'),
       })
       for (const r of results) console.log(`[generate:${r.target}] ${r.componentName} → ${r.outPath}`)
       break

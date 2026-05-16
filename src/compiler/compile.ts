@@ -518,7 +518,7 @@ function buildBase(
   parent?: RawNode,
 ): DNodeBase {
   const out: DNodeBase = { sourceId: n.id, sourceName: n.name };
-  if (n.componentPropertyReferences?.visible) {
+  if (n.componentPropertyReferences?.visible && !opts.detachRootInstance) {
     out.visible = propValue(publicComponentPropName(n.componentPropertyReferences.visible));
   } else if (n.visible === false) {
     out.visible = literalValue(false);
@@ -791,7 +791,7 @@ function compileText(
       : n.textAutoResize === "TRUNCATE"
         ? TextAutoResize.Truncate
         : TextAutoResize.FixedBoth;
-  const baseStyle: TextStyleValue | undefined = n.componentPropertyReferences?.textStyleId
+  const baseStyle: TextStyleValue | undefined = n.componentPropertyReferences?.textStyleId && !opts.detachRootInstance
     ? propValue(publicComponentPropName(n.componentPropertyReferences.textStyleId))
     : textStyleName(n.textStyleId, opts);
   const textStyle: TextStyleValue = baseStyle ?? literalValue({
@@ -828,7 +828,7 @@ function compileText(
   const out: DText = {
     ...buildBase(n, opts, parent),
     kind: NodeKind.Text,
-    content: n.componentPropertyReferences?.characters
+    content: !opts.detachInstances && !opts.detachRootInstance && n.componentPropertyReferences?.characters
       ? propValue(publicComponentPropName(n.componentPropertyReferences.characters))
       : literalValue(sanitizeTextContent(n.characters ?? "")),
     textStyle,
@@ -1235,7 +1235,10 @@ async function compileInstance(
   const entry = setKey ? opts.registry.get(setKey) : undefined;
   if (!entry) {
     if (opts.detachUnregisteredInstances && (n.children?.length ?? 0) > 0) {
-      return compileContainer(n, childOpts, parent, false);
+      // Detached subtree has no surrounding component to provide prop values,
+      // so inline any componentPropertyReferences (Label/visible/textStyleId)
+      // to their concrete raw values instead of dangling `props.X` refs.
+      return compileContainer(n, { ...childOpts, detachRootInstance: true }, parent, false);
     }
     throw new Error(
       `pixpec compile: encountered INSTANCE ${n.id} (${n.name}) of unregistered component ` +
@@ -1264,7 +1267,7 @@ async function compileInstance(
       fields,
     ) ?? {};
   if (hasUnconsumedDNodeDiff(variant?.ast, compiledChildren, fields.consumed))
-    return compileContainer(n, opts, parent, false);
+    return compileContainer(n, { ...opts, detachRootInstance: true }, parent, false);
   const out: DInstance = {
     ...buildBase(n, opts, parent),
     kind: NodeKind.Instance,

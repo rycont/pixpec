@@ -4,7 +4,6 @@ import type { GpuiEmitContext } from './context.ts'
 import { emitContainer } from './container.ts'
 import { emitImage } from './image.ts'
 import { emitInstance } from './instance.ts'
-import { pad } from './rust.ts'
 import { emitShape } from './shape.ts'
 import { emitText } from './text.ts'
 import { emitUnknown } from './unknown.ts'
@@ -44,13 +43,5 @@ export async function emitChildExpr(
   indent: number,
   parentDirection?: FlowDirection,
 ): Promise<string> {
-  if (!n.visible || n.visible.kind !== 'expression') return emitNode(n, ctx, indent, parentDirection)
-
-  return [
-    `${pad(indent)}if true {`,
-    await emitNode(n, ctx, indent + 1, parentDirection),
-    `${pad(indent)}} else {`,
-    `${pad(indent + 1)}div()`,
-    `${pad(indent)}}`,
-  ].join('\n')
+  return emitNode(n, ctx, indent, parentDirection)
 }
