@@ -109,8 +109,26 @@ const STATIC_CSS_PROPERTIES = [
   "color",
   "background",
   "backgroundColor",
+  "borderRadius",
+  "borderWidth",
+  "borderColor",
   "textStyle",
+  "fontSize",
+  "lineHeight",
+  "letterSpacing",
+  "fontFamily",
+  "fontWeight",
 ] as const;
+
+/** Figma field path → Panda CSS property name. detectPromotions surfaces
+ *  promotions by figma field name; collectStaticTokens needs to bucket the
+ *  observed values under the corresponding Panda CSS property so Panda's
+ *  static analysis emits the matching utility class. */
+const FIELD_TO_CSS_PROPERTY: Record<string, StaticCssProperty> = {
+  cornerRadius: "borderRadius",
+  "border.width": "borderWidth",
+  "border.paint": "borderColor",
+};
 
 type StaticCssProperty = (typeof STATIC_CSS_PROPERTIES)[number];
 type StaticTokenMap = Record<StaticCssProperty, Set<string>>;
@@ -1547,16 +1565,11 @@ function collectStaticTokens(
   cases: Array<{ props: Record<string, unknown> }>,
   promotions: PromotedField[],
 ): void {
-  const promotedCssFields = new Map(
-    promotions
-      .filter(
-        (
-          promotion,
-        ): promotion is PromotedField & { field: StaticCssProperty } =>
-          isStaticCssProperty(promotion.field),
-      )
-      .map((promotion) => [promotion.prop, promotion.field]),
-  );
+  const promotedCssFields = new Map<string, StaticCssProperty>();
+  for (const promotion of promotions) {
+    const property = cssPropertyForField(promotion.field);
+    if (property) promotedCssFields.set(promotion.prop, property);
+  }
   for (const c of cases) {
     for (const [key, value] of Object.entries(c.props)) {
       const property = isStaticCssProperty(key)
@@ -1566,6 +1579,11 @@ function collectStaticTokens(
       if (isStaticCssValue(value)) out[property].add(value);
     }
   }
+}
+
+function cssPropertyForField(field: string): StaticCssProperty | undefined {
+  if (isStaticCssProperty(field)) return field;
+  return FIELD_TO_CSS_PROPERTY[field];
 }
 
 async function writeStaticTokens(

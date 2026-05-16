@@ -470,7 +470,11 @@ async function refreshReactPandaStyledSystem(opts: {
                 `  Underlying: ${(error as Error).message}`,
         )
     }
-    const staticCss = mergeStaticCss(config.staticCss, await readStaticTokenCss(opts.componentsDir))
+    const staticCss = mergeStaticCss(
+        config.staticCss,
+        await readStaticTokenCss(opts.componentsDir),
+        STATIC_CSS_PROPERTIES_RUNTIME,
+    )
 
     await mkdir(opts.runtimeDir, { recursive: true })
     const runtimeConfigPath = resolve(opts.runtimeDir, 'panda.config.mjs')
@@ -528,11 +532,14 @@ async function readStaticTokenCss(componentsDir: string): Promise<Record<string,
     )
 }
 
-function mergeStaticCss(base: unknown, extraProperties: Record<string, string[]>): unknown {
+function mergeStaticCss(
+    base: unknown,
+    extraProperties: Record<string, string[]>,
+    forceAllTokensFor?: readonly string[],
+): unknown {
     const extra = Object.fromEntries(
         Object.entries(extraProperties).filter(([, values]) => values.length > 0),
     )
-    if (Object.keys(extra).length === 0) return base
     const baseObject = isRecord(base) ? base : {}
     const cssItems = Array.isArray(baseObject.css) ? baseObject.css : []
     const first = cssItems[0]
@@ -549,9 +556,57 @@ function mergeStaticCss(base: unknown, extraProperties: Record<string, string[]>
             ...new Set([...(mergedProperties[property] ?? []), ...values]),
         ].sort()
     }
+    if (forceAllTokensFor && forceAllTokensFor.length > 0) {
+        // Force-emit every registered token (the `'*'` sentinel) alongside any
+        // existing raw values (literal rem / px sizes Panda already collected
+        // statically). Runtime-bound props that hold token paths need the
+        // utility class pre-emitted; raw values stay covered too.
+        for (const property of forceAllTokensFor) {
+            const existing = mergedProperties[property] ?? []
+            mergedProperties[property] = [...new Set([...existing, '*'])]
+        }
+    } else if (Object.keys(extra).length === 0) {
+        return base
+    }
     const mergedFirst = { ...(isRecord(first) ? first : {}), properties: mergedProperties }
     return { ...baseObject, css: [mergedFirst, ...cssItems.slice(1)] }
 }
+
+const STATIC_CSS_PROPERTIES_RUNTIME = [
+    'width',
+    'height',
+    'minWidth',
+    'maxWidth',
+    'minHeight',
+    'maxHeight',
+    'paddingTop',
+    'paddingRight',
+    'paddingBottom',
+    'paddingLeft',
+    'padding',
+    'margin',
+    'marginTop',
+    'marginRight',
+    'marginBottom',
+    'marginLeft',
+    'gap',
+    'rowGap',
+    'columnGap',
+    'color',
+    'background',
+    'backgroundColor',
+    'borderColor',
+    'fill',
+    'stroke',
+    'borderRadius',
+    'fontSize',
+    'lineHeight',
+    'fontFamily',
+    'fontWeight',
+    'letterSpacing',
+    'boxShadow',
+    'textStyle',
+] as const
 
 function isRecord(value: unknown): value is Record<string, unknown> {
     return !!value && typeof value === 'object' && !Array.isArray(value)
