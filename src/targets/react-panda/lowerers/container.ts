@@ -23,7 +23,7 @@ import {
     shadowToCss,
     sizeToPx,
 } from '../data-lowerer.ts'
-import { imagePaintUrlMarker } from '../assets.ts'
+import { assetImportExpression } from '../assets.ts'
 import type { LowererCtx as Ctx, LowerResult, ParentCtx } from '../lowerer-types.ts'
 import { boxCtx, emptyUses, flexCtx, LocalCtx, mergeUses, stackCtx } from '../lowerer-types.ts'
 import {
@@ -46,14 +46,14 @@ import {
 } from '../styles.ts'
 
 // Reference to the dispatcher — set by codegen.ts to avoid circular import.
-let dispatch: (n: DNode, ctx: Ctx, parent: ParentCtx) => LowerResult = () => {
+let dispatch: (n: DNode, ctx: Ctx, parent: ParentCtx) => Promise<LowerResult> = async () => {
     throw new Error('emitNode dispatcher not registered')
 }
 export function setNodeDispatcher(fn: typeof dispatch) {
     dispatch = fn
 }
 
-export function emitContainer(n: DFlex | DStack | DBox, ctx: Ctx, parent: ParentCtx): LowerResult {
+export async function emitContainer(n: DFlex | DStack | DBox, ctx: Ctx, parent: ParentCtx): Promise<LowerResult> {
     const uses = emptyUses()
 
     const direction: 'row' | 'column' | 'none' =
@@ -158,13 +158,8 @@ export function emitContainer(n: DFlex | DStack | DBox, ctx: Ctx, parent: Parent
     // background + opacity + render-bounds offset
     let imageBgExpr: ast.Expression | undefined
     if (n.background) {
-        if (isImagePaintLiteral(n.background)) {
-            imageBgExpr = imagePaintUrlMarker(
-                n.background.value,
-                nodeSourceId(n),
-                ctx,
-                uses,
-            )
+        if (isImagePaintLiteral(n.background) && n.background.value.asset) {
+            imageBgExpr = assetImportExpression(n.background.value.asset, ctx)
         } else {
             const bg = paintToProp(n.background)
             if (bg !== undefined) {
@@ -416,8 +411,10 @@ export function emitContainer(n: DFlex | DStack | DBox, ctx: Ctx, parent: Parent
             : direction === 'column'
               ? stackCtx({ mainAxisHug: sizingV === Sizing.Hug })
               : boxCtx()
-    const children = n.children.map((c) => {
-        const r = dispatch(c, ctx, childParent)
+    const childResults = await Promise.all(
+        n.children.map((c) => dispatch(c, ctx, childParent)),
+    )
+    const children = childResults.map((r) => {
         mergeUses(uses, r.uses)
         return r.jsx
     })

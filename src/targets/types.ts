@@ -57,6 +57,10 @@ export interface CodegenContext {
   componentsDir?: string
   /** Optional props file for component output. Omit for prop-less view output. */
   propsFile?: string
+  /** Directory where compile-side shared assets (SVG bytes, image bytes) are
+   *  persisted. Lowerers read source content from here and build import paths
+   *  relative to `outputDir`. */
+  assetsDir?: string
   /** Optional view-level semantic transforms, loaded from src/view/<View>/view.config.json. */
   viewConfig?: ViewCodegenConfig
 }

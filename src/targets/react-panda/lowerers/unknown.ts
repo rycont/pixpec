@@ -4,7 +4,7 @@ import { px2rem, sizeToPx } from '../data-lowerer.ts'
 import type { LowererCtx as Ctx, LowerResult } from '../lowerer-types.ts'
 import { emptyUses } from '../lowerer-types.ts'
 
-export function emitUnknown(n: DUnknown, ctx: Ctx): LowerResult {
+export async function emitUnknown(n: DUnknown, ctx: Ctx): Promise<LowerResult> {
     const uses = emptyUses()
     const w = sizeToPx(n.width) ?? 0
     const h = sizeToPx(n.height) ?? 0

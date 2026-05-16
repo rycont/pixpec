@@ -7,7 +7,7 @@ import type { LowererCtx as Ctx, LowerResult, ParentCtx } from '../lowerer-types
 import { emptyUses } from '../lowerer-types.ts'
 import { axisSizing } from '../sizing.ts'
 
-export function emitShape(n: DShape, ctx: Ctx, _parent: ParentCtx): LowerResult {
+export async function emitShape(n: DShape, ctx: Ctx, _parent: ParentCtx): Promise<LowerResult> {
     const uses = emptyUses()
     const w = sizeToPx(n.width) ?? 0
     const h = sizeToPx(n.height) ?? 0

@@ -212,16 +212,21 @@ export async function init(opts: {
   });
   const designContext = await loadCompileDesignContext(root, componentsDir);
   const typeTransformer = new DesignAstTypeTransformer();
-  const component = await buildComponentSource(raw, registry, designContext);
-  const componentName = pascalize(component.name);
+  // Compute the component name from the raw figma name up-front so the
+  // shared `assets/` dir is known before compile starts writing into it.
+  const componentName = pascalize(raw.name);
   const componentDir = join(componentsDir, componentName);
   await mkdir(componentDir, { recursive: true });
-  // Master variant assets: shared, "owned" by the component definition.
   const masterAssetsDir = join(componentDir, "assets");
-  // Per-case override assets: not owned by any variant — stored under .pixpec.
   const caseAssetsDir = join(componentDir, ".pixpec", "case-assets");
   await rm(masterAssetsDir, { recursive: true, force: true });
   await rm(caseAssetsDir, { recursive: true, force: true });
+  const component = await buildComponentSource(
+    raw,
+    registry,
+    designContext,
+    masterAssetsDir,
+  );
   const analysisRegistry = component.key
     ? new Map([...registry].filter(([key]) => key !== component.key))
     : registry;
@@ -428,6 +433,9 @@ export async function init(opts: {
           outName: "index",
           propsFile: join(componentDir, "schema.ts"),
           ast: meta.ast,
+          // Variant codegen reads asset bytes from the component's shared
+          // assets dir (compile wrote them there during init's variant pass).
+          assetsDir: masterAssetsDir,
           format: false,
         }, generateContext);
         return { target, outPath: result.outPath };
@@ -528,6 +536,7 @@ async function buildComponentSource(
   raw: RawNode,
   registry: Awaited<ReturnType<typeof loadRegistry>>,
   designContext: CompileDesignContext,
+  masterAssetsDir: string,
 ) {
   if (raw.remote) {
     throw new Error(

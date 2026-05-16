@@ -20,7 +20,7 @@ function normalizeTextLineBreaks(text: string): string {
     return text.replace(/\r\n/g, '\n').replace(LINE_BREAK_RE, '\n')
 }
 
-export function emitText(n: DText, ctx: Ctx, parent: ParentCtx): LowerResult {
+export async function emitText(n: DText, ctx: Ctx, parent: ParentCtx): Promise<LowerResult> {
     const uses = emptyUses()
     const ts = n.textStyle
     const isPlainTsObject =

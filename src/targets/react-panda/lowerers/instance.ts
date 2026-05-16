@@ -32,7 +32,7 @@ function componentPropToTargetValue(value: unknown, ctx: Ctx): unknown {
     return literal
 }
 
-export function emitInstance(n: DInstance, ctx: Ctx, _parent: ParentCtx): LowerResult {
+export async function emitInstance(n: DInstance, ctx: Ctx, _parent: ParentCtx): Promise<LowerResult> {
     const uses = emptyUses()
     uses.usedComponents.add(n.componentName)
     const attrs: ast.JsxAttributeLike[] = []

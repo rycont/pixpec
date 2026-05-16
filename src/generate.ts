@@ -60,6 +60,10 @@ export interface GenerateOptions {
    * component prop refs with their concrete override values. Intended for
    * breakdown sub-entry standalone rendering. */
   detachRootInstance?: boolean
+  /** Where compile-side shared assets live on disk. When omitted, generate
+   *  defaults to `<outputDir>/pixpec-assets`. Init passes the component's
+   *  shared `assets/` dir so variant codegen reads from there. */
+  assetsDir?: string
   /** Override pixpec.toml scale for generated target code. */
   renderScale?: number
   /** Normalized view.config.json data for view-level semantic codegen. */
@@ -246,6 +250,10 @@ export async function runGeneratePrepared(
     outputDir: outDir,
     rootDir: root,
     componentsDir,
+    assetsDir: opts.assetsDir
+      ?? (opts.outputDir
+        ? join(opts.outputDir, 'pixpec-assets')
+        : resolve(componentsDir, componentName, 'generated', 'pixpec-assets')),
     viewConfig: opts.viewConfig,
     propsFile: opts.propsFile === null
       ? undefined

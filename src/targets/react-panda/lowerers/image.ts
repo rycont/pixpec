@@ -1,11 +1,11 @@
 import type { DImage } from '../../../compiler/design-ast.ts'
-import { imageAssetUrlMarker } from '../assets.ts'
+import { assetImportExpression } from '../assets.ts'
 import { jsxAttr, jsxExprAttr, jsxSelf, styleAttr, styledTag } from '../ast.ts'
 import { px2rem, sizeToPx } from '../data-lowerer.ts'
 import type { LowererCtx as Ctx, LowerResult } from '../lowerer-types.ts'
 import { emptyUses } from '../lowerer-types.ts'
 
-export function emitImage(n: DImage, ctx: Ctx): LowerResult {
+export async function emitImage(n: DImage, ctx: Ctx): Promise<LowerResult> {
     const uses = emptyUses()
     const w = sizeToPx(n.width) ?? 0
     const h = sizeToPx(n.height) ?? 0
@@ -18,10 +18,10 @@ export function emitImage(n: DImage, ctx: Ctx): LowerResult {
     if (n.opacity !== undefined) {
         styles.opacity = n.opacity
     }
-    const srcExpr = imageAssetUrlMarker(n, ctx, uses)
-    if (!srcExpr) {
+    if (!n.asset) {
         return { jsx: jsxSelf('div', [styleAttr(styles)]), uses }
     }
+    const srcExpr = assetImportExpression(n.asset, ctx)
     uses.usedJsxPatterns.add('styled')
     return {
         jsx: jsxSelf(styledTag('img'), [

@@ -28,7 +28,10 @@ export interface Uses {
     usedTypography: Set<string>
     usedComponents: Set<string>
     usesCss: boolean
-    svgSidecars: Map<string, { alias: string; content: string; importPath: string }>
+    svgSidecars: Map<
+        string,
+        { alias: string; content: string; importPath: string; shared?: boolean }
+    >
     imageSidecars: Map<string, { content: Uint8Array }>
     squircleHooks: Array<{ key: string; radiusPx: number; smoothing: number }>
     usesTinting: boolean

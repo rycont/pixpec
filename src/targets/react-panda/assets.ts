@@ -1,20 +1,18 @@
 // Asset/sidecar path helpers for SVG vectors and raster images.
+//
+// Compile writes inline assets (image fills, SVG bytes) once to a shared
+// directory passed in via `ctx.env.assetsDir`. The lowerer here builds the
+// per-output relative import path. Target-specific derived assets (e.g. the
+// tinted `currentColor` SVG sidecar used by vector tinting) are still written
+// alongside the generated source under `<outputDir>/.pixpec/assets/`.
 
 import * as nodePath from 'node:path'
 import * as ast from '@typescript/native-preview/ast'
 import * as f from '@typescript/native-preview/ast/factory'
-import type { DImage, ImagePaint } from '../../compiler/design-ast.ts'
 import { stringLiteral } from './ast.ts'
-import type { LowererCtx as Ctx, Uses } from './lowerer-types.ts'
-import { nodeSourceId } from './sizing.ts'
+import type { LowererCtx as Ctx } from './lowerer-types.ts'
 import { sanitizeKey } from './styles.ts'
 
-export function sidecarFilename(id: string): string {
-    return `svg__${sanitizeKey(id)}.svg`
-}
-export function sidecarFilenameTinted(id: string): string {
-    return `svg__${sanitizeKey(id)}__c.svg`
-}
 export function sidecarAlias(id: string): string {
     return `Svg_${sanitizeKey(id)}`
 }
@@ -22,7 +20,14 @@ export function sidecarAliasTinted(id: string): string {
     return `SvgC_${sanitizeKey(id)}`
 }
 
-export function assetSidecarPath(ctx: Ctx, filename: string): string {
+/** Relative path (from `<outputDir>`) of the tinted-variant sidecar file for
+ *  the given source node id. Codegen writes the sidecar bytes to this path. */
+export function tintedSidecarRelativePath(ctx: Ctx, sourceId: string): string {
+    const filename = `svg__${sanitizeKey(sourceId)}__c.svg`
+    return targetSidecarRelativePath(ctx, filename)
+}
+
+function targetSidecarRelativePath(ctx: Ctx, filename: string): string {
     const base = ctx.env.outputDir ? nodePath.basename(ctx.env.outputDir) : ''
     if (base === 'generated' || base === 'breakdown') {
         return `../.pixpec/assets/${filename}`
@@ -30,74 +35,23 @@ export function assetSidecarPath(ctx: Ctx, filename: string): string {
     return `.pixpec/assets/${filename}`
 }
 
-export function assetImportPath(relativePath: string, suffix = ''): string {
-    const rel = relativePath.replace(/\\/g, '/')
-    return `${rel.startsWith('./') || rel.startsWith('../') ? rel : `./${rel}`}${suffix}`
+/** Build a relative import path from `<outputDir>` to the shared asset file. */
+export function assetImportPathFromOutput(filename: string, ctx: Ctx): string {
+    const outDir = ctx.env.outputDir
+    const assetsDir = ctx.env.assetsDir
+    if (!outDir || !assetsDir) {
+        // Without context, fall back to a target-local sidecar path.
+        return targetSidecarRelativePath(ctx, filename)
+    }
+    const rel = nodePath.relative(outDir, nodePath.join(assetsDir, filename))
+    const normalized = rel.split(nodePath.sep).join('/')
+    return normalized.startsWith('.') ? normalized : `./${normalized}`
 }
 
-const IMAGE_MIME_EXT: Record<string, string | undefined> = {
-    'image/png': 'png',
-    'image/jpeg': 'jpg',
-    'image/gif': 'gif',
-    'image/webp': 'webp',
-}
-
-function imageFilename(sourceId: string, mime: string): string | undefined {
-    const ext = IMAGE_MIME_EXT[mime.toLowerCase()]
-    if (!ext) {
-        return undefined
-    }
-    return `image__${sourceId.replace(/[^A-Za-z0-9]/g, '_')}.${ext}`
-}
-
-export function imageAssetUrlMarker(n: DImage, ctx: Ctx, uses: Uses): ast.Expression | undefined {
-    if (!n.dataUrl) {
-        return undefined
-    }
-    return registerImageSidecarFromDataUrl(n.dataUrl, nodeSourceId(n), ctx, uses)
-}
-
-/** Register a container-background image fill as an asset sidecar and return
- *  the `new URL('./image__…', import.meta.url).href` expression to embed in
- *  generated code. */
-export function imagePaintUrlMarker(
-    paint: ImagePaint,
-    sourceId: string,
-    ctx: Ctx,
-    uses: Uses,
-): ast.Expression | undefined {
-    if (!paint.dataUrl) {
-        return undefined
-    }
-    return registerImageSidecarFromDataUrl(paint.dataUrl, sourceId, ctx, uses)
-}
-
-function registerImageSidecarFromDataUrl(
-    dataUrl: string,
-    sourceId: string,
-    ctx: Ctx,
-    uses: Uses,
-): ast.Expression | undefined {
-    const match = /^data:([^;,]+);base64,(.*)$/s.exec(dataUrl)
-    if (!match) {
-        return undefined
-    }
-    const mime = match[1] ?? ''
-    const filename = imageFilename(sourceId, mime)
-    if (!filename) {
-        return undefined
-    }
-    const relativePath = assetSidecarPath(ctx, filename)
-    if (!uses.imageSidecars.has(relativePath)) {
-        uses.imageSidecars.set(relativePath, {
-            content: Buffer.from(match[2] ?? '', 'base64'),
-        })
-    }
-    return assetUrlExpression(assetImportPath(relativePath))
-}
-
-// `new URL('<path>', import.meta.url).href`
-export function assetUrlExpression(importPath: string): ast.Expression {
+/** `new URL('<importPath>', import.meta.url).href` — the canonical way to
+ *  reference an asset alongside the generated source file in modern bundlers. */
+export function assetImportExpression(filename: string, ctx: Ctx): ast.Expression {
+    const importPath = assetImportPathFromOutput(filename, ctx)
     const importMetaUrl = f.createPropertyAccessExpression(
         f.createMetaProperty(ast.SyntaxKind.ImportKeyword, f.createIdentifier('meta')),
         undefined,

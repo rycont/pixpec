@@ -158,7 +158,7 @@ function wrapVisibility(n: DNode, jsx: ast.JsxChild, ctx: Ctx, parent: ParentCtx
 
 setNodeDispatcher((n, ctx, parent) => emitNode(n, ctx, parent))
 
-function emitNode(n: DNode, ctx: Ctx, parent: ParentCtx): LowerResult {
+async function emitNode(n: DNode, ctx: Ctx, parent: ParentCtx): Promise<LowerResult> {
     if (n.kind === NodeKind.DataScope) {
         return emitNode((n as DDataScope).child, ctx, parent)
     }
@@ -168,25 +168,25 @@ function emitNode(n: DNode, ctx: Ctx, parent: ParentCtx): LowerResult {
         case NodeKind.Flex:
         case NodeKind.Stack:
         case NodeKind.Box:
-            inner = emitContainer(n, ctx, parent)
+            inner = await emitContainer(n, ctx, parent)
             break
         case NodeKind.Text:
-            inner = emitText(n, ctx, parent)
+            inner = await emitText(n, ctx, parent)
             break
         case NodeKind.Shape:
-            inner = emitShape(n, ctx, parent)
+            inner = await emitShape(n, ctx, parent)
             break
         case NodeKind.Vector:
-            inner = emitVector(n, ctx)
+            inner = await emitVector(n, ctx)
             break
         case NodeKind.Image:
-            inner = emitImage(n, ctx)
+            inner = await emitImage(n, ctx)
             break
         case NodeKind.Instance:
-            inner = emitInstance(n, ctx, parent)
+            inner = await emitInstance(n, ctx, parent)
             break
         case NodeKind.Unknown:
-            inner = emitUnknown(n, ctx)
+            inner = await emitUnknown(n, ctx)
             break
     }
     mergeUses(uses, inner.uses)
@@ -279,15 +279,15 @@ interface BuildResult {
     imageSidecars: Map<string, { content: Uint8Array }>
 }
 
-function buildSource(
+async function buildSource(
     root: DNode,
     ctx: Ctx,
     printNode: (n: ast.Node) => string,
     sourceId: string,
     componentName: string,
-): BuildResult {
+): Promise<BuildResult> {
     const scope = ensureDataScope(root, componentName)
-    const { jsx: bodyJsx, uses } = emitNode(scope.child, ctx, ROOT_PARENT)
+    const { jsx: bodyJsx, uses } = await emitNode(scope.child, ctx, ROOT_PARENT)
     const body = bodyJsx as ast.Expression
     uses.tintFilterId = `tint_${sourceId.replace(/[^A-Za-z0-9]/g, '_')}`
     uses.usedJsxPatterns.add('splitCssProps')
@@ -413,7 +413,10 @@ function buildSource(
     }
 }
 
-export function codegenReactPanda(root: DNode, ctx: CodegenContext): CodegenResult {
+export async function codegenReactPanda(
+    root: DNode,
+    ctx: CodegenContext,
+): Promise<CodegenResult> {
     const normalizedRoot = ensureSourceMeta(root)
     const ext = ctx as CodegenContext & ReactPandaCtxExt
     const cgCtx: Ctx = {
@@ -426,18 +429,23 @@ export function codegenReactPanda(root: DNode, ctx: CodegenContext): CodegenResu
             rootDir: ctx.rootDir,
             componentsDir: ctx.componentsDir,
             propsFile: ctx.propsFile,
+            assetsDir: ctx.assetsDir,
             viewConfig: ctx.viewConfig ?? {},
         },
     }
     const sourceId = ext.sourceId ?? nodeSourceId(normalizedRoot)
 
     const printNode = ext.printNode ?? getSharedPrintNode(process.cwd())
-    const result = buildSource(normalizedRoot, cgCtx, printNode, sourceId, ctx.componentName)
+    const result = await buildSource(normalizedRoot, cgCtx, printNode, sourceId, ctx.componentName)
     const sidecars = [
-        ...[...result.svgSidecars.entries()].map(([relativePath, { content }]) => ({
-            relativePath,
-            content,
-        })),
+        // Skip `shared` SVG sidecars — those bytes already live in the shared
+        // assetsDir written by compile and don't need a target-side copy.
+        ...[...result.svgSidecars.entries()]
+            .filter(([, { shared }]) => !shared)
+            .map(([relativePath, { content }]) => ({
+                relativePath,
+                content,
+            })),
         ...[...result.imageSidecars.entries()].map(([relativePath, { content }]) => ({
             relativePath,
             content,

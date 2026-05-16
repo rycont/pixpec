@@ -1,11 +1,12 @@
+import { readFile } from 'node:fs/promises'
+import * as nodePath from 'node:path'
 import type { DVector } from '../../../compiler/design-ast.ts'
 import {
-    assetImportPath,
-    assetSidecarPath,
+    assetImportPathFromOutput,
     sidecarAlias,
     sidecarAliasTinted,
-    sidecarFilename,
     sidecarFilenameTinted,
+    tintedSidecarRelativePath,
 } from '../assets.ts'
 import { jsxAttr, jsxEl, jsxSelf, styleAttr, styledTag } from '../ast.ts'
 import { px2rem, sizeToPx } from '../data-lowerer.ts'
@@ -14,52 +15,46 @@ import { emptyUses } from '../lowerer-types.ts'
 import { expressionPropName, nodeSourceId } from '../sizing.ts'
 import { tintSwapJsx } from '../styles.ts'
 
-export function emitVector(n: DVector, ctx: Ctx): LowerResult {
+export async function emitVector(n: DVector, ctx: Ctx): Promise<LowerResult> {
     const uses = emptyUses()
     const rawW = sizeToPx(n.width) ?? 0
     const rawH = sizeToPx(n.height) ?? 0
-    const svgSize = n.svg.startsWith('data:') ? undefined : svgRootSize(n.svg)
-    const w = svgSize?.width ?? rawW
-    const h = svgSize?.height ?? rawH
-    if (n.svg.startsWith('data:')) {
-        uses.usedJsxPatterns.add('styled')
+    if (!n.asset) {
         return {
-            jsx: jsxSelf(styledTag('img'), [
-                jsxAttr('src', n.svg),
-                jsxAttr('alt', ''),
+            jsx: jsxSelf(styledTag('span'), [
                 jsxAttr('flexShrink', 0),
-                jsxAttr('width', px2rem(w, ctx.env.remBase)),
-                jsxAttr('height', px2rem(h, ctx.env.remBase)),
+                jsxAttr('width', px2rem(rawW, ctx.env.remBase)),
+                jsxAttr('height', px2rem(rawH, ctx.env.remBase)),
                 styleAttr({ display: 'block' }),
             ]),
             uses,
         }
     }
-    // Wrap the svgr-imported component in an inline-sized box. Breakdown
-    // outputs aren't in Panda's static extraction set, so width/height can't
-    // rely on generated utility classes.
+    const svgContent = ctx.env.assetsDir
+        ? await readFile(nodePath.join(ctx.env.assetsDir, n.asset), 'utf8').catch(() => '')
+        : ''
+    const svgSize = svgRootSize(svgContent)
+    const w = svgSize?.width ?? rawW
+    const h = svgSize?.height ?? rawH
     const sourceId = nodeSourceId(n)
-    const sidecarKey = assetSidecarPath(ctx, sidecarFilename(sourceId))
+    const originalImportPath = assetImportPathFromOutput(n.asset, ctx)
     const alias = sidecarAlias(sourceId)
-    const normalizedSvg = n.svg
-    if (!uses.svgSidecars.has(sidecarKey)) {
-        uses.svgSidecars.set(sidecarKey, {
-            alias,
-            content: ringifyStrokeCircles(normalizedSvg),
-            importPath: assetImportPath(sidecarKey, '?react'),
-        })
-    }
+    // Register original as a "sidecar" — but content is just a marker that
+    // codegen treats this as "already exists at importPath, no copy needed".
+    uses.svgSidecars.set(originalImportPath, {
+        alias,
+        content: '',
+        importPath: `${originalImportPath}?react`,
+        shared: true,
+    })
     const fillProp = expressionPropName(n.fill)
-    // Second `currentColor` sidecar lets a prop-driven fill swap colors via
-    // inline `color: props.X`. Matches figma's anisotropic stretch under
-    // preserveAspectRatio="none".
-    const tintedKey = assetSidecarPath(ctx, sidecarFilenameTinted(sourceId))
+    const tintedRelativePath = tintedSidecarRelativePath(ctx, sourceId)
     const tintedAlias = sidecarAliasTinted(sourceId)
-    if (!uses.svgSidecars.has(tintedKey)) {
-        uses.svgSidecars.set(tintedKey, {
+    if (!uses.svgSidecars.has(tintedRelativePath)) {
+        uses.svgSidecars.set(tintedRelativePath, {
             alias: tintedAlias,
-            content: makeCurrentColorSvg(ringifyStrokeCircles(normalizedSvg)),
-            importPath: assetImportPath(tintedKey, '?react'),
+            content: makeCurrentColorSvg(ringifyStrokeCircles(svgContent)),
+            importPath: `${tintedRelativePath}?react`,
         })
     }
     uses.usesTinting = true
