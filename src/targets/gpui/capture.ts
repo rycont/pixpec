@@ -252,16 +252,144 @@ impl Render for Generated {
     resolve(opts.runtimeDir, 'src/main.rs'),
     `use anyhow::Result;
 use gpui::{
-    px, point, size, App, Application, AssetSource, Bounds, SharedString, WindowBounds,
-    WindowKind, WindowOptions,
+    canvas, px, point, size, App, Application, AssetSource, Bounds, Hsla, IntoElement, Path,
+    PathBuilder, Pixels, Point, SharedString, Styled, WindowBounds, WindowKind, WindowOptions,
 };
 use gpui::prelude::*;
 use std::borrow::Cow;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::{Path as StdPath, PathBuf};
 use std::time::Duration;
 
 mod generated;
+
+// --- pixpec squircle support --------------------------------------------------
+// Port of figma-squircle's getPathParamsForCorner + corner drawing to Rust so
+// the runtime can paint Figma's continuous-curvature corners (cornerSmoothing > 0)
+// using GPUI's PathBuilder. Codegen routes nodes with cornerSmoothing > 0 to
+// pixpec_squircle_bg() which fills the parent with the squircle silhouette.
+
+#[derive(Copy, Clone)]
+struct PixpecSquircleParams {
+    a: f32, b: f32, c: f32, d: f32, p: f32, arc_section_length: f32, corner_radius: f32,
+}
+
+fn pixpec_squircle_params(corner_radius: f32, smoothing: f32, budget: f32) -> PixpecSquircleParams {
+    let mut smoothing = smoothing;
+    let mut p = (1.0 + smoothing) * corner_radius;
+    let max_smoothing = if corner_radius > 0.0 { (budget / corner_radius - 1.0).max(0.0) } else { 0.0 };
+    if p > budget && corner_radius > 0.0 {
+        // preserve = true path from figma-squircle: clamp parameters so the
+        // smoothing stays representable when the side budget is tight.
+        let arc_measure = 90.0_f32 * (1.0 - smoothing);
+        let arc_section_length = (arc_measure / 2.0).to_radians().sin() * corner_radius * 2.0_f32.sqrt();
+        let angle_alpha = (90.0_f32 - arc_measure) / 2.0;
+        let p3_to_p4 = corner_radius * (angle_alpha / 2.0).to_radians().tan();
+        let angle_beta = 45.0_f32 * smoothing;
+        let c = p3_to_p4 * angle_beta.to_radians().cos();
+        let d = c * angle_beta.to_radians().tan();
+        let p1_to_p3_max = budget - d - arc_section_length - c;
+        let min_a = p1_to_p3_max / 6.0;
+        let max_b = p1_to_p3_max - min_a;
+        let mut b = (p - arc_section_length - c - d) / 3.0;
+        b = b.min(max_b);
+        let a = p1_to_p3_max - b;
+        p = p.min(budget);
+        return PixpecSquircleParams { a, b, c, d, p, arc_section_length, corner_radius };
+    }
+    smoothing = smoothing.min(max_smoothing).max(0.0);
+    let arc_measure = 90.0_f32 * (1.0 - smoothing);
+    let arc_section_length = (arc_measure / 2.0).to_radians().sin() * corner_radius * 2.0_f32.sqrt();
+    let angle_alpha = (90.0_f32 - arc_measure) / 2.0;
+    let p3_to_p4 = corner_radius * (angle_alpha / 2.0).to_radians().tan();
+    let angle_beta = 45.0_f32 * smoothing;
+    let c = p3_to_p4 * angle_beta.to_radians().cos();
+    let d = c * angle_beta.to_radians().tan();
+    let b = (p - arc_section_length - c - d) / 3.0;
+    let a = 2.0 * b;
+    PixpecSquircleParams { a, b, c, d, p, arc_section_length, corner_radius }
+}
+
+fn pixpec_squircle_path(width: f32, height: f32, corner_radius: f32, smoothing: f32, origin: Point<Pixels>) -> Path<Pixels> {
+    let budget = (width.min(height)) / 2.0;
+    let r = corner_radius.min(budget).max(0.0);
+    let params = pixpec_squircle_params(r, smoothing.max(0.0), budget);
+    let p = params.p;
+    let asl = params.arc_section_length;
+    let a = params.a;
+    let bb = params.b;
+    let cc = params.c;
+    let dd = params.d;
+    let rr = params.corner_radius;
+    let ox: f32 = origin.x.into();
+    let oy: f32 = origin.y.into();
+    let mk = |x: f32, y: f32| point(px(ox + x), px(oy + y));
+
+    let mut path = PathBuilder::fill();
+    // M (width - p) 0
+    let mut x = width - p;
+    let mut y = 0.0_f32;
+    path.move_to(mk(x, y));
+    // top-right: cubic, arc, cubic
+    path.cubic_bezier_to(mk(x + a + bb + cc, y + dd), mk(x + a, y), mk(x + a + bb, y));
+    x += a + bb + cc; y += dd;
+    path.arc_to(point(px(rr), px(rr)), px(0.0), false, true, mk(x + asl, y + asl));
+    x += asl; y += asl;
+    path.cubic_bezier_to(mk(x + dd, y + a + bb + cc), mk(x + dd, y + a), mk(x + dd, y + a + bb));
+    y += a + bb + cc;
+    // L width (height - p)
+    path.line_to(mk(width, height - p));
+    x = width; y = height - p;
+    // bottom-right: cubic, arc, cubic
+    path.cubic_bezier_to(mk(x - dd, y + a + bb + cc), mk(x, y + a), mk(x, y + a + bb));
+    x -= dd; y += a + bb + cc;
+    path.arc_to(point(px(rr), px(rr)), px(0.0), false, true, mk(x - asl, y + asl));
+    x -= asl; y += asl;
+    path.cubic_bezier_to(mk(x - a - bb - cc, y + dd), mk(x - cc, y + dd), mk(x - bb - cc, y + dd));
+    x -= a + bb + cc;
+    // L p height
+    path.line_to(mk(p, height));
+    x = p; y = height;
+    // bottom-left
+    path.cubic_bezier_to(mk(x - a - bb - cc, y - dd), mk(x - a, y), mk(x - a - bb, y));
+    x -= a + bb + cc; y -= dd;
+    path.arc_to(point(px(rr), px(rr)), px(0.0), false, true, mk(x - asl, y - asl));
+    x -= asl; y -= asl;
+    path.cubic_bezier_to(mk(x - dd, y - a - bb - cc), mk(x - dd, y - a), mk(x - dd, y - a - bb));
+    y -= a + bb + cc;
+    // L 0 p
+    path.line_to(mk(0.0, p));
+    x = 0.0; y = p;
+    // top-left
+    path.cubic_bezier_to(mk(x + dd, y - a - bb - cc), mk(x, y - a), mk(x, y - a - bb));
+    x += dd; y -= a + bb + cc;
+    path.arc_to(point(px(rr), px(rr)), px(0.0), false, true, mk(x + asl, y - asl));
+    x += asl; y -= asl;
+    path.cubic_bezier_to(mk(x + a + bb + cc, y - dd), mk(x + cc, y - dd), mk(x + bb + cc, y - dd));
+    path.close();
+    path.build().expect("squircle path build")
+}
+
+pub fn pixpec_squircle_bg(corner_radius: f32, smoothing: f32, color: impl Into<Hsla>) -> impl IntoElement {
+    let hsla = color.into();
+    canvas(
+        |_bounds, _window, _cx| {},
+        move |bounds: Bounds<Pixels>, _state, window, _cx| {
+            let path = pixpec_squircle_path(
+                bounds.size.width.into(),
+                bounds.size.height.into(),
+                corner_radius,
+                smoothing,
+                bounds.origin,
+            );
+            window.paint_path(path, hsla);
+        },
+    )
+    .absolute()
+    .left(px(0.0))
+    .top(px(0.0))
+    .size_full()
+}
 
 struct CaptureAssets {
     base: PathBuf,
@@ -403,7 +531,7 @@ fn main() {
     });
 }
 
-fn collect_font_files(dir: &Path, out: &mut Vec<Cow<'static, [u8]>>) {
+fn collect_font_files(dir: &StdPath, out: &mut Vec<Cow<'static, [u8]>>) {
     let Ok(entries) = fs::read_dir(dir) else { return; };
     for entry in entries.flatten() {
         let path = entry.path();

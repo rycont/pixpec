@@ -3,9 +3,10 @@ import { Align, FlowDirection, Justify, NodeKind } from '../../../compiler/desig
 import { div } from './chain.ts'
 import type { GpuiEmitContext } from './context.ts'
 import { addNodeLayout } from './layout.ts'
+import { pad } from './rust.ts'
 import { addSizing } from './sizing.ts'
 import { addContainerStyles } from './styles.ts'
-import { lengthExpr } from './values.ts'
+import { colorExpr, lengthExpr, lengthNumber } from './values.ts'
 
 export async function emitContainer(
   n: DFlex | DStack | DBox,
@@ -31,7 +32,27 @@ export async function emitContainer(
   // Padding on an empty container only exists in Figma as a hit-area hint
   // and never widens the visible box, so emitting it as real padding here
   // would inflate the GPUI box without any content using the space.
-  const stylesNode = n.children.length === 0 ? { ...n, padding: undefined } : n
+  let stylesNode = n.children.length === 0 ? { ...n, padding: undefined } : n
+  // Figma's `cornerSmoothing > 0` paints a continuous-curvature ("squircle")
+  // corner that GPUI's `rounded()` does not reproduce — corner placement
+  // differs by 1-2px at the curve which snowballs in pixel-diff verification.
+  // Route the bg + rounded through a runtime-painted squircle path overlay
+  // (see pixpec_squircle_bg in capture.ts main.rs); stripping those fields
+  // from the styles call lets the standard div be just the layout container.
+  const smoothing = (n as { cornerSmoothing?: number }).cornerSmoothing ?? 0
+  const radiusValue = n.cornerRadius
+  const hasUniformRadius = !!radiusValue && (typeof radiusValue === 'string' || (typeof radiusValue === 'object' && 'kind' in radiusValue))
+  const useSquircleBg = smoothing > 0 && hasUniformRadius && !!n.background
+  let squircleBg: { radius: number; smoothing: number; color: string } | undefined
+  if (useSquircleBg) {
+    stylesNode = { ...stylesNode, background: undefined, cornerRadius: undefined }
+    chain.method('relative')
+    squircleBg = {
+      radius: lengthNumber(radiusValue as Parameters<typeof lengthNumber>[0], ctx),
+      smoothing,
+      color: colorExpr(n.background!, ctx),
+    }
+  }
   addContainerStyles(chain, stylesNode, ctx)
 
   if (direction) {
@@ -47,8 +68,17 @@ export async function emitContainer(
     else if (flex.justify === Justify.SpaceBetween) chain.method('justify_between')
   }
 
+  if (squircleBg) {
+    chain.child(
+      `${pad(indent + 2)}super::pixpec_squircle_bg(${rustFloat(squircleBg.radius)}, ${rustFloat(squircleBg.smoothing)}, ${squircleBg.color})`,
+    )
+  }
   for (const child of n.children) {
     chain.child(await emitChild(child, ctx, indent + 2, direction))
   }
   return chain.toString()
+}
+
+function rustFloat(value: number): string {
+  return Number.isInteger(value) ? `${value}.0` : `${+value.toFixed(6)}`
 }

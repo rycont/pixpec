@@ -43,46 +43,23 @@ export async function codegenGpui(root: DNode, ctx: CodegenContext): Promise<Cod
     const outsideRing = outsideBorderRing(root, emitCtx, offset)
     let innerOverride = inner
     if (outsideRing) {
-      // If the root carries Figma cornerSmoothing > 0 the corner curve is a
-      // squircle, not a circular arc. GPUI only knows circular rounded(); to
-      // match Figma's exact pixel placement we paint a single SVG with both
-      // the outer ring (border color) and the inner fill (bg color) using
-      // figma-squircle-generated paths. The wrapper becomes a plain rectangle
-      // and the squircle bg renders via an absolute img layer.
-      const squircleAsset = await tryGenerateSquircleAsset(root, emitCtx, offset, outsideRing)
-      if (squircleAsset) {
-        lines.push(`            .overflow_hidden()`)
-        // Strip wrapper bg/rounded — SVG paints them.
-        lines.push('            .child(')
-        lines.push(`                img(r"${squircleAsset.path}")`)
-        lines.push(`                    .w(px(${rustFloat(squircleAsset.width)}))`)
-        lines.push(`                    .h(px(${rustFloat(squircleAsset.height)}))`)
-        lines.push('                    .absolute()')
-        lines.push('                    .left(px(0.0))')
-        lines.push('                    .top(px(0.0))')
-        lines.push('            )')
-        // Strip inner's bg, border, rounded — SVG covers them.
-        innerOverride = inner
-          .split('\n')
-          .filter((line) =>
-            !/\.bg\(/.test(line) &&
-            !/\.border(?:_[trbl])?\(px\(/.test(line) &&
-            !/\.border_color\(/.test(line) &&
-            !/\.rounded\(/.test(line),
-          )
-          .join('\n')
+      // Strip the inner div's own border emission so the colors don't stack —
+      // Figma draws the border exactly once at the outer ring.
+      innerOverride = inner
+        .split('\n')
+        .filter((line) => !/\.border(?:_[trbl])?\(px\(/.test(line) && !/\.border_color\(/.test(line))
+        .join('\n')
+      const smoothing = (root as { cornerSmoothing?: number }).cornerSmoothing ?? 0
+      if (smoothing > 0 && outsideRing.rounded !== undefined) {
+        // Continuous-curvature corner: paint the border ring as a squircle
+        // via the runtime helper. The wrapper carries no bg/rounded itself.
+        lines.push('            .relative()')
+        lines.push(`            .child(super::pixpec_squircle_bg(${rustFloat(outsideRing.rounded)}, ${rustFloat(smoothing)}, ${outsideRing.colorExpr}))`)
       } else {
         lines.push(`            .bg(${outsideRing.colorExpr})`)
         if (outsideRing.rounded !== undefined) {
           lines.push(`            .rounded(px(${rustFloat(outsideRing.rounded)}))`)
         }
-        // The wrapper now renders the border ring. Strip the inner div's own
-        // border emission so the colors don't stack — Figma draws the border
-        // exactly once at the outer 8px.
-        innerOverride = inner
-          .split('\n')
-          .filter((line) => !/\.border(?:_[trbl])?\(px\(/.test(line) && !/\.border_color\(/.test(line))
-          .join('\n')
       }
     }
     lines.push('            .child(')
