@@ -86,7 +86,7 @@ export function emitText(n: DText, ctx: Ctx, parent: ParentCtx): LowerResult {
     }
     if (hasExplicitLineBreak || (contentCanContainLineBreaks && !isHug)) {
         styles.whiteSpace = 'pre-wrap'
-    } else if (isHug) {
+    } else if (isHug || collapsedFill) {
         styles.whiteSpace = 'nowrap'
     }
     const tag = styledTag('span')

@@ -32,13 +32,18 @@ import { emitVector } from './lowerers/vector.ts'
 import { expressionPropName, nodeSourceId } from './sizing.ts'
 import { injectSpreadAttr, splitCssPropsDecl, squircleHookMarker } from './styles.ts'
 
-function requireDataScope(root: DNode): DDataScope {
-    if (root.kind !== NodeKind.DataScope) {
-        throw new Error(
-            'pixpec react-panda: root node must be a DataScope (component scaffold boundary)',
-        )
+// View-level codegen (breakdown) hands us a raw root without a DataScope
+// wrapper; wrap it on the fly using ctx.componentName as the identifier.
+function ensureDataScope(root: DNode, fallbackName: string): DDataScope {
+    if (root.kind === NodeKind.DataScope) {
+        return root as DDataScope
     }
-    return root as DDataScope
+    return {
+        kind: NodeKind.DataScope,
+        componentName: fallbackName || 'Generated',
+        data: {},
+        child: root,
+    } as DDataScope
 }
 
 function propsTypeName(scope: DDataScope): string {
@@ -279,8 +284,9 @@ function buildSource(
     ctx: Ctx,
     printNode: (n: ast.Node) => string,
     sourceId: string,
+    componentName: string,
 ): BuildResult {
-    const scope = requireDataScope(root)
+    const scope = ensureDataScope(root, componentName)
     const { jsx: bodyJsx, uses } = emitNode(scope.child, ctx, ROOT_PARENT)
     const body = bodyJsx as ast.Expression
     uses.tintFilterId = `tint_${sourceId.replace(/[^A-Za-z0-9]/g, '_')}`
@@ -426,7 +432,7 @@ export function codegenReactPanda(root: DNode, ctx: CodegenContext): CodegenResu
     const sourceId = ext.sourceId ?? nodeSourceId(normalizedRoot)
 
     const printNode = ext.printNode ?? getSharedPrintNode(process.cwd())
-    const result = buildSource(normalizedRoot, cgCtx, printNode, sourceId)
+    const result = buildSource(normalizedRoot, cgCtx, printNode, sourceId, ctx.componentName)
     const sidecars = [
         ...[...result.svgSidecars.entries()].map(([relativePath, { content }]) => ({
             relativePath,

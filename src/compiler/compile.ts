@@ -67,7 +67,11 @@ import type {
 } from "../dumper/raw-node.ts";
 import type { Registry } from "./registry.ts";
 import { resolveRegistryVariant } from "./registry.ts";
-import { indexDNodeClasses, materializeDNode, materializeDNodes } from "./nodes/index.ts";
+import {
+  indexDNodeClasses,
+  materializeDNode,
+  materializeDNodes,
+} from "./nodes/index.ts";
 import type { DNodeClass } from "./nodes/index.ts";
 
 export interface CompileOptions {
@@ -412,7 +416,9 @@ function pickColor(
   return colorLiteral(paint.color, opacity);
 }
 
-function gradientPaintToPaint(paint: RawGradientPaint | null | undefined): Paint | undefined {
+function gradientPaintToPaint(
+  paint: RawGradientPaint | null | undefined,
+): Paint | undefined {
   if (!paint?.gradientStops?.length) return undefined;
   const angle = gradientCssAngle(paint);
   return literalValue({
@@ -457,7 +463,9 @@ function colorsEquivalent(a: string, b: string): boolean {
   return ca.every((value, index) => Math.abs(value - cb[index]) <= 1);
 }
 
-function parseCssColor(value: string): [number, number, number, number] | undefined {
+function parseCssColor(
+  value: string,
+): [number, number, number, number] | undefined {
   const hex = /^#([0-9a-fA-F]{6})$/.exec(value);
   if (hex) {
     const n = Number.parseInt(hex[1], 16);
@@ -493,7 +501,10 @@ function shadowFromRaw(n: RawNode): Shadow | undefined {
     y: px(effect.offset?.y ?? 0),
     blur: px(effect.radius ?? 0),
     spread: effect.spread ? px(effect.spread) : undefined,
-    color: colorLiteral(effect.color, typeof effect.color.a === "number" ? effect.color.a : 1),
+    color: colorLiteral(
+      effect.color,
+      typeof effect.color.a === "number" ? effect.color.a : 1,
+    ),
   };
 }
 
@@ -519,7 +530,9 @@ function buildBase(
 ): DNodeBase {
   const out: DNodeBase = { sourceId: n.id, sourceName: n.name };
   if (n.componentPropertyReferences?.visible && !opts.detachRootInstance) {
-    out.visible = propValue(publicComponentPropName(n.componentPropertyReferences.visible));
+    out.visible = propValue(
+      publicComponentPropName(n.componentPropertyReferences.visible),
+    );
   } else if (n.visible === false) {
     out.visible = literalValue(false);
   }
@@ -561,11 +574,18 @@ function propValue(name: string): Value<never> {
 }
 
 function publicComponentPropName(rawKey: string): string {
-  return String(rawKey).replace(/#[^#]*$/, "").replace(/\s+/g, "");
+  return String(rawKey)
+    .replace(/#[^#]*$/, "")
+    .replace(/\s+/g, "");
 }
 
-function axisSize(n: RawNode, axis: "horizontal" | "vertical", opts: CompileOptions): AxisSize | undefined {
-  const rawSizing = axis === "horizontal" ? n.layoutSizingHorizontal : n.layoutSizingVertical;
+function axisSize(
+  n: RawNode,
+  axis: "horizontal" | "vertical",
+  opts: CompileOptions,
+): AxisSize | undefined {
+  const rawSizing =
+    axis === "horizontal" ? n.layoutSizingHorizontal : n.layoutSizingVertical;
   const sizing = sizingFromRaw(rawSizing);
   if (sizing === Sizing.Fill) return Sizing.Fill;
   if (sizing === Sizing.Hug) return Sizing.Hug;
@@ -574,7 +594,11 @@ function axisSize(n: RawNode, axis: "horizontal" | "vertical", opts: CompileOpti
   return pickSize(value, variable, opts);
 }
 
-function fixedSize(n: RawNode, axis: "horizontal" | "vertical", opts: CompileOptions): LengthValue | undefined {
+function fixedSize(
+  n: RawNode,
+  axis: "horizontal" | "vertical",
+  opts: CompileOptions,
+): LengthValue | undefined {
   const value = axis === "horizontal" ? nodeWidth(n) : nodeHeight(n);
   const variable = axis === "horizontal" ? nodeWidthVar(n) : nodeHeightVar(n);
   return pickSize(value, variable, opts);
@@ -582,11 +606,19 @@ function fixedSize(n: RawNode, axis: "horizontal" | "vertical", opts: CompileOpt
 
 function nonZeroSize(size: LengthValue | undefined): LengthValue | undefined {
   if (!size) return undefined;
-  if (typeof size !== "string" && size.kind === "literal" && Math.abs(size.value.value) < 0.001) return undefined;
+  if (
+    typeof size !== "string" &&
+    size.kind === "literal" &&
+    Math.abs(size.value.value) < 0.001
+  )
+    return undefined;
   return size;
 }
 
-function textStyleName(id: string | undefined, opts: CompileOptions): string | undefined {
+function textStyleName(
+  id: string | undefined,
+  opts: CompileOptions,
+): string | undefined {
   if (!id) return undefined;
   const map = opts.typographyMap;
   if (!map) return undefined;
@@ -595,23 +627,34 @@ function textStyleName(id: string | undefined, opts: CompileOptions): string | u
   return Object.entries(map).find(([key]) => key.startsWith(id))?.[1];
 }
 
-function directPaintBinding(n: RawNode, opts: CompileOptions): string | undefined {
+function directPaintBinding(
+  n: RawNode,
+  opts: CompileOptions,
+): string | undefined {
   return undefined;
 }
 
 function hasVisiblePaint(n: RawNode): boolean {
   if (n.isMask || isInvisibleShape(n)) return false;
-  return Array.isArray(n.fills) && n.fills.some((f) => f && f.visible !== false);
+  return (
+    Array.isArray(n.fills) && n.fills.some((f) => f && f.visible !== false)
+  );
 }
 
-function foldedPaintBinding(n: RawNode, opts: CompileOptions): string | undefined {
+function foldedPaintBinding(
+  n: RawNode,
+  opts: CompileOptions,
+): string | undefined {
   const direct = directPaintBinding(n, opts);
   if (direct) return direct;
   const props = new Set<string>();
   let painted = 0;
   const visit = (node: RawNode) => {
     if (node.visible === false) return;
-    if ((SHAPELIKE.has(node.type) || VECTORLIKE.has(node.type)) && hasVisiblePaint(node)) {
+    if (
+      (SHAPELIKE.has(node.type) || VECTORLIKE.has(node.type)) &&
+      hasVisiblePaint(node)
+    ) {
       painted += 1;
       const prop = directPaintBinding(node, opts);
       if (prop) props.add(prop);
@@ -624,7 +667,10 @@ function foldedPaintBinding(n: RawNode, opts: CompileOptions): string | undefine
   let boundPainted = 0;
   const countBound = (node: RawNode) => {
     if (node.visible === false) return;
-    if ((SHAPELIKE.has(node.type) || VECTORLIKE.has(node.type)) && hasVisiblePaint(node)) {
+    if (
+      (SHAPELIKE.has(node.type) || VECTORLIKE.has(node.type)) &&
+      hasVisiblePaint(node)
+    ) {
       if (directPaintBinding(node, opts) === prop) boundPainted += 1;
     }
     for (const child of node.children ?? []) countBound(child);
@@ -698,7 +744,8 @@ function hasUnconsumedDNodeDiff(
   const usageNodes = indexDNodes(usageChildren);
   const usageNodesByBareId = indexDNodesByBareId(usageChildren);
   for (const [nodeId, masterNode] of masterNodes) {
-    const usageNode = usageNodes.get(nodeId) ?? usageNodesByBareId.get(stripPrefix(nodeId));
+    const usageNode =
+      usageNodes.get(nodeId) ?? usageNodesByBareId.get(stripPrefix(nodeId));
     if (!usageNode || usageNode.kind !== masterNode.kind) return true;
     for (const diff of masterNode.visualDiff(usageNode)) {
       if (consumedFields.has(`${nodeId}\0${diff.field}`)) continue;
@@ -715,11 +762,17 @@ function indexDNodesByBareId(nodes: DNode[]): Map<string, DNodeClass> {
 }
 
 function containerChildren(node: DNode): DNode[] {
-  if (node.kind === NodeKind.DataScope) return containerChildren((node as DDataScope).child);
-  return materializeDNode(node).children().map((child) => child.toJSON());
+  if (node.kind === NodeKind.DataScope)
+    return containerChildren((node as DDataScope).child);
+  return materializeDNode(node)
+    .children()
+    .map((child) => child.toJSON());
 }
 
-function withInstanceOverrideFields(opts: CompileOptions, n: RawNode): CompileOptions {
+function withInstanceOverrideFields(
+  opts: CompileOptions,
+  n: RawNode,
+): CompileOptions {
   if (!n.overrides?.length) return opts;
   const overrideFields = new Map<string, Set<string>>();
   for (const [nodeId, fields] of opts.overrideFields ?? []) {
@@ -734,7 +787,9 @@ function withInstanceOverrideFields(opts: CompileOptions, n: RawNode): CompileOp
   return { ...opts, overrideFields };
 }
 
-function renderBoundsOffsetFromRaw(n: RawNode): { x: LengthValue; y: LengthValue } | undefined {
+function renderBoundsOffsetFromRaw(
+  n: RawNode,
+): { x: LengthValue; y: LengthValue } | undefined {
   const bb = n.absoluteBoundingBox;
   const rb = n.absoluteRenderBounds;
   if (!bb || !rb) return undefined;
@@ -754,7 +809,8 @@ function compileText(
   // Figma binds text-level fills via boundVariables.fills (may be array)
   // OR per-paint boundVariables.color on the SOLID paint itself.
   const colorVarId = varId(fill?.boundVariables, "color") ?? varId(bv, "fills");
-  const color = pickColor(fill, colorVarId, opts) ?? literalValue({ r: 0, g: 0, b: 0 });
+  const color =
+    pickColor(fill, colorVarId, opts) ?? literalValue({ r: 0, g: 0, b: 0 });
   const fontSize = pickSize(n.fontSize, varId(bv, "fontSize"), opts) ?? px(16);
   const lhRaw =
     n.lineHeight && n.lineHeight.unit === "PIXELS"
@@ -788,19 +844,24 @@ function compileText(
       ? TextAutoResize.Hug
       : n.textAutoResize === "HEIGHT"
         ? TextAutoResize.FixedWidth
-      : n.textAutoResize === "TRUNCATE"
-        ? TextAutoResize.Truncate
-        : TextAutoResize.FixedBoth;
-  const baseStyle: TextStyleValue | undefined = n.componentPropertyReferences?.textStyleId && !opts.detachRootInstance
-    ? propValue(publicComponentPropName(n.componentPropertyReferences.textStyleId))
-    : textStyleName(n.textStyleId, opts);
-  const textStyle: TextStyleValue = baseStyle ?? literalValue({
-    fontFamily: n.fontName?.family,
-    fontWeight: n.fontWeight,
-    fontSize,
-    lineHeight,
-    paragraphSpacing,
-  });
+        : n.textAutoResize === "TRUNCATE"
+          ? TextAutoResize.Truncate
+          : TextAutoResize.FixedBoth;
+  const baseStyle: TextStyleValue | undefined =
+    n.componentPropertyReferences?.textStyleId && !opts.detachRootInstance
+      ? propValue(
+          publicComponentPropName(n.componentPropertyReferences.textStyleId),
+        )
+      : textStyleName(n.textStyleId, opts);
+  const textStyle: TextStyleValue =
+    baseStyle ??
+    literalValue({
+      fontFamily: n.fontName?.family,
+      fontWeight: n.fontWeight,
+      fontSize,
+      lineHeight,
+      paragraphSpacing,
+    });
   const runs: DTextRun[] | undefined = n.styledTextSegments?.map(
     (seg: RawTextRun) => {
       const segFill = firstSolidFill(seg.fills);
@@ -828,9 +889,14 @@ function compileText(
   const out: DText = {
     ...buildBase(n, opts, parent),
     kind: NodeKind.Text,
-    content: !opts.detachInstances && !opts.detachRootInstance && n.componentPropertyReferences?.characters
-      ? propValue(publicComponentPropName(n.componentPropertyReferences.characters))
-      : literalValue(sanitizeTextContent(n.characters ?? "")),
+    content:
+      !opts.detachInstances &&
+      !opts.detachRootInstance &&
+      n.componentPropertyReferences?.characters
+        ? propValue(
+            publicComponentPropName(n.componentPropertyReferences.characters),
+          )
+        : literalValue(sanitizeTextContent(n.characters ?? "")),
     textStyle,
     color,
     textDecoration: decoration,
@@ -893,31 +959,32 @@ async function compileShape(
     width: fixedSize(n, "horizontal", opts) ?? px(0),
     height: fixedSize(n, "vertical", opts) ?? px(0),
     fill: pickPaint(fill, gradientFill, fillVarId, opts),
-    stroke: stroke || gradientStroke
-      ? {
-          paint: pickPaint(stroke, gradientStroke, strokeVarId, opts) ?? {
-            kind: "literal",
-            value: { r: 0, g: 0, b: 0 },
-          },
-          width:
-            strokeWidth ??
-            px(typeof n.strokeWeight === "number" ? n.strokeWeight : 1),
-          align:
-            n.strokeAlign === "INSIDE"
-              ? StrokeAlign.Inside
-              : n.strokeAlign === "OUTSIDE"
-                ? StrokeAlign.Outside
-                : n.strokeAlign === "CENTER"
-                  ? StrokeAlign.Center
+    stroke:
+      stroke || gradientStroke
+        ? {
+            paint: pickPaint(stroke, gradientStroke, strokeVarId, opts) ?? {
+              kind: "literal",
+              value: { r: 0, g: 0, b: 0 },
+            },
+            width:
+              strokeWidth ??
+              px(typeof n.strokeWeight === "number" ? n.strokeWeight : 1),
+            align:
+              n.strokeAlign === "INSIDE"
+                ? StrokeAlign.Inside
+                : n.strokeAlign === "OUTSIDE"
+                  ? StrokeAlign.Outside
+                  : n.strokeAlign === "CENTER"
+                    ? StrokeAlign.Center
+                    : undefined,
+            cap:
+              n.strokeCap === "ROUND"
+                ? StrokeCap.Round
+                : n.strokeCap === "SQUARE"
+                  ? StrokeCap.Square
                   : undefined,
-          cap:
-            n.strokeCap === "ROUND"
-              ? StrokeCap.Round
-              : n.strokeCap === "SQUARE"
-                ? StrokeCap.Square
-                : undefined,
-        }
-      : undefined,
+          }
+        : undefined,
     cornerRadius: cornerFromRaw(n, opts),
   };
   return out;
@@ -981,7 +1048,11 @@ function paddingFromRaw(n: RawNode, opts: CompileOptions): Padding | undefined {
   };
 }
 
-function overriddenField(n: RawNode, opts: CompileOptions, field: string): boolean {
+function overriddenField(
+  n: RawNode,
+  opts: CompileOptions,
+  field: string,
+): boolean {
   return opts.overrideFields?.get(stripPrefix(n.id))?.has(field) ?? false;
 }
 
@@ -1063,7 +1134,13 @@ async function compileContainer(
   const childRaws = (n.children ?? []).filter(
     (c) => c.visible !== false && (c.isMask || !isInvisibleShape(c)),
   );
-  const children = await compileChildren(childRaws, opts, n, rawSubtree, direction === "none");
+  const children = await compileChildren(
+    childRaws,
+    opts,
+    n,
+    rawSubtree,
+    direction === "none",
+  );
   const bgVarId =
     varId(fill?.boundVariables, "color") ?? varId(n.boundVariables, "fills");
   const strokeVarId = varId(stroke?.boundVariables, "color");
@@ -1091,37 +1168,42 @@ async function compileContainer(
     ),
     padding: paddingFromRaw(n, opts),
     background,
-    border: stroke || gradientStroke
-      ? {
-          paint: pickPaint(stroke, gradientStroke, strokeVarId, opts) ?? {
-            kind: "literal",
-            value: { r: 0, g: 0, b: 0 },
-          },
-          width:
-            (n.strokeWeight as unknown) === "mixed"
-              ? {
-                  top: pickSize(n.strokeTopWeight, undefined, opts) ?? px(0),
-                  right:
-                    pickSize(n.strokeRightWeight, undefined, opts) ?? px(0),
-                  bottom:
-                    pickSize(n.strokeBottomWeight, undefined, opts) ?? px(0),
-                  left: pickSize(n.strokeLeftWeight, undefined, opts) ?? px(0),
-                }
-              : (strokeWidth ??
-                px(typeof n.strokeWeight === "number" ? n.strokeWeight : 1)),
-          align:
-            n.strokeAlign === "INSIDE"
-              ? StrokeAlign.Inside
-              : n.strokeAlign === "OUTSIDE"
-                ? StrokeAlign.Outside
-                : n.strokeAlign === "CENTER"
-                  ? StrokeAlign.Center
-                  : undefined,
-        }
-      : undefined,
+    border:
+      stroke || gradientStroke
+        ? {
+            paint: pickPaint(stroke, gradientStroke, strokeVarId, opts) ?? {
+              kind: "literal",
+              value: { r: 0, g: 0, b: 0 },
+            },
+            width:
+              (n.strokeWeight as unknown) === "mixed"
+                ? {
+                    top: pickSize(n.strokeTopWeight, undefined, opts) ?? px(0),
+                    right:
+                      pickSize(n.strokeRightWeight, undefined, opts) ?? px(0),
+                    bottom:
+                      pickSize(n.strokeBottomWeight, undefined, opts) ?? px(0),
+                    left:
+                      pickSize(n.strokeLeftWeight, undefined, opts) ?? px(0),
+                  }
+                : (strokeWidth ??
+                  px(typeof n.strokeWeight === "number" ? n.strokeWeight : 1)),
+            align:
+              n.strokeAlign === "INSIDE"
+                ? StrokeAlign.Inside
+                : n.strokeAlign === "OUTSIDE"
+                  ? StrokeAlign.Outside
+                  : n.strokeAlign === "CENTER"
+                    ? StrokeAlign.Center
+                    : undefined,
+          }
+        : undefined,
     shadow: shadowFromRaw(n),
     cornerRadius: cornerFromRaw(n, opts),
-    cornerSmoothing: typeof n.cornerSmoothing === "number" ? normalizeNumber(n.cornerSmoothing) : undefined,
+    cornerSmoothing:
+      typeof n.cornerSmoothing === "number"
+        ? normalizeNumber(n.cornerSmoothing)
+        : undefined,
     clip: n.clipsContent ? true : undefined,
     children,
   };
@@ -1130,10 +1212,19 @@ async function compileContainer(
       ...common,
       kind: NodeKind.Flex,
       direction: FlowDirection.Row,
-      gap: nonZeroSize(pickSize(n.itemSpacing, varId(n.boundVariables, "itemSpacing"), opts)),
-      counterGap: n.layoutWrap === "WRAP"
-        ? nonZeroSize(pickSize(n.counterAxisSpacing, varId(n.boundVariables, "counterAxisSpacing"), opts))
-        : undefined,
+      gap: nonZeroSize(
+        pickSize(n.itemSpacing, varId(n.boundVariables, "itemSpacing"), opts),
+      ),
+      counterGap:
+        n.layoutWrap === "WRAP"
+          ? nonZeroSize(
+              pickSize(
+                n.counterAxisSpacing,
+                varId(n.boundVariables, "counterAxisSpacing"),
+                opts,
+              ),
+            )
+          : undefined,
       align: alignFromRaw(n.counterAxisAlignItems),
       justify: justifyFromRaw(n.primaryAxisAlignItems),
       wrap: n.layoutWrap === "WRAP" ? true : undefined,
@@ -1144,10 +1235,19 @@ async function compileContainer(
       ...common,
       kind: NodeKind.Stack,
       direction: FlowDirection.Column,
-      gap: nonZeroSize(pickSize(n.itemSpacing, varId(n.boundVariables, "itemSpacing"), opts)),
-      counterGap: n.layoutWrap === "WRAP"
-        ? nonZeroSize(pickSize(n.counterAxisSpacing, varId(n.boundVariables, "counterAxisSpacing"), opts))
-        : undefined,
+      gap: nonZeroSize(
+        pickSize(n.itemSpacing, varId(n.boundVariables, "itemSpacing"), opts),
+      ),
+      counterGap:
+        n.layoutWrap === "WRAP"
+          ? nonZeroSize(
+              pickSize(
+                n.counterAxisSpacing,
+                varId(n.boundVariables, "counterAxisSpacing"),
+                opts,
+              ),
+            )
+          : undefined,
       align: alignFromRaw(n.counterAxisAlignItems),
       justify: justifyFromRaw(n.primaryAxisAlignItems),
       wrap: n.layoutWrap === "WRAP" ? true : undefined,
@@ -1180,7 +1280,8 @@ async function compileChildren(
         ? opts
         : { ...opts, paintOpacityMultiplier: maskOpacityMultiplier };
     const child = await compileNode(childRaw, childOpts, parent, rawSubtree);
-    if (applyAbsolutePosition) applyAbsoluteChildPosition(child, childRaw, parent);
+    if (applyAbsolutePosition)
+      applyAbsoluteChildPosition(child, childRaw, parent);
     children.push(child);
   }
   return children;
@@ -1203,16 +1304,10 @@ function applyAbsoluteChildPosition(
       ? n.absoluteBoundingBox.y - parent.absoluteBoundingBox.y
       : (n.y ?? 0);
   out.absolute = { inset: { left: px(left), top: px(top) } };
-  if (
-    typeof parent.width === "number" &&
-    typeof n.width === "number"
-  ) {
+  if (typeof parent.width === "number" && typeof n.width === "number") {
     out.absolute.inset!.right = px(parent.width - left - n.width);
   }
-  if (
-    typeof parent.height === "number" &&
-    typeof n.height === "number"
-  ) {
+  if (typeof parent.height === "number" && typeof n.height === "number") {
     out.absolute.inset!.bottom = px(parent.height - top - n.height);
   }
   if (n.constraints) {
@@ -1238,7 +1333,12 @@ async function compileInstance(
       // Detached subtree has no surrounding component to provide prop values,
       // so inline any componentPropertyReferences (Label/visible/textStyleId)
       // to their concrete raw values instead of dangling `props.X` refs.
-      return compileContainer(n, { ...childOpts, detachRootInstance: true }, parent, false);
+      return compileContainer(
+        n,
+        { ...childOpts, detachRootInstance: true },
+        parent,
+        false,
+      );
     }
     throw new Error(
       `pixpec compile: encountered INSTANCE ${n.id} (${n.name}) of unregistered component ` +
@@ -1252,7 +1352,9 @@ async function compileInstance(
     n.mainComponent?.name,
   );
   const compiledChildren = await compileChildren(
-    (n.children ?? []).filter((c) => c.visible !== false && (c.isMask || !isInvisibleShape(c))),
+    (n.children ?? []).filter(
+      (c) => c.visible !== false && (c.isMask || !isInvisibleShape(c)),
+    ),
     childOpts,
     n,
     false,
@@ -1267,7 +1369,12 @@ async function compileInstance(
       fields,
     ) ?? {};
   if (hasUnconsumedDNodeDiff(variant?.ast, compiledChildren, fields.consumed))
-    return compileContainer(n, { ...opts, detachRootInstance: true }, parent, false);
+    return compileContainer(
+      n,
+      { ...opts, detachRootInstance: true },
+      parent,
+      false,
+    );
   const out: DInstance = {
     ...buildBase(n, opts, parent),
     kind: NodeKind.Instance,
@@ -1372,14 +1479,20 @@ async function compileNode(
   if (n.type === "TEXT") return compileText(n, opts, parent);
   if (SHAPELIKE.has(n.type)) return compileShape(n, opts, parent);
   if (VECTORLIKE.has(n.type)) return compileVector(n, opts, parent);
-  if (n.type === "INSTANCE") return compileInstance(n, opts, parent, rawSubtree);
+  if (n.type === "INSTANCE")
+    return compileInstance(n, opts, parent, rawSubtree);
   if (n.type === "GROUP") return compileContainer(n, opts, parent, rawSubtree);
-  if (FRAMELIKE.has(n.type)) return compileContainer(n, opts, parent, rawSubtree);
+  if (FRAMELIKE.has(n.type))
+    return compileContainer(n, opts, parent, rawSubtree);
   return compileUnknown(n, opts, parent);
 }
 
-async function exportSvgForRawNode(n: RawNode, opts: CompileOptions): Promise<string> {
-  if (!opts.exportSvg) throw new Error("pixpec compile: exportSvg callback is not configured");
+async function exportSvgForRawNode(
+  n: RawNode,
+  opts: CompileOptions,
+): Promise<string> {
+  if (!opts.exportSvg)
+    throw new Error("pixpec compile: exportSvg callback is not configured");
   const bareId = stripPrefix(n.id);
   try {
     return await opts.exportSvg(bareId);
@@ -1409,7 +1522,12 @@ export async function compile(
   opts: CompileOptions,
 ): Promise<DNode> {
   if (opts.detachRootInstance && raw.type === "INSTANCE") {
-    return compileContainer(raw, withInstanceOverrideFields(opts, raw), undefined, false);
+    return compileContainer(
+      raw,
+      withInstanceOverrideFields(opts, raw),
+      undefined,
+      false,
+    );
   }
   return compileNode(raw, opts, undefined);
 }

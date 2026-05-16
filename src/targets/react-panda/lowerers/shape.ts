@@ -2,7 +2,7 @@ import type * as ast from '@typescript/native-preview/ast'
 import type { DShape } from '../../../compiler/design-ast.ts'
 import { Anchor, ShapeKind, Sizing, StrokeAlign, StrokeCap } from '../../../compiler/design-ast.ts'
 import { jsxAttr, jsxEl, jsxExprAttr, jsxSelf, styledTag } from '../ast.ts'
-import { isCornerRadii, paintToProp, px2rem, sizeToPx } from '../data-lowerer.ts'
+import { cssColorLiteral, isCornerRadii, paintToProp, px2rem, sizeToPx } from '../data-lowerer.ts'
 import type { LowererCtx as Ctx, LowerResult, ParentCtx } from '../lowerer-types.ts'
 import { emptyUses } from '../lowerer-types.ts'
 import { axisSizing } from '../sizing.ts'
@@ -11,13 +11,15 @@ export function emitShape(n: DShape, ctx: Ctx, _parent: ParentCtx): LowerResult 
     const uses = emptyUses()
     const w = sizeToPx(n.width) ?? 0
     const h = sizeToPx(n.height) ?? 0
-    const fillVal = paintToProp(n.fill) ?? 'none'
+    const rawFill = paintToProp(n.fill)
+    const fillVal = rawFill ? cssColorLiteral(rawFill) : 'none'
     uses.usedJsxPatterns.add('styled')
     const innerAttrs: Record<string, unknown> = { fill: fillVal }
     const strokeWidth = n.stroke ? (sizeToPx(n.stroke.width) ?? 1) : 0
     const strokeInset = n.stroke?.align === StrokeAlign.Inside ? strokeWidth / 2 : 0
     if (n.stroke) {
-        innerAttrs.stroke = paintToProp(n.stroke.paint) ?? '#000'
+        const rawStroke = paintToProp(n.stroke.paint)
+        innerAttrs.stroke = rawStroke ? cssColorLiteral(rawStroke) : '#000'
         innerAttrs['strokeWidth'] = strokeWidth
     }
 

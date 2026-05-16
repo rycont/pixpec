@@ -88,8 +88,10 @@ export function emitContainer(n: DFlex | DStack | DBox, ctx: Ctx, parent: Parent
         }
     }
 
-    // padding
-    if (n.padding) {
+    // padding — figma renders no visible padding for empty autolayout frames
+    // (padding only affects child layout). Skip emission when no children.
+    const hasChildren = 'children' in n && Array.isArray(n.children) && n.children.length > 0
+    if (n.padding && hasChildren) {
         const pad = (side: keyof typeof n.padding, key: string) => {
             const v = sizeToPropMinusPx(n.padding![side], cssBorderLayoutInsetPx, ctx.env.remBase)
             if (v !== undefined && v !== 0) {

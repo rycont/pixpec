@@ -117,6 +117,13 @@ export class DesignAstTypeTransformer {
     if (/\bValue\s*<\s*string\s*>/.test(expanded) || /\bstring\b/.test(expanded)) {
       return "string";
     }
+    if (
+      hasTypeName(expanded, "TextAlign") ||
+      hasTypeName(expanded, "TextDecoration") ||
+      hasTypeName(expanded, "TextAutoResize")
+    ) {
+      return "string";
+    }
     if (/\bValue\s*<\s*boolean\s*>/.test(expanded) || /\bboolean\b/.test(expanded)) {
       return "boolean";
     }

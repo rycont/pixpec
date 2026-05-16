@@ -747,13 +747,19 @@ async function detectPromotions(
     ([, items]) => items.length > 1,
   );
   if (conflicts.length > 0) {
-    throw new Error(
-      `pixpec init: ambiguous promoted prop(s): ${conflicts
+    console.warn(
+      `[init] ambiguous promoted prop(s) — keeping first occurrence: ${conflicts
         .map(([prop]) => JSON.stringify(prop))
         .join(", ")}`,
     );
   }
-  return promoted.map((source) => {
+  const seen = new Set<string>();
+  const deduped = promoted.filter((p) => {
+    if (seen.has(p.prop)) return false;
+    seen.add(p.prop);
+    return true;
+  });
+  return deduped.map((source) => {
     const masterNode = indexDNodes(master).get(source.nodeId);
     if (!masterNode) return source;
     if (source.field.startsWith("component.")) return source;
@@ -1274,7 +1280,7 @@ function emitImpl(
       .join("|"),
   }));
   const imports = generated
-    .map((v) => `import { Generated as V_${v.id} } from '${v.importPath}'`)
+    .map((v) => `import { ${componentName} as V_${v.id} } from '${v.importPath}'`)
     .join("\n");
   const cases = generated
     .map((v) => `  ${JSON.stringify(v.key)}: V_${v.id},`)
@@ -1331,7 +1337,7 @@ function emitReactPandaImpl(
     })
     .join("\n");
   const imports = generated
-    .map((v) => `import { Generated as V_${v.id} } from '${v.importPath}'`)
+    .map((v) => `import { ${componentName} as V_${v.id} } from '${v.importPath}'`)
     .join("\n");
   const cases = generated
     .map((v) => `  ${JSON.stringify(v.key)}: V_${v.id},`)
