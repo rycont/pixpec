@@ -28,11 +28,12 @@ export interface Uses {
     usedTypography: Set<string>
     usedComponents: Set<string>
     usesCss: boolean
-    svgSidecars: Map<
-        string,
-        { alias: string; content: string; importPath: string; shared?: boolean }
-    >
-    imageSidecars: Map<string, { content: Uint8Array }>
+    /** ESM default imports: alias → import specifier path.
+     *  Used for SVG (`?react`), raster image (bg URLs), etc. */
+    defaultImports: Map<string, string>
+    /** Sidecar files to write next to the generated source.
+     *  Key is the path relative to the generated file. */
+    sidecarFiles: Map<string, string | Uint8Array>
     squircleHooks: Array<{ key: string; radiusPx: number; smoothing: number }>
     usesTinting: boolean
     tintFilterId: string
@@ -91,8 +92,8 @@ export function emptyUses(): Uses {
         usedTypography: new Set(),
         usedComponents: new Set(),
         usesCss: false,
-        svgSidecars: new Map(),
-        imageSidecars: new Map(),
+        defaultImports: new Map(),
+        sidecarFiles: new Map(),
         squircleHooks: [],
         usesTinting: false,
         tintFilterId: '',
@@ -113,11 +114,11 @@ export function mergeUses(into: Uses, ...froms: Uses[]): void {
         if (from.usesCss) {
             into.usesCss = true
         }
-        for (const [k, v] of from.svgSidecars) {
-            into.svgSidecars.set(k, v)
+        for (const [k, v] of from.defaultImports) {
+            into.defaultImports.set(k, v)
         }
-        for (const [k, v] of from.imageSidecars) {
-            into.imageSidecars.set(k, v)
+        for (const [k, v] of from.sidecarFiles) {
+            into.sidecarFiles.set(k, v)
         }
         into.squircleHooks.push(...from.squircleHooks)
         if (from.usesTinting) {

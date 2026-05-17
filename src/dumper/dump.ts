@@ -92,7 +92,18 @@ export async function exportNodeSvg(opts: DumpOptions): Promise<string> {
     const node = await figma.getNodeByIdAsync(${JSON.stringify(opts.nodeId)});
     if (!node) return { error: 'node_not_found: ' + ${JSON.stringify(opts.nodeId)} };
     try {
-      const bytes = await node.exportAsync({ format: 'SVG_STRING' });
+      let bytes = await node.exportAsync({ format: 'SVG_STRING' });
+      // figma rounds viewBox/width/height to integers in SVG export even when
+      // the source vector has fractional dimensions, so the path ends up
+      // occupying <100% of the SVG box. Patch viewBox/width/height back to
+      // the raw figma node size (which matches the path's true bbox).
+      const w = node.width, h = node.height;
+      if (typeof w === 'number' && typeof h === 'number' && w > 0 && h > 0) {
+        bytes = bytes
+          .replace(/viewBox="[^"]+"/, 'viewBox="0 0 ' + w + ' ' + h + '"')
+          .replace(/(\\s)width="[^"]+"/, '$1width="' + w + '"')
+          .replace(/(\\s)height="[^"]+"/, '$1height="' + h + '"');
+      }
       return { svg: bytes };
     } catch (e) {
       return { error: 'svg_export_failed: ' + (e && e.message || String(e)) };
@@ -404,7 +415,17 @@ async function dumpNode(node) {
 
   if (VECTORLIKE.has(node.type)) {
     try {
-      const bytes = await node.exportAsync({ format: 'SVG_STRING' });
+      let bytes = await node.exportAsync({ format: 'SVG_STRING' });
+      // Same fractional-viewBox correction as exportNodeSvg (line ~95):
+      // figma rounds the exported viewBox to integers, so patch back to the
+      // node's true width/height so the path occupies 100% of the SVG box.
+      const w = node.width, h = node.height;
+      if (typeof w === 'number' && typeof h === 'number' && w > 0 && h > 0) {
+        bytes = bytes
+          .replace(/viewBox="[^"]+"/, 'viewBox="0 0 ' + w + ' ' + h + '"')
+          .replace(/(\s)width="[^"]+"/, '$1width="' + w + '"')
+          .replace(/(\s)height="[^"]+"/, '$1height="' + h + '"');
+      }
       out.svg = bytes;
     } catch (_) {
       out.svgExportFailed = true;

@@ -7,9 +7,10 @@ import * as ast from '@typescript/native-preview/ast'
 import * as f from '@typescript/native-preview/ast/factory'
 import { API } from '@typescript/native-preview/sync'
 import type { DDataScope, DNode, DShape } from '../../compiler/design-ast.ts'
-import { Anchor, NodeKind, ShapeKind } from '../../compiler/design-ast.ts'
+import { NodeKind, ShapeKind } from '../../compiler/design-ast.ts'
 import type { CodegenContext, CodegenResult } from '../types.ts'
 import {
+    callExpression,
     exportModifier,
     jsxEl,
     keywordExpression,
@@ -29,8 +30,8 @@ import { emitShape } from './lowerers/shape.ts'
 import { emitText } from './lowerers/text.ts'
 import { emitUnknown } from './lowerers/unknown.ts'
 import { emitVector } from './lowerers/vector.ts'
-import { expressionPropName, nodeSourceId } from './sizing.ts'
-import { injectSpreadAttr, splitCssPropsDecl, squircleHookMarker } from './styles.ts'
+import { expressionPropName, nodeSourceId, sizeToProp } from './sizing.ts'
+import { squircleHookMarker } from './styles.ts'
 
 // View-level codegen (breakdown) hands us a raw root without a DataScope
 // wrapper; wrap it on the fly using ctx.componentName as the identifier.
@@ -50,14 +51,56 @@ function propsTypeName(scope: DDataScope): string {
     return `${scope.componentName}Props`
 }
 
-function generatedPropsSource(scope: DDataScope, rootPropsTypeName: string): string {
+function generatedPropsSource(scope: DDataScope, _rootPropsTypeName: string): string {
+    // All promoted/exposed fields are emitted as REQUIRED here. The component
+    // accepts `Partial<XProps>` externally and merges with module-level
+    // DEFAULTS, so inside the function body every prop is guaranteed defined.
     const fields = Object.entries(scope.data)
         .map(([key, def]) => {
             const type = reactPandaPropType(def.type)
-            return `    ${key}?: ${type}`
+            return `    ${key}: ${type}`
         })
         .join('\n')
-    return `export interface ${propsTypeName(scope)} extends ${rootPropsTypeName} {\n${fields}\n}\n`
+    return `export interface ${propsTypeName(scope)} {\n${fields}\n}\n`
+}
+
+function generatedDefaultsSource(scope: DDataScope): string {
+    const lines = Object.entries(scope.data)
+        .map(([key, def]) => `    ${key}: ${defaultLiteral(def)},`)
+        .join('\n')
+    return `const DEFAULTS: ${propsTypeName(scope)} = {\n${lines}\n}\n`
+}
+
+function defaultLiteral(def: { type?: string; default?: unknown }): string {
+    const d = def.default
+    if (d === undefined || d === null) return 'undefined as never'
+    if (typeof d === 'string') return JSON.stringify(d)
+    if (typeof d === 'number' || typeof d === 'boolean') return String(d)
+    if (typeof d === 'object') {
+        const rec = d as Record<string, unknown>
+        if (rec.kind === 'literal') {
+            const v = rec.value
+            if (typeof v === 'string') return JSON.stringify(v)
+            if (typeof v === 'number' || typeof v === 'boolean') return String(v)
+            if (v && typeof v === 'object') {
+                const vr = v as Record<string, unknown>
+                if ('unit' in vr && 'value' in vr) {
+                    const num = Number(vr.value)
+                    if (vr.unit === 'px') return JSON.stringify(`${+(num / 16).toFixed(6)}rem`)
+                    return JSON.stringify(`${num}${vr.unit}`)
+                }
+                if ('r' in vr && 'g' in vr && 'b' in vr) {
+                    const a = 'a' in vr ? Number(vr.a) : 1
+                    return JSON.stringify(
+                        a < 1
+                            ? `rgba(${vr.r}, ${vr.g}, ${vr.b}, ${a})`
+                            : `rgb(${vr.r}, ${vr.g}, ${vr.b})`,
+                    )
+                }
+            }
+        }
+    }
+    return JSON.stringify(d)
 }
 
 function reactPandaPropType(type: string | undefined): string {
@@ -85,51 +128,85 @@ function reactPandaPropType(type: string | undefined): string {
     return 'unknown'
 }
 
+function isPlainPxLiteral(v: unknown): boolean {
+    if (!v || typeof v !== 'object') return false
+    const rec = v as Record<string, unknown>
+    if (rec.kind !== 'literal' || !rec.value || typeof rec.value !== 'object') return false
+    return (rec.value as { unit?: string }).unit === 'px'
+}
+
 function wrapAbsolute(n: DNode, jsx: ast.JsxChild, ctx: Ctx): LowerResult {
     const uses = emptyUses()
     if (!n.absolute) {
         return { jsx, uses }
     }
-    const inset = n.absolute.inset ?? {}
-    let absX = sizeToPx(inset.left) ?? 0
-    let absY = sizeToPx(inset.top) ?? 0
-    // figma reports a LINE node's bbox y/x as the FAR edge of the stroke on the
-    // collapsed axis (not the line center). Our `<svg>` viewport gets inflated
-    // by strokeWeight on that axis with the stroke drawn from the svg's top
-    // edge — without offsetting the absolute wrapper, the rendered line sits
-    // strokeWeight px below figma's mark. Pull back by the full stroke width.
+    const wrapStyle: Record<string, unknown> = { position: 'absolute' }
+    // Figma reports a LINE node's bbox y/x as the FAR edge of the stroke on the
+    // collapsed axis. Apply a small px tweak before emitting the inset.
+    let xOffset = 0
+    let yOffset = 0
     if (n.kind === NodeKind.Shape && (n as DShape).shape === ShapeKind.Line) {
         const sh = n as DShape
         const sw = sizeToPx(sh.stroke?.width) ?? 1
         const w = sizeToPx(sh.width) ?? 0
         const h = sizeToPx(sh.height) ?? 0
-        if (h === 0) {
-            absY -= sw
-        }
-        if (w === 0) {
-            absX -= sw
-        }
+        if (h === 0) yOffset -= sw
+        if (w === 0) xOffset -= sw
     }
     if (n.renderBoundsOffset) {
-        const offset = n.renderBoundsOffset
-        absX += sizeToPx(offset.x) ?? 0
-        absY += sizeToPx(offset.y) ?? 0
+        xOffset += sizeToPx(n.renderBoundsOffset.x) ?? 0
+        yOffset += sizeToPx(n.renderBoundsOffset.y) ?? 0
     }
-    const wrapStyle: Record<string, unknown> = {
-        position: 'absolute',
-        left: px2rem(absX, ctx.env.remBase),
-        top: px2rem(absY, ctx.env.remBase),
-    }
-    if (n.absolute.anchor?.horizontal === Anchor.Stretch && sizeToPx(inset.right) !== undefined) {
-        wrapStyle.right = px2rem(sizeToPx(inset.right) ?? 0, ctx.env.remBase)
-    }
-    if (n.absolute.anchor?.vertical === Anchor.Stretch && sizeToPx(inset.bottom) !== undefined) {
-        wrapStyle.bottom = px2rem(sizeToPx(inset.bottom) ?? 0, ctx.env.remBase)
-    }
+    applyAxisPosition(wrapStyle, n.absolute.horizontal, 'left', 'right', xOffset, ctx)
+    applyAxisPosition(wrapStyle, n.absolute.vertical, 'top', 'bottom', yOffset, ctx)
     uses.usedJsxPatterns.add('styled')
     return {
         jsx: jsxEl(styledTag('span'), [styleAttr(wrapStyle)], [jsx]),
         uses,
+    }
+}
+
+function applyAxisPosition(
+    style: Record<string, unknown>,
+    axis: import('../../compiler/design-ast.ts').AxisPosition | undefined,
+    startKey: 'left' | 'top',
+    endKey: 'right' | 'bottom',
+    pxOffset: number,
+    ctx: Ctx,
+): void {
+    if (!axis) return
+    if (axis.kind === 'center') {
+        // `left:50%; transform:translate(-50% + delta)` — center anchor moves
+        // the child to the parent's midpoint, then offsets by delta.
+        style[startKey] = '50%'
+        const deltaProp = sizeToProp(axis.delta, ctx.env.remBase)
+        const translatePct = startKey === 'left' ? 'translateX(-50%)' : 'translateY(-50%)'
+        const translateAxis = startKey === 'left' ? 'translateX' : 'translateY'
+        if (
+            isPlainPxLiteral(axis.delta) &&
+            typeof (axis.delta as { value: { value: number } }).value.value === 'number' &&
+            (axis.delta as { value: { value: number } }).value.value === 0
+        ) {
+            style.transform = translatePct
+        } else if (typeof deltaProp === 'string' || typeof deltaProp === 'number') {
+            style.transform = `${translatePct} ${translateAxis}(${deltaProp})`
+        }
+        return
+    }
+    const startProp = sizeToProp(axis.start, ctx.env.remBase)
+    const endProp = sizeToProp(axis.end, ctx.env.remBase)
+    if (startProp !== undefined) {
+        const isPx = isPlainPxLiteral(axis.start)
+        if (isPx && pxOffset !== 0) {
+            style[startKey] = px2rem((sizeToPx(axis.start) ?? 0) + pxOffset, ctx.env.remBase)
+        } else {
+            style[startKey] = startProp
+        }
+    } else if (pxOffset !== 0) {
+        style[startKey] = px2rem(pxOffset, ctx.env.remBase)
+    }
+    if (endProp !== undefined) {
+        style[endKey] = endProp
     }
 }
 
@@ -275,8 +352,7 @@ function ensureSourceMeta(root: DNode): DNode {
 
 interface BuildResult {
     source: string
-    svgSidecars: Map<string, { alias: string; content: string; importPath: string }>
-    imageSidecars: Map<string, { content: Uint8Array }>
+    sidecarFiles: Map<string, string | Uint8Array>
 }
 
 async function buildSource(
@@ -290,7 +366,6 @@ async function buildSource(
     const { jsx: bodyJsx, uses } = await emitNode(scope.child, ctx, ROOT_PARENT)
     const body = bodyJsx as ast.Expression
     uses.tintFilterId = `tint_${sourceId.replace(/[^A-Za-z0-9]/g, '_')}`
-    uses.usedJsxPatterns.add('splitCssProps')
 
     // Imports
     const componentImports = [...uses.usedComponents].sort().map((name) => {
@@ -323,45 +398,67 @@ async function buildSource(
           ]
         : []
     const cssImport = uses.usesCss ? [namedImport(['css'], styledSystemPath(ctx, 'css'))] : []
-    const svgImports = [...uses.svgSidecars.entries()]
+    const assetImports = [...uses.defaultImports.entries()]
         .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
-        .map(([, { alias, importPath }]) => defaultImport(alias, importPath))
+        .map(([alias, importPath]) => defaultImport(alias, importPath))
     const jsxPatternImport = uses.usedJsxPatterns.size
         ? [namedImport([...uses.usedJsxPatterns].sort(), styledSystemPath(ctx, 'jsx'))]
         : []
-    const squircleImport = uses.squircleHooks.length
-        ? [namedImport(['useSquircleClip'], 'pixpec/targets/react-panda/runtime')]
+    const hasProps = Object.keys(scope.data).length > 0
+    const runtimeImports = [
+        ...(hasProps ? ['mergeProps'] : []),
+        ...(uses.squircleHooks.length ? ['useSquircleClip'] : []),
+    ]
+    const squircleImport = runtimeImports.length
+        ? [namedImport(runtimeImports, 'pixpec/targets/react-panda/runtime')]
         : []
     const fcImport = namedImport(['FC'], 'react', { typeOnly: true })
     // FC signature
-    const rootPropsTypeName = rootPropsType(scope.child)
     const propsTypeIdent = propsTypeName(scope)
-    const rootPropsTypeImport = namedImport([rootPropsTypeName], styledSystemPath(ctx, 'jsx'), {
-        typeOnly: true,
-    })
-    const fcType = f.createTypeReferenceNode(f.createIdentifier('FC'), [
-        f.createTypeReferenceNode(f.createIdentifier(propsTypeIdent), undefined),
-    ])
-    const fnParams = [
-        f.createParameterDeclaration(
-            undefined,
-            undefined,
-            f.createIdentifier('props'),
-            undefined,
-            undefined,
-            undefined,
-        ),
-    ]
+    const fcType = hasProps
+        ? f.createTypeReferenceNode(f.createIdentifier('FC'), [
+              f.createTypeReferenceNode(f.createIdentifier('Partial'), [
+                  f.createTypeReferenceNode(f.createIdentifier(propsTypeIdent), undefined),
+              ]),
+          ])
+        : f.createTypeReferenceNode(f.createIdentifier('FC'), [])
+    const fnParams = hasProps
+        ? [
+              f.createParameterDeclaration(
+                  undefined,
+                  undefined,
+                  f.createIdentifier('rawProps'),
+                  undefined,
+                  undefined,
+                  undefined,
+              ),
+          ]
+        : []
 
-    // Spread caller's cssProps LAST so they override baked-in attrs. The
-    // root-pattern `direction` is incompatible with Panda's CSS `direction`,
-    // so splitCssPropsDecl strips it before spreading.
-    const body2 = injectSpreadAttr(body, f.createJsxSpreadAttribute(f.createIdentifier('cssProps')))
-    const cssPropsDecl = splitCssPropsDecl()
-    const returnExpr: ast.Expression = f.createParenthesizedExpression(body2)
+    // Merge caller's partial props with module-level DEFAULTS so the body sees
+    // every field as defined.
+    const mergePropsStmt = f.createVariableStatement(
+        undefined,
+        f.createVariableDeclarationList(
+            [
+                f.createVariableDeclaration(
+                    f.createIdentifier('props'),
+                    undefined,
+                    undefined,
+                    callExpression(f.createIdentifier('mergeProps'), [
+                        f.createIdentifier('DEFAULTS'),
+                        f.createIdentifier('rawProps'),
+                    ]),
+                ),
+            ],
+            nodeFlagsConst,
+        ),
+    )
+
+    const returnExpr: ast.Expression = f.createParenthesizedExpression(body)
     const generatedBody: ast.ConciseBody = f.createBlock(
         [
-            cssPropsDecl,
+            ...(hasProps ? [mergePropsStmt] : []),
             ...uses.squircleHooks.map((h) => squircleHookMarker(h.key, h.radiusPx, h.smoothing)),
             f.createReturnStatement(returnExpr),
         ],
@@ -390,26 +487,24 @@ async function buildSource(
     )
     const statements: ast.Statement[] = [
         fcImport,
-        rootPropsTypeImport,
         ...componentImports,
         ...typographyImports,
         ...cssImport,
         ...jsxPatternImport,
         ...squircleImport,
-        ...svgImports,
+        ...assetImports,
     ]
     const header = `/**\n * AUTO-GENERATED by pixpec react-panda target.\n * Source: ${sourceId}\n */\n`
     let printed =
         header +
         statements.map(printNode).join('\n') +
         '\n' +
-        generatedPropsSource(scope, rootPropsTypeName) +
+        (hasProps ? generatedPropsSource(scope, '') + generatedDefaultsSource(scope) : '') +
         printNode(generatedFn) +
         '\n'
     return {
         source: printed,
-        svgSidecars: uses.svgSidecars,
-        imageSidecars: uses.imageSidecars,
+        sidecarFiles: uses.sidecarFiles,
     }
 }
 
@@ -437,20 +532,10 @@ export async function codegenReactPanda(
 
     const printNode = ext.printNode ?? getSharedPrintNode(process.cwd())
     const result = await buildSource(normalizedRoot, cgCtx, printNode, sourceId, ctx.componentName)
-    const sidecars = [
-        // Skip `shared` SVG sidecars — those bytes already live in the shared
-        // assetsDir written by compile and don't need a target-side copy.
-        ...[...result.svgSidecars.entries()]
-            .filter(([, { shared }]) => !shared)
-            .map(([relativePath, { content }]) => ({
-                relativePath,
-                content,
-            })),
-        ...[...result.imageSidecars.entries()].map(([relativePath, { content }]) => ({
-            relativePath,
-            content,
-        })),
-    ]
+    const sidecars = [...result.sidecarFiles.entries()].map(([relativePath, content]) => ({
+        relativePath,
+        content,
+    }))
     return {
         source: result.source,
         fileExtension: ext.fileExtension ?? 'tsx',

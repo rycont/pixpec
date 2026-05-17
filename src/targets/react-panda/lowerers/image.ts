@@ -1,5 +1,6 @@
+import * as f from '@typescript/native-preview/ast/factory'
 import type { DImage } from '../../../compiler/design-ast.ts'
-import { assetImportExpression } from '../assets.ts'
+import { assetImportPathFromOutput, imageAliasFromFilename } from '../assets.ts'
 import { jsxAttr, jsxExprAttr, jsxSelf, styleAttr, styledTag } from '../ast.ts'
 import { px2rem, sizeToPx } from '../data-lowerer.ts'
 import type { LowererCtx as Ctx, LowerResult } from '../lowerer-types.ts'
@@ -21,11 +22,12 @@ export async function emitImage(n: DImage, ctx: Ctx): Promise<LowerResult> {
     if (!n.asset) {
         return { jsx: jsxSelf('div', [styleAttr(styles)]), uses }
     }
-    const srcExpr = assetImportExpression(n.asset, ctx)
+    const alias = imageAliasFromFilename(n.asset)
+    uses.defaultImports.set(alias, assetImportPathFromOutput(n.asset, ctx))
     uses.usedJsxPatterns.add('styled')
     return {
         jsx: jsxSelf(styledTag('img'), [
-            jsxExprAttr('src', srcExpr),
+            jsxExprAttr('src', f.createIdentifier(alias)),
             jsxAttr('alt', ''),
             styleAttr(styles),
         ]),

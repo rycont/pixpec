@@ -1,11 +1,15 @@
 import type * as ast from '@typescript/native-preview/ast'
-import type { DShape } from '../../../compiler/design-ast.ts'
-import { Anchor, ShapeKind, Sizing, StrokeAlign, StrokeCap } from '../../../compiler/design-ast.ts'
+import type { AxisPosition, DShape } from '../../../compiler/design-ast.ts'
+import { ShapeKind, Sizing, StrokeAlign, StrokeCap } from '../../../compiler/design-ast.ts'
 import { jsxAttr, jsxEl, jsxExprAttr, jsxSelf, styledTag } from '../ast.ts'
 import { cssColorLiteral, isCornerRadii, paintToProp, px2rem, sizeToPx } from '../data-lowerer.ts'
 import type { LowererCtx as Ctx, LowerResult, ParentCtx } from '../lowerer-types.ts'
 import { emptyUses } from '../lowerer-types.ts'
 import { axisSizing } from '../sizing.ts'
+
+function isBothEdgeInset(axis: AxisPosition | undefined): boolean {
+    return axis?.kind === 'inset' && axis.start !== undefined && axis.end !== undefined
+}
 
 export async function emitShape(n: DShape, ctx: Ctx, _parent: ParentCtx): Promise<LowerResult> {
     const uses = emptyUses()
@@ -86,9 +90,9 @@ export async function emitShape(n: DShape, ctx: Ctx, _parent: ParentCtx): Promis
         }
     }
     const hStretch =
-        axisSizing(n.width) === Sizing.Fill || n.absolute?.anchor?.horizontal === Anchor.Stretch
+        axisSizing(n.width) === Sizing.Fill || isBothEdgeInset(n.absolute?.horizontal)
     const vStretch =
-        axisSizing(n.height) === Sizing.Fill || n.absolute?.anchor?.vertical === Anchor.Stretch
+        axisSizing(n.height) === Sizing.Fill || isBothEdgeInset(n.absolute?.vertical)
     const svgAttrs: ast.JsxAttributeLike[] = [
         jsxAttr('viewBox', `0 0 ${viewW} ${viewH}`),
         jsxAttr('display', 'block'),

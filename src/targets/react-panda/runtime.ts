@@ -61,3 +61,44 @@ export function useSquircleClip<T extends HTMLElement>(
     }, [cornerRadius, cornerSmoothing])
     return [ref, clipPath]
 }
+
+export function mergeProps<T extends object>(defaults: T, props: Partial<T>): T {
+    const out = { ...defaults }
+    for (const k in props) {
+        const raw = props[k as keyof T]
+        if (raw === undefined) continue
+        const v = normalizeLiteralProp(raw) as T[keyof T]
+        out[k as keyof T] = v
+    }
+    return out
+}
+
+/** Pixpec usecases serialize literal length/color values as `{kind:'literal',
+ *  value:{value,unit}}` or `{kind:'literal', value:{r,g,b,a?}}`. Components
+ *  expect primitive strings, so we flatten on the merge boundary. */
+function normalizeLiteralProp(v: unknown): unknown {
+    if (!v || typeof v !== 'object') return v
+    const obj = v as Record<string, unknown>
+    if (obj.kind !== 'literal') return v
+    const inner = obj.value
+    if (inner == null) return v
+    if (typeof inner === 'string') return inner
+    if (typeof inner === 'number' || typeof inner === 'boolean') return inner
+    if (typeof inner === 'object') {
+        const r = inner as Record<string, unknown>
+        if ('unit' in r && 'value' in r) {
+            const num = Number(r.value)
+            // Match Panda's runtime px→rem rounding (toFixed(6)) so the
+            // className we resolve matches the pre-emitted utility class.
+            if (r.unit === 'px') return `${+(num / 16).toFixed(6)}rem`
+            return `${num}${r.unit}`
+        }
+        if ('r' in r && 'g' in r && 'b' in r) {
+            const a = 'a' in r ? Number(r.a) : 1
+            return a < 1
+                ? `rgba(${r.r}, ${r.g}, ${r.b}, ${a})`
+                : `rgb(${r.r}, ${r.g}, ${r.b})`
+        }
+    }
+    return v
+}

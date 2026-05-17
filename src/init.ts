@@ -253,9 +253,6 @@ export async function init(opts: {
     ? await scanAllOpenTabsForInit({
         componentSetKey: component.key,
         cfigmaBin: cfg.cfigmaBin,
-      }).catch((e) => {
-        console.warn(`[init] usecase scan failed: ${(e as Error).message}`);
-        return undefined;
       })
     : undefined;
 
@@ -266,25 +263,18 @@ export async function init(opts: {
     if (!u.fileKey) continue;
     const usageRaw = usageRawById.get(`${u.fileKey}:${u.id}`);
     if (!usageRaw) continue;
-    try {
-      usecases.push({
-        figmaId: `${u.fileKey}:${u.id}`,
-        variantKey: u.mainKey,
-        raw: usageRaw,
-        ir: await compileUsageForInit(
-          usageRaw,
-          analysisRegistry,
-          designContext,
-          caseAssetsDir,
-        ),
-        render: parseRenderBox(usageRaw),
-      });
-    } catch (e) {
-      if (isFatalInitError(e)) throw e;
-      console.warn(
-        `[init] skipped usecase ${u.fileKey}:${u.id}: ${(e as Error).message}`,
-      );
-    }
+    usecases.push({
+      figmaId: `${u.fileKey}:${u.id}`,
+      variantKey: u.mainKey,
+      raw: usageRaw,
+      ir: await compileUsageForInit(
+        usageRaw,
+        analysisRegistry,
+        designContext,
+        caseAssetsDir,
+      ),
+      render: parseRenderBox(usageRaw),
+    });
   }
 
   const usecasesByVariant = groupBy(
@@ -398,22 +388,14 @@ export async function init(opts: {
     const usecases = (
       usecasesByVariant.get(meta.variant.key ?? "") ?? []
     ).flatMap((u) => {
-      try {
-        const usecase = makeUsecaseWithParser(
-          parser,
-          component.defs,
-          meta.variant,
-          u,
-          cfg.remBase ?? 16,
-        );
-        return usecase ? [usecase] : [];
-      } catch (e) {
-        if (isFatalInitError(e)) throw e;
-        console.warn(
-          `[init] skipped usecase ${u.figmaId}: ${(e as Error).message}`,
-        );
-        return [];
-      }
+      const usecase = makeUsecaseWithParser(
+        parser,
+        component.defs,
+        meta.variant,
+        u,
+        cfg.remBase ?? 16,
+      );
+      return usecase ? [usecase] : [];
     });
     const cases = [masterCase, ...usecases];
     collectStaticTokens(staticTokens, cases, promotions);
@@ -516,35 +498,12 @@ async function dumpUsageRawsForInit(
     const ids = [...new Set(group.map((usage) => usage.id))];
     for (let start = 0; start < ids.length; start += INIT_USAGE_DUMP_BATCH_SIZE) {
       const chunk = ids.slice(start, start + INIT_USAGE_DUMP_BATCH_SIZE);
-      try {
-        const dumped = await dumpMany({
-          cfigmaBin: cfg.cfigmaBin ?? "cfigma",
-          tab: tab.key,
-          nodeIds: chunk,
-        });
-        for (const [id, raw] of dumped) out.set(`${fileKey}:${id}`, raw);
-      } catch (e) {
-        console.warn(
-          `[init] batch usecase dump failed for ${fileKey} [${start}..${start + chunk.length}); falling back to single dumps: ${(e as Error).message}`,
-        );
-        for (const id of chunk) {
-          try {
-            out.set(
-              `${fileKey}:${id}`,
-              await dump({
-                cfigmaBin: cfg.cfigmaBin ?? "cfigma",
-                tab: tab.key,
-                nodeId: id,
-              }),
-            );
-          } catch (singleError) {
-            if (isFatalInitError(singleError)) throw singleError;
-            console.warn(
-              `[init] skipped usecase ${fileKey}:${id}: ${(singleError as Error).message}`,
-            );
-          }
-        }
-      }
+      const dumped = await dumpMany({
+        cfigmaBin: cfg.cfigmaBin ?? "cfigma",
+        tab: tab.key,
+        nodeIds: chunk,
+      });
+      for (const [id, raw] of dumped) out.set(`${fileKey}:${id}`, raw);
     }
   }
   return out;
@@ -855,6 +814,10 @@ function dataScopeEntries(
 ): Record<string, DataScopeEntry> {
   const entries: Record<string, DataScopeEntry> = {};
   for (const [name, def] of Object.entries(defs)) {
+    // Skip Figma VARIANT-kind props: the impl dispatch layer already routes
+    // by variant key, so per-variant render code never reads these. Including
+    // them in the render-time props interface is pure noise.
+    if (def.kind === "variant") continue;
     entries[name] = {
       type: def.dataType,
       default: variant.props[name] ?? def.defaultValue,
@@ -1029,7 +992,9 @@ function literalType(value: unknown): string {
 }
 
 function isLengthLiteral(value: Record<string, unknown>): boolean {
-  return typeof value.value === "number" && value.unit === "px";
+  return (
+    typeof value.value === "number" && (value.unit === "px" || value.unit === "%")
+  );
 }
 
 function lengthNumber(value: unknown): number | undefined {
@@ -1575,10 +1540,31 @@ function collectStaticTokens(
       const property = isStaticCssProperty(key)
         ? key
         : promotedCssFields.get(key);
-      if (!property || typeof value !== "string") continue;
-      if (isStaticCssValue(value)) out[property].add(value);
+      if (!property) continue;
+      const normalized = staticCssValueFromProp(value);
+      if (normalized !== undefined) out[property].add(normalized);
     }
   }
+}
+
+/** Normalize a usecase prop value into a string the Panda cssgen will look up
+ *  as a static value. Strings pass through; length literals get rendered as
+ *  rem (matching codegen) so cssgen emits the corresponding utility class. */
+function staticCssValueFromProp(value: unknown): string | undefined {
+  if (typeof value === "string") {
+    return isStaticCssValue(value) ? value : undefined;
+  }
+  if (!value || typeof value !== "object") return undefined;
+  const rec = value as Record<string, unknown>;
+  if (rec.kind === "literal" && rec.value && typeof rec.value === "object") {
+    const v = rec.value as Record<string, unknown>;
+    if (typeof v.value === "number" && typeof v.unit === "string") {
+      if (v.unit === "px") return `${+(v.value / 16).toFixed(6)}rem`;
+      if (v.unit === "rem") return `${+v.value.toFixed(6)}rem`;
+      return `${v.value}${v.unit}`;
+    }
+  }
+  return undefined;
 }
 
 function cssPropertyForField(field: string): StaticCssProperty | undefined {
@@ -1624,7 +1610,7 @@ function zodForType(type: string, optional = false): string {
   const suffix = optional ? ".optional()" : "";
   const literal = (schema: string) =>
     `z.object({ kind: z.literal("literal"), value: ${schema} })`;
-  const lengthLiteral = `z.object({ value: z.number(), unit: z.literal("px") })`;
+  const lengthLiteral = `z.object({ value: z.number(), unit: z.union([z.literal("px"), z.literal("%")]) })`;
   const colorLiteral = `z.object({ r: z.number(), g: z.number(), b: z.number(), a: z.number().optional() })`;
   const textStyleLiteral = `z.object({
     fontFamily: z.string().optional(),

@@ -69,13 +69,25 @@ async function waitForFontSettle(
 }
 
 export class Renderer {
-    private constructor(private browser: Browser) {}
+    private constructor(
+        private browser: Browser,
+        private extraArgs: string[],
+    ) {}
 
     static async create(extraArgs: string[] = []): Promise<Renderer> {
         const browser = await chromium.launch({
             args: [...LOCKED_FLAGS, ...extraArgs],
         })
-        return new Renderer(browser)
+        return new Renderer(browser, extraArgs)
+    }
+
+    /** Discard the underlying browser and launch a fresh one. Used to recover
+     *  from compositor/renderer crashes mid-capture. */
+    async restart(): Promise<void> {
+        try { await this.browser.close() } catch {}
+        this.browser = await chromium.launch({
+            args: [...LOCKED_FLAGS, ...this.extraArgs],
+        })
     }
 
     async renderUrl(opts: RenderUrlOptions): Promise<void> {

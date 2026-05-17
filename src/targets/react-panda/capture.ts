@@ -191,24 +191,41 @@ export async function captureReactPandaDestination(
             let nextIdx = 0
             const worker = async () => {
                 let session: Awaited<ReturnType<Renderer['openBatch']>> | null = null
+                const openSession = async (url: string) =>
+                    renderer.openBatch({
+                        url,
+                        viewport: comp.viewport ?? { width: 4000, height: 8000 },
+                        outputScale: plan.scale ?? 2,
+                        remBase: plan.remBase ?? 16,
+                    })
                 try {
                     while (nextIdx < chunks.length) {
                         const idx = nextIdx++
                         const chunk = await prepareChunk(chunks[idx])
-                        if (!session) {
-                            session = await renderer.openBatch({
-                                url: chunk.url,
-                                viewport: comp.viewport ?? { width: 4000, height: 8000 },
-                                outputScale: plan.scale ?? 2,
-                                remBase: plan.remBase ?? 16,
-                            })
-                            await captureChunk(session, chunk, true)
-                        } else {
-                            await captureChunk(session, chunk, false)
+                        let attempt = 0
+                        while (true) {
+                            attempt++
+                            try {
+                                if (!session) {
+                                    session = await openSession(chunk.url)
+                                    await captureChunk(session, chunk, true)
+                                } else {
+                                    await captureChunk(session, chunk, false)
+                                }
+                                break
+                            } catch (err) {
+                                const msg = String(err)
+                                const fatal = msg.includes('Target page, context or browser has been closed') || msg.includes('Target closed') || msg.includes('crashed')
+                                if (!fatal || attempt >= 3) throw err
+                                console.warn(`[capture] session died on chunk ${chunk.s}..${chunk.e} (attempt ${attempt}); restarting browser: ${msg.split('\n')[0]}`)
+                                try { await session?.close() } catch {}
+                                session = null
+                                await renderer.restart()
+                            }
                         }
                     }
                 } finally {
-                    await session?.close()
+                    try { await session?.close() } catch {}
                 }
             }
             await Promise.all(Array.from({ length: Math.min(PARALLEL, chunks.length) }, worker))
@@ -239,6 +256,9 @@ function lowerPixpecValueForReact(value: unknown, remBase: number): unknown {
     if (record.kind === 'literal') return lowerPixpecValueForReact(record.value, remBase)
     if (typeof record.value === 'number' && record.unit === 'px') {
         return `${+(record.value / remBase).toFixed(6)}rem`
+    }
+    if (typeof record.value === 'number' && record.unit === '%') {
+        return `${+record.value.toFixed(6)}%`
     }
     if (isColorRecord(record)) return colorRecordToCss(record)
     return Object.fromEntries(
@@ -565,6 +585,14 @@ function mergeStaticCss(
             const existing = mergedProperties[property] ?? []
             mergedProperties[property] = [...new Set([...existing, '*'])]
         }
+        // Sizing-axis utilities also accept the Figma keywords `fill`/`hug`
+        // (transformed by our custom width/height utility). cssgen's static
+        // analysis won't pick them up from runtime-bound props, so register
+        // explicitly.
+        for (const property of ['width', 'height']) {
+            const existing = mergedProperties[property] ?? []
+            mergedProperties[property] = [...new Set([...existing, 'fill', 'hug'])]
+        }
     } else if (Object.keys(extra).length === 0) {
         return base
     }
@@ -593,6 +621,7 @@ const STATIC_CSS_PROPERTIES_RUNTIME = [
     'rowGap',
     'columnGap',
     'color',
+    'bg',
     'background',
     'backgroundColor',
     'borderColor',
@@ -640,8 +669,24 @@ export default {
       maxHeight: { values: { type: 'string' } },
       minWidth: { values: { type: 'string' } },
       maxWidth: { values: { type: 'string' } },
-      width: { values: { type: 'string' } },
-      height: { values: { type: 'string' } },
+      width: {
+        values: { type: 'string' },
+        transform(value, { token }) {
+          if (value === 'fill') return { width: '100%', flexGrow: 1, minWidth: 0 }
+          if (value === 'hug') return { width: 'fit-content' }
+          const resolved = token(\`sizes.\${value}\`) ?? value
+          return { width: resolved }
+        },
+      },
+      height: {
+        values: { type: 'string' },
+        transform(value, { token }) {
+          if (value === 'fill') return { height: '100%', flexGrow: 1, minHeight: 0 }
+          if (value === 'hug') return { height: 'fit-content' }
+          const resolved = token(\`sizes.\${value}\`) ?? value
+          return { height: resolved }
+        },
+      },
       insetBorder: {
         className: 'inset-bd',
         values: { type: 'string' },

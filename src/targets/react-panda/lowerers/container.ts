@@ -12,7 +12,7 @@ import type {
     Value,
 } from '../../../compiler/design-ast.ts'
 import { Align, Justify, NodeKind, Sizing, StrokeAlign } from '../../../compiler/design-ast.ts'
-import { attrsFromObject, compactPaddingStyles, jsxEl, propAccess } from '../ast.ts'
+import { attrsFromObject, compactPaddingStyles, jsxAttr, jsxEl, propAccess } from '../ast.ts'
 import {
     cssColorLiteral,
     isCornerRadii,
@@ -23,7 +23,7 @@ import {
     shadowToCss,
     sizeToPx,
 } from '../data-lowerer.ts'
-import { assetImportExpression } from '../assets.ts'
+import { assetImportPathFromOutput, imageAliasFromFilename } from '../assets.ts'
 import type { LowererCtx as Ctx, LowerResult, ParentCtx } from '../lowerer-types.ts'
 import { boxCtx, emptyUses, flexCtx, LocalCtx, mergeUses, stackCtx } from '../lowerer-types.ts'
 import {
@@ -156,10 +156,13 @@ export async function emitContainer(n: DFlex | DStack | DBox, ctx: Ctx, parent: 
     }
 
     // background + opacity + render-bounds offset
-    let imageBgExpr: ast.Expression | undefined
+    let imageBgIdent: ast.Identifier | undefined
     if (n.background) {
         if (isImagePaintLiteral(n.background) && n.background.value.asset) {
-            imageBgExpr = assetImportExpression(n.background.value.asset, ctx)
+            const filename = n.background.value.asset
+            const alias = imageAliasFromFilename(filename)
+            uses.defaultImports.set(alias, assetImportPathFromOutput(filename, ctx))
+            imageBgIdent = f.createIdentifier(alias)
         } else {
             const bg = paintToProp(n.background)
             if (bg !== undefined) {
@@ -186,16 +189,50 @@ export async function emitContainer(n: DFlex | DStack | DBox, ctx: Ctx, parent: 
     let staticBorderPaintStyle:
         | { background: string; paint: string; baseShadow?: string }
         | undefined
+    let promotedInsetBorderAttr: ast.JsxAttributeLike | undefined
     if (n.border) {
         const w = n.border.width
         const colorStr = paintToProp(n.border.paint)
         const colorRef = colorStr ? cssColorLiteral(colorStr) : '#000'
         const gradientBorder = Boolean(colorStr?.includes('gradient('))
+        const widthPropName = !isPerSideWidth(w) ? expressionPropName(w) : undefined
         if (borderPaintProp) {
             const wPx = isPerSideWidth(w) ? undefined : sizeToPx(w)
             if (wPx !== undefined) {
                 styles.border = `${px2rem(wPx, ctx.env.remBase)} solid transparent`
             }
+        } else if (widthPropName && colorStr && !colorStr.includes('gradient(')) {
+            // Promoted width — emit inline `style={{ boxShadow: `inset 0 0 0
+            // ${props.X} ${color}` }}` so cssgen doesn't need to pre-emit a
+            // class for every (width, color) combination.
+            const head = n.border.align === StrokeAlign.Outside
+                ? '0 0 0 '
+                : 'inset 0 0 0 '
+            const tail = ` ${colorRef}`
+            const template = f.createTemplateExpression(
+                f.createTemplateHead(head, head, undefined),
+                [
+                    f.createTemplateSpan(
+                        propAccess(widthPropName),
+                        f.createTemplateTail(tail, tail, undefined),
+                    ),
+                ],
+            )
+            promotedInsetBorderAttr = f.createJsxAttribute(
+                f.createIdentifier('style'),
+                f.createJsxExpression(
+                    undefined,
+                    f.createObjectLiteralExpression([
+                        f.createPropertyAssignment(
+                            undefined,
+                            f.createIdentifier('boxShadow'),
+                            undefined,
+                            undefined,
+                            template,
+                        ),
+                    ], false),
+                ),
+            )
         } else if (isPerSideWidth(w)) {
             // Per-side widths via inset box-shadow.
             const remB = ctx.env.remBase
@@ -289,7 +326,15 @@ export async function emitContainer(n: DFlex | DStack | DBox, ctx: Ctx, parent: 
     const tag = direction === 'row' ? 'Flex' : direction === 'column' ? 'Stack' : 'Box'
     uses.usedJsxPatterns.add(tag)
     const compact = compactPaddingStyles(styles)
+    // Panda's token-aware shorthand for the `background` CSS prop is `bg`.
+    // Emitting `background=` skips the token utility in some Panda configs;
+    // `bg=` always resolves design tokens (e.g. "line.divider" → bg_line.divider).
+    if (compact && typeof compact === 'object' && 'background' in compact && !('bg' in compact)) {
+        (compact as Record<string, unknown>).bg = (compact as Record<string, unknown>).background
+        delete (compact as Record<string, unknown>).background
+    }
     const attrs = attrsFromObject(compact)
+    if (promotedInsetBorderAttr) attrs.push(promotedInsetBorderAttr)
     const squircleRadius =
         n.cornerSmoothing &&
         n.cornerSmoothing > 0 &&
@@ -341,7 +386,7 @@ export async function emitContainer(n: DFlex | DStack | DBox, ctx: Ctx, parent: 
             // (invalid) color strings.
             attrs.push(
                 f.createJsxAttribute(
-                    f.createIdentifier('background'),
+                    f.createIdentifier('bg'),
                     f.createJsxExpression(undefined, propAccess(backgroundProp)),
                 ),
             )
@@ -360,12 +405,15 @@ export async function emitContainer(n: DFlex | DStack | DBox, ctx: Ctx, parent: 
                 : boxShadowStyleExpression(shadowProp),
         )
     }
-    if (imageBgExpr) {
+    if (imageBgIdent) {
+        // Background image URL must go through inline `style={...}` — Panda's
+        // `bgImage` utility is not token-aware for dynamic URLs. backgroundSize
+        // /Position/Repeat stay as Panda style props.
         const urlTemplate = f.createTemplateExpression(
             f.createTemplateHead('url(', 'url(', undefined),
             [
                 f.createTemplateSpan(
-                    imageBgExpr,
+                    imageBgIdent,
                     f.createTemplateTail(')', ')', undefined),
                 ),
             ],
@@ -379,31 +427,15 @@ export async function emitContainer(n: DFlex | DStack | DBox, ctx: Ctx, parent: 
                     undefined,
                     urlTemplate,
                 ),
-                f.createPropertyAssignment(
-                    undefined,
-                    f.createIdentifier('backgroundSize'),
-                    undefined,
-                    undefined,
-                    f.createStringLiteral('cover', false),
-                ),
-                f.createPropertyAssignment(
-                    undefined,
-                    f.createIdentifier('backgroundPosition'),
-                    undefined,
-                    undefined,
-                    f.createStringLiteral('center', false),
-                ),
-                f.createPropertyAssignment(
-                    undefined,
-                    f.createIdentifier('backgroundRepeat'),
-                    undefined,
-                    undefined,
-                    f.createStringLiteral('no-repeat', false),
-                ),
             ],
             false,
         )
         pushStyle(f.createJsxExpression(undefined, styleObj))
+        attrs.push(
+            jsxAttr('bgSize', 'cover'),
+            jsxAttr('bgPosition', 'center'),
+            jsxAttr('bgRepeat', 'no-repeat'),
+        )
     }
     const childParent: ParentCtx =
         direction === 'row'

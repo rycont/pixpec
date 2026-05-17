@@ -13,17 +13,25 @@ import { stringLiteral } from './ast.ts'
 import type { LowererCtx as Ctx } from './lowerer-types.ts'
 import { sanitizeKey } from './styles.ts'
 
-export function sidecarAlias(id: string): string {
-    return `Svg_${sanitizeKey(id)}`
+/** Strip `<dir>/...` prefix and the `.ext`; replace non-identifier chars with `_`. */
+function assetStem(filename: string): string {
+    const base = filename.split('/').pop() ?? filename
+    return base.replace(/\.[^./]+$/, '').replace(/[^A-Za-z0-9]/g, '_')
 }
-export function sidecarAliasTinted(id: string): string {
-    return `SvgC_${sanitizeKey(id)}`
+export function sidecarAlias(filename: string): string {
+    return `Svg_${assetStem(filename)}`
+}
+export function sidecarAliasTinted(filename: string): string {
+    return `SvgC_${assetStem(filename)}`
+}
+export function imageAliasFromFilename(filename: string): string {
+    return `Img_${assetStem(filename)}`
 }
 
 /** Relative path (from `<outputDir>`) of the tinted-variant sidecar file for
  *  the given source node id. Codegen writes the sidecar bytes to this path. */
-export function tintedSidecarRelativePath(ctx: Ctx, sourceId: string): string {
-    const filename = `svg__${sanitizeKey(sourceId)}__c.svg`
+export function tintedSidecarRelativePath(ctx: Ctx, assetFilename: string): string {
+    const filename = `${assetStem(assetFilename)}__c.svg`
     return targetSidecarRelativePath(ctx, filename)
 }
 

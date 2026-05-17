@@ -1,3 +1,4 @@
+import type * as ast from '@typescript/native-preview/ast'
 import { readFile } from 'node:fs/promises'
 import * as nodePath from 'node:path'
 import type { DVector } from '../../../compiler/design-ast.ts'
@@ -5,28 +6,36 @@ import {
     assetImportPathFromOutput,
     sidecarAlias,
     sidecarAliasTinted,
-    sidecarFilenameTinted,
     tintedSidecarRelativePath,
 } from '../assets.ts'
 import { jsxAttr, jsxEl, jsxSelf, styleAttr, styledTag } from '../ast.ts'
 import { px2rem, sizeToPx } from '../data-lowerer.ts'
 import type { LowererCtx as Ctx, LowerResult } from '../lowerer-types.ts'
 import { emptyUses } from '../lowerer-types.ts'
-import { expressionPropName, nodeSourceId } from '../sizing.ts'
+import { expressionPropName, sizeToProp } from '../sizing.ts'
 import { tintSwapJsx } from '../styles.ts'
 
 export async function emitVector(n: DVector, ctx: Ctx): Promise<LowerResult> {
     const uses = emptyUses()
+    const widthExprName = expressionPropName(n.width)
+    const heightExprName = expressionPropName(n.height)
+    const widthProp = widthExprName ? sizeToProp(n.width, ctx.env.remBase) : undefined
+    const heightProp = heightExprName ? sizeToProp(n.height, ctx.env.remBase) : undefined
     const rawW = sizeToPx(n.width) ?? 0
     const rawH = sizeToPx(n.height) ?? 0
+    const attrsNoAsset: ast.JsxAttributeLike[] = [
+        jsxAttr('flexShrink', 0),
+        ...(n.width !== undefined
+            ? [jsxAttr('width', widthProp ?? px2rem(rawW, ctx.env.remBase))]
+            : []),
+        ...(n.height !== undefined
+            ? [jsxAttr('height', heightProp ?? px2rem(rawH, ctx.env.remBase))]
+            : []),
+        styleAttr({ display: 'block' }),
+    ]
     if (!n.asset) {
         return {
-            jsx: jsxSelf(styledTag('span'), [
-                jsxAttr('flexShrink', 0),
-                jsxAttr('width', px2rem(rawW, ctx.env.remBase)),
-                jsxAttr('height', px2rem(rawH, ctx.env.remBase)),
-                styleAttr({ display: 'block' }),
-            ]),
+            jsx: jsxSelf(styledTag('span'), attrsNoAsset),
             uses,
         }
     }
@@ -36,41 +45,36 @@ export async function emitVector(n: DVector, ctx: Ctx): Promise<LowerResult> {
     const svgSize = svgRootSize(svgContent)
     const w = svgSize?.width ?? rawW
     const h = svgSize?.height ?? rawH
-    const sourceId = nodeSourceId(n)
     const originalImportPath = assetImportPathFromOutput(n.asset, ctx)
-    const alias = sidecarAlias(sourceId)
-    // Register original as a "sidecar" — but content is just a marker that
-    // codegen treats this as "already exists at importPath, no copy needed".
-    uses.svgSidecars.set(originalImportPath, {
-        alias,
-        content: '',
-        importPath: `${originalImportPath}?react`,
-        shared: true,
-    })
+    const alias = sidecarAlias(n.asset)
+    // Original SVG file already exists in the shared assets dir (written by
+    // compile). Only register an ESM import; no sidecar file to write.
+    uses.defaultImports.set(alias, `${originalImportPath}?react`)
     const fillProp = expressionPropName(n.fill)
-    const tintedRelativePath = tintedSidecarRelativePath(ctx, sourceId)
-    const tintedAlias = sidecarAliasTinted(sourceId)
-    if (!uses.svgSidecars.has(tintedRelativePath)) {
-        uses.svgSidecars.set(tintedRelativePath, {
-            alias: tintedAlias,
-            content: makeCurrentColorSvg(ringifyStrokeCircles(svgContent)),
-            importPath: `${tintedRelativePath}?react`,
-        })
+    const tintedRelativePath = tintedSidecarRelativePath(ctx, n.asset)
+    const tintedAlias = sidecarAliasTinted(n.asset)
+    if (!uses.defaultImports.has(tintedAlias)) {
+        uses.defaultImports.set(tintedAlias, `${tintedRelativePath}?react`)
+        uses.sidecarFiles.set(
+            tintedRelativePath,
+            makeCurrentColorSvg(ringifyStrokeCircles(svgContent)),
+        )
     }
-    uses.usesTinting = true
-    const innerSvg = tintSwapJsx(alias, tintedAlias, fillProp)
-    uses.usedJsxPatterns.add('styled')
-    return {
-        jsx: jsxEl(
-            styledTag('span'),
-            [
-                jsxAttr('flexShrink', 0),
-                jsxAttr('width', px2rem(w, ctx.env.remBase)),
-                jsxAttr('height', px2rem(h, ctx.env.remBase)),
-                styleAttr({ display: 'block' }),
-            ],
-            [innerSvg],
+    // No wrapper span — svg directly carries width/height + display:block so
+    // sub-pixel rounding doesn't accumulate across nested boxes. tintSwapJsx
+    // ships the size attrs straight through to the svg element.
+    const sizeAttrs: ast.JsxAttributeLike[] = [
+        jsxAttr(
+            'width',
+            n.width !== undefined ? widthProp ?? px2rem(w, ctx.env.remBase) : '100%',
         ),
+        jsxAttr(
+            'height',
+            n.height !== undefined ? heightProp ?? px2rem(h, ctx.env.remBase) : '100%',
+        ),
+    ]
+    return {
+        jsx: tintSwapJsx(alias, tintedAlias, fillProp, sizeAttrs),
         uses,
     }
 }

@@ -21,7 +21,7 @@ function isObj(v: unknown): v is Record<string, unknown> {
 }
 
 export function isLengthLiteral(v: unknown): v is Length {
-    return isObj(v) && typeof v.value === 'number' && v.unit === 'px'
+    return isObj(v) && typeof v.value === 'number' && (v.unit === 'px' || v.unit === '%')
 }
 
 export function isCornerRadii(v: unknown): v is CornerRadii {
@@ -48,6 +48,9 @@ export function isLiteralValue<T>(v: unknown): v is LiteralValue<T> {
 export function sizeToPropLiteral(s: Length, remBase: number): string | number {
     if (s.value === 0) {
         return 0
+    }
+    if (s.unit === '%') {
+        return `${+s.value.toFixed(6)}%`
     }
     return px2rem(s.value, remBase)
 }

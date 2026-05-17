@@ -72,6 +72,11 @@ async function runVerifyTarget(
   opts: VerifyOptions,
 ): Promise<{ pass: number; fail: number; total: number; failed: string[]; report: VerifyTargetReport }> {
   console.log(`[verify:${target}] capturing ${componentName} destination artifacts…`)
+  // Clear stale results.json before capture so a failure here doesn't leave a
+  // previous run's results visible to callers that scan results.json directly.
+  const { rm } = await import('node:fs/promises')
+  const verifyMeasureDir = `${componentDir}/.pixpec/verify/figma__${target}/measure`
+  await rm(`${verifyMeasureDir}/results.json`, { force: true })
   if (process.env.PIXPEC_VERIFY_CAPTURE_IN_PROCESS === '1') {
     await runCapture('dst', componentName, { backend: target, clearOutDir: true })
   } else {

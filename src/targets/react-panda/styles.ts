@@ -170,12 +170,14 @@ export function tintSwapJsx(
     normal: string,
     tinted: string,
     fillProp: string | undefined,
+    extraAttrs: ast.JsxAttributeLike[] = [],
 ): ast.JsxChild {
-    const baseStyle = { display: 'block', width: '100%', height: '100%' }
+    const baseStyle = { display: 'block' }
     const svgAttrs = (extra?: ast.JsxAttributeLike): ast.JsxAttributeLike[] => {
         const a: ast.JsxAttributeLike[] = [
             jsxAttr('preserveAspectRatio', 'none'),
-            jsxAttr('shapeRendering', 'geometricPrecision'),
+            jsxAttr('shapeRendering', 'crispEdges'),
+            ...extraAttrs,
         ]
         if (extra) {
             a.push(extra)

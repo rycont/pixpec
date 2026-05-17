@@ -162,7 +162,10 @@ export interface DDataScope extends DNodeBase {
 
 export interface Length {
   value: number;
-  unit: "px";
+  /** `'px'` for absolute lengths; `'%'` for parent-relative (Scale-anchor
+   *  children carry their inset/width/height as percentages of the immediate
+   *  parent dimension, so they auto-scale without promoting to props). */
+  unit: "px" | "%";
 }
 
 export type LengthValue = ScalarValue<Length>;
@@ -223,9 +226,22 @@ export interface Shadow {
   color: Color;
 }
 
+/** Per-axis positioning for absolutely-laid-out children.
+ *  - `inset` carries one or both edges (`left`/`right` or `top`/`bottom`):
+ *    both edges present + px units ⇒ stretch (sticky to both sides),
+ *    both edges present + % units ⇒ scale (parent-relative),
+ *    a single edge ⇒ sticky to that edge.
+ *    When both edges are present, the matching width/height should be omitted
+ *    (the edges fully determine the box).
+ *  - `center` carries an offset (`delta`) from the parent's center along that
+ *    axis. `delta` is a length so it can be `0`, fixed px, or % of parent. */
+export type AxisPosition =
+  | { kind: "inset"; start?: LengthValue; end?: LengthValue }
+  | { kind: "center"; delta: LengthValue };
+
 export interface AbsoluteLayout {
-  inset?: { left?: LengthValue; top?: LengthValue; right?: LengthValue; bottom?: LengthValue };
-  anchor?: { horizontal?: Anchor; vertical?: Anchor };
+  horizontal?: AxisPosition;
+  vertical?: AxisPosition;
 }
 
 export type TextStyleName = TokenRef | ExpressionValue;
@@ -351,8 +367,11 @@ export interface DShape extends DNodeBase {
 /** Inline vector (path or raw SVG). Resolved upstream from a vector source. */
 export interface DVector extends DNodeBase {
   kind: NodeKind.Vector;
-  width: LengthValue;
-  height: LengthValue;
+  /** Optional when the parent inset's left+right edges fully determine width
+   *  (stretch/scale anchor) — CSS then computes the size automatically. */
+  width?: LengthValue;
+  /** Optional when the parent inset's top+bottom edges fully determine height. */
+  height?: LengthValue;
   /** The vector paint source. When prop-bound, the emitter must drive the
    *  vector from that declared prop, not from target-specific style
    *  conventions such as CSS `color`. */

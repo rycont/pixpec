@@ -235,7 +235,7 @@ function colorLiteral(
   return literalValue(value);
 }
 
-function normalizeNumber(value: number, precision = 3): number {
+function normalizeNumber(value: number, precision = 6): number {
   const normalized = +value.toFixed(precision);
   return Object.is(normalized, -0) ? 0 : normalized;
 }
@@ -309,6 +309,72 @@ function justifyFromRaw(
 
 function px(n: number): LengthValue {
   return { kind: "literal", value: { value: normalizeNumber(n), unit: "px" } };
+}
+
+function pct(n: number): LengthValue {
+  return { kind: "literal", value: { value: normalizeNumber(n), unit: "%" } };
+}
+
+/** Build a per-axis AbsoluteLayout entry from a Figma constraint + raw px
+ *  positions. SCALE → both edges as %, STRETCH → both edges as px,
+ *  CENTER → `delta` from parent's midpoint (px), MIN/undefined → start edge px,
+ *  MAX → end edge px. */
+function axisPosition(
+  constraint: RawConstraints["horizontal"] | undefined,
+  startPx: number,
+  sizePx: number | undefined,
+  parentSizePx: number | undefined,
+): import("./design-ast.ts").AxisPosition {
+  const anchor = anchorFromConstraint(constraint);
+  const knowSize = typeof sizePx === "number" && typeof parentSizePx === "number" && parentSizePx > 0;
+  const endPx = knowSize ? parentSizePx! - startPx - sizePx! : undefined;
+  if (anchor === Anchor.Center && knowSize) {
+    const childCenter = startPx + sizePx! / 2;
+    const parentCenter = parentSizePx! / 2;
+    return { kind: "center", delta: px(childCenter - parentCenter) };
+  }
+  if (anchor === Anchor.Scale && knowSize) {
+    return {
+      kind: "inset",
+      start: pct((startPx / parentSizePx!) * 100),
+      end: pct((endPx! / parentSizePx!) * 100),
+    };
+  }
+  if (anchor === Anchor.Stretch && endPx !== undefined) {
+    return { kind: "inset", start: px(startPx), end: px(endPx) };
+  }
+  if (anchor === Anchor.End && endPx !== undefined) {
+    return { kind: "inset", end: px(endPx) };
+  }
+  // MIN, undefined, or anything else falls back to a left/top-sticky inset.
+  return { kind: "inset", start: px(startPx) };
+}
+
+/** If the child is absolutely positioned and the axis has both inset edges set
+ *  (stretch/scale), the size is fully determined by the inset and should be
+ *  omitted from the IR. Otherwise return the regular px size. */
+function absoluteAxisSize(
+  n: RawNode,
+  parent: RawNode | undefined,
+  axis: "horizontal" | "vertical",
+  opts: CompileOptions,
+): LengthValue | undefined {
+  const sizeKey = axis === "horizontal" ? "width" : "height";
+  const fallback = pickSize(n[sizeKey], undefined, opts);
+  if (!parent) return fallback;
+  // A child is absolutely positioned either by explicit `layoutPositioning`
+  // (auto-layout siblings can opt out) or implicitly because the parent frame
+  // doesn't run auto-layout (layoutMode==="NONE" or missing).
+  const childAbsolute =
+    n.layoutPositioning === "ABSOLUTE" ||
+    !parent.layoutMode ||
+    parent.layoutMode === "NONE";
+  if (!childAbsolute) return fallback;
+  const anchor = n.constraints
+    ? anchorFromConstraint(n.constraints[axis])
+    : undefined;
+  if (anchor === Anchor.Stretch || anchor === Anchor.Scale) return undefined;
+  return fallback;
 }
 
 function pxToRem(n: number, remBase: number): string {
@@ -609,26 +675,20 @@ function buildBase(
   if (typeof n.rotation === "number" && Math.abs(n.rotation) >= 0.01)
     out.rotation = n.rotation;
   if (parent && n.layoutPositioning === "ABSOLUTE") {
-    out.absolute = { inset: { left: px(n.x ?? 0), top: px(n.y ?? 0) } };
-    if (
-      parent &&
-      typeof parent.width === "number" &&
-      typeof n.width === "number"
-    ) {
-      out.absolute.inset!.right = px(parent.width - (n.x ?? 0) - n.width);
-    }
-    if (
-      parent &&
-      typeof parent.height === "number" &&
-      typeof n.height === "number"
-    ) {
-      out.absolute.inset!.bottom = px(parent.height - (n.y ?? 0) - n.height);
-    }
-    if (n.constraints) {
-      const h = anchorFromConstraint(n.constraints.horizontal);
-      const v = anchorFromConstraint(n.constraints.vertical);
-      if (h || v) out.absolute.anchor = { horizontal: h, vertical: v };
-    }
+    out.absolute = {
+      horizontal: axisPosition(
+        n.constraints?.horizontal,
+        n.x ?? 0,
+        n.width,
+        parent.width,
+      ),
+      vertical: axisPosition(
+        n.constraints?.vertical,
+        n.y ?? 0,
+        n.height,
+        parent.height,
+      ),
+    };
   }
   out.renderBoundsOffset = renderBoundsOffsetFromRaw(n);
   return out;
@@ -1188,8 +1248,8 @@ async function compileVector(
   opts: CompileOptions,
   parent?: RawNode,
 ): Promise<DVector | DImage> {
-  const w = pickSize(n.width, undefined, opts) ?? px(0);
-  const h = pickSize(n.height, undefined, opts) ?? px(0);
+  const w = absoluteAxisSize(n, parent, "horizontal", opts);
+  const h = absoluteAxisSize(n, parent, "vertical", opts);
   const fillProp = directPaintBinding(n, opts);
   const fillOverride = overriddenField(n, opts, "fills")
     ? solidFillOverride(n, opts)
@@ -1430,18 +1490,10 @@ function applyAbsoluteChildPosition(
     typeof parent.absoluteBoundingBox?.y === "number"
       ? n.absoluteBoundingBox.y - parent.absoluteBoundingBox.y
       : (n.y ?? 0);
-  out.absolute = { inset: { left: px(left), top: px(top) } };
-  if (typeof parent.width === "number" && typeof n.width === "number") {
-    out.absolute.inset!.right = px(parent.width - left - n.width);
-  }
-  if (typeof parent.height === "number" && typeof n.height === "number") {
-    out.absolute.inset!.bottom = px(parent.height - top - n.height);
-  }
-  if (n.constraints) {
-    const h = anchorFromConstraint(n.constraints.horizontal);
-    const v = anchorFromConstraint(n.constraints.vertical);
-    if (h || v) out.absolute.anchor = { horizontal: h, vertical: v };
-  }
+  out.absolute = {
+    horizontal: axisPosition(n.constraints?.horizontal, left, n.width, parent.width),
+    vertical: axisPosition(n.constraints?.vertical, top, n.height, parent.height),
+  };
 }
 
 async function compileInstance(

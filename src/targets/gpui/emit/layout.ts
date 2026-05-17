@@ -1,5 +1,4 @@
-import type { DNode } from '../../../compiler/design-ast.ts'
-import { Anchor } from '../../../compiler/design-ast.ts'
+import type { AxisPosition, DNode } from '../../../compiler/design-ast.ts'
 import type { GpuiChain } from './chain.ts'
 import type { GpuiEmitContext } from './context.ts'
 import { lengthNumber, scaledPx, scaledPxWithOffset } from './values.ts'
@@ -11,26 +10,24 @@ export function addNodeLayout(
   offset: { x?: number; y?: number } = {},
 ): void {
   if (!n.absolute) return
-
-  const inset = n.absolute.inset ?? {}
-  const anchor = n.absolute.anchor ?? {}
   chain.method('absolute')
+  applyAxis(chain, n.absolute.horizontal, 'left', 'right', ctx, offset.x)
+  applyAxis(chain, n.absolute.vertical, 'top', 'bottom', ctx, offset.y)
+}
 
-  if (anchor.horizontal === Anchor.End) {
-    if (inset.right !== undefined) chain.method('right', scaledPxWithOffset(lengthNumber(inset.right, ctx), ctx, offset.x))
-  } else if (anchor.horizontal === Anchor.Stretch) {
-    if (inset.left !== undefined) chain.method('left', scaledPxWithOffset(lengthNumber(inset.left, ctx), ctx, offset.x))
-    if (inset.right !== undefined) chain.method('right', scaledPx(lengthNumber(inset.right, ctx), ctx))
-  } else {
-    if (inset.left !== undefined) chain.method('left', scaledPxWithOffset(lengthNumber(inset.left, ctx), ctx, offset.x))
+function applyAxis(
+  chain: GpuiChain,
+  axis: AxisPosition | undefined,
+  startKey: 'left' | 'top',
+  endKey: 'right' | 'bottom',
+  ctx: GpuiEmitContext,
+  offset: number | undefined,
+): void {
+  if (!axis || axis.kind !== 'inset') return
+  if (axis.start !== undefined) {
+    chain.method(startKey, scaledPxWithOffset(lengthNumber(axis.start, ctx), ctx, offset))
   }
-
-  if (anchor.vertical === Anchor.End) {
-    if (inset.bottom !== undefined) chain.method('bottom', scaledPxWithOffset(lengthNumber(inset.bottom, ctx), ctx, offset.y))
-  } else if (anchor.vertical === Anchor.Stretch) {
-    if (inset.top !== undefined) chain.method('top', scaledPxWithOffset(lengthNumber(inset.top, ctx), ctx, offset.y))
-    if (inset.bottom !== undefined) chain.method('bottom', scaledPx(lengthNumber(inset.bottom, ctx), ctx))
-  } else {
-    if (inset.top !== undefined) chain.method('top', scaledPxWithOffset(lengthNumber(inset.top, ctx), ctx, offset.y))
+  if (axis.end !== undefined) {
+    chain.method(endKey, scaledPx(lengthNumber(axis.end, ctx), ctx))
   }
 }
