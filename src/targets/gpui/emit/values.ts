@@ -27,6 +27,15 @@ export function lengthNumber(value: LengthValue, ctx: GpuiEmitContext): number {
   if (value.kind === 'expression') {
     throw new Error(`gpui target does not support prop expression lengths: ${value.name}`)
   }
+  if (value.value.unit === '%') {
+    // Scale-anchor children carry inset/sizes as parent-relative percentages.
+    // GPUI's chain API expects absolute px, and the call site doesn't have
+    // the parent dimension here — surface the gap explicitly rather than
+    // silently emitting the bare percent value as if it were px.
+    throw new Error(
+      `gpui target does not yet support '%' lengths (Scale-anchor child); value=${value.value.value}%`,
+    )
+  }
   return value.value.value
 }
 
