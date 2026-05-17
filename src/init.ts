@@ -561,7 +561,6 @@ async function compileForInit(
 ): Promise<DNode> {
   return compile(raw, {
     registry,
-    detachUnregisteredInstances: true,
     tokenMap: design.tokenMap,
     tokenValueMap: design.tokenValueMap,
     tokenColorMap: design.tokenColorMap,
@@ -579,7 +578,6 @@ async function compileUsageForInit(
   return compile(raw, {
     registry,
     detachRootInstance: true,
-    detachUnregisteredInstances: true,
     tokenMap: design.tokenMap,
     tokenValueMap: design.tokenValueMap,
     tokenColorMap: design.tokenColorMap,
