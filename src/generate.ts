@@ -308,13 +308,11 @@ export async function ensureRegistryForRaw(
         cfigmaBin: opts.cfigmaBin,
       })
       if (!source) {
-        initialized.add(key)
-        console.warn(
-          `pixpec generate: INSTANCE references unregistered component key ${key}, ` +
-            `but no open non-remote COMPONENT/COMPONENT_SET with that key was found; ` +
-            `falling back to detached raw subtree output.`,
+        throw new Error(
+          `pixpec init: INSTANCE references unregistered component key ${key}, ` +
+            `and no open non-remote COMPONENT/COMPONENT_SET with that key was found. ` +
+            `Open the source library file in a tab (e.g. via cfigma) and re-run init.`,
         )
-        continue
       }
       initialized.add(key)
       console.log(
