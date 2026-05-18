@@ -946,6 +946,14 @@ function writePath(
       target.cornerRadius = { tl: scalar, tr: scalar, br: scalar, bl: scalar };
     }
   }
+  // Same shape-upgrade for flip: master without any flip needs a stub
+  // composite so flip.x / flip.y promotions can be written as expressions.
+  if (parts.length === 2 && parts[0] === "flip") {
+    const existing = target.flip;
+    if (!existing || typeof existing !== "object") {
+      target.flip = { x: false, y: false };
+    }
+  }
   let current = target;
   for (const part of parts.slice(0, -1)) {
     const next = current[part];

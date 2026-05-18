@@ -114,6 +114,16 @@ export class DesignAstTypeTransformer {
     ) {
       return "length";
     }
+    // Check Value<T> wrappers BEFORE the bare `\bstring\b` fallback. `Value<T>`
+    // expands through `TokenRef = string`, so `Value<boolean>` contains the
+    // literal token "string" in its union — without these specific checks the
+    // bare-string fallback would misclassify booleans/numbers as strings.
+    if (/\bValue\s*<\s*boolean\s*>/.test(expanded)) {
+      return "boolean";
+    }
+    if (/\bValue\s*<\s*number\s*>/.test(expanded)) {
+      return "number";
+    }
     if (/\bValue\s*<\s*string\s*>/.test(expanded) || /\bstring\b/.test(expanded)) {
       return "string";
     }
@@ -124,10 +134,10 @@ export class DesignAstTypeTransformer {
     ) {
       return "string";
     }
-    if (/\bValue\s*<\s*boolean\s*>/.test(expanded) || /\bboolean\b/.test(expanded)) {
+    if (/\bboolean\b/.test(expanded)) {
       return "boolean";
     }
-    if (/\bValue\s*<\s*number\s*>/.test(expanded) || /\bnumber\b/.test(expanded)) {
+    if (/\bnumber\b/.test(expanded)) {
       return "number";
     }
     throw new Error(`pixpec init: unsupported DNode field type ${JSON.stringify(typeText)}`);

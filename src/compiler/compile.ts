@@ -674,6 +674,26 @@ function buildBase(
   if (typeof n.opacity === "number" && n.opacity < 1) out.opacity = n.opacity;
   if (typeof n.rotation === "number" && Math.abs(n.rotation) >= 0.01)
     out.rotation = n.rotation;
+  // Flip detection: ROOT uses absoluteTransform (folds ancestor chain that
+  // won't cascade through HTML in standalone rendering); INNER uses
+  // relativeTransform (HTML cascade will combine with ROOT's flip, matching
+  // figma's cumulative behaviour). Only handle pure axis-aligned flips —
+  // when the matrix has rotation components (m[0][1] != 0 || m[1][0] != 0)
+  // the sign of m[r][r] no longer equals the scale sign, so we skip.
+  const matrix = parent ? n.relativeTransform : n.absoluteTransform;
+  if (Array.isArray(matrix) && matrix.length >= 2) {
+    const r0 = matrix[0], r1 = matrix[1];
+    const isAxisAligned =
+      Array.isArray(r0) && Array.isArray(r1) &&
+      typeof r0[0] === "number" && typeof r0[1] === "number" &&
+      typeof r1[0] === "number" && typeof r1[1] === "number" &&
+      Math.abs(r0[1]) < 0.001 && Math.abs(r1[0]) < 0.001;
+    if (isAxisAligned) {
+      const flipX = r0[0]! < 0;
+      const flipY = r1[1]! < 0;
+      if (flipX || flipY) out.flip = { x: flipX, y: flipY };
+    }
+  }
   if (parent && n.layoutPositioning === "ABSOLUTE") {
     out.absolute = {
       horizontal: axisPosition(

@@ -1,4 +1,4 @@
-import type * as ast from '@typescript/native-preview/ast'
+import * as ast from '@typescript/native-preview/ast'
 import * as f from '@typescript/native-preview/ast/factory'
 import type {
     Color,
@@ -12,7 +12,9 @@ import type {
     Value,
 } from '../../../compiler/design-ast.ts'
 import { Align, Justify, NodeKind, Sizing, StrokeAlign } from '../../../compiler/design-ast.ts'
-import { attrsFromObject, compactPaddingStyles, jsxAttr, jsxEl, propAccess } from '../ast.ts'
+import * as f from '@typescript/native-preview/ast/factory'
+import { attrsFromObject, compactPaddingStyles, jsxAttr, jsxEl, propAccess, propertyAssignment } from '../ast.ts'
+import { templateString } from '../styles.ts'
 import {
     cssColorLiteral,
     isCornerRadii,
@@ -321,6 +323,33 @@ export async function emitContainer(n: DFlex | DStack | DBox, ctx: Ctx, parent: 
     if (n.children?.some((c) => isAbsoluteNode(c))) {
         styles.position = 'relative'
     }
+    // Apply flip from figma transform matrix as CSS scaleX/Y(-1). HTML
+    // cascade composes nested flips the same way figma's cumulative does.
+    // Emit as inline `style={{ transform: ... }}` rather than Panda's
+    // `transform` JSX prop — Panda statically extracts CSS at build time, so
+    // runtime template-literal values would produce a hash class with no
+    // matching rule. inline style hits the browser parser directly.
+    const flipExpr = flipTransformExpr(n.flip)
+    let flipStyleAttr: ast.JsxAttribute | undefined
+    if (flipExpr !== undefined) {
+        flipStyleAttr = f.createJsxAttribute(
+            f.createIdentifier('style'),
+            f.createJsxExpression(
+                undefined,
+                f.createObjectLiteralExpression(
+                    [
+                        propertyAssignment(
+                            f.createIdentifier('transform'),
+                            typeof flipExpr === 'string'
+                                ? f.createStringLiteral(flipExpr)
+                                : flipExpr,
+                        ),
+                    ],
+                    false,
+                ),
+            ),
+        )
+    }
 
     // pick panda pattern
     const tag = direction === 'row' ? 'Flex' : direction === 'column' ? 'Stack' : 'Box'
@@ -335,6 +364,7 @@ export async function emitContainer(n: DFlex | DStack | DBox, ctx: Ctx, parent: 
     }
     const attrs = attrsFromObject(compact)
     if (promotedInsetBorderAttr) attrs.push(promotedInsetBorderAttr)
+    if (flipStyleAttr) attrs.push(flipStyleAttr)
     const squircleRadius =
         n.cornerSmoothing &&
         n.cornerSmoothing > 0 &&
@@ -472,4 +502,49 @@ function insideCssBorderLayoutInsetPx(n: DFlex | DStack | DBox): number {
 
 function isRenderBoundsFromAbsoluteChild(n: DFlex | DStack | DBox): boolean {
     return n.children.some((child) => isAbsoluteNode(child))
+}
+
+// Build the inline-style `transform` value for a figma flip. Returns:
+//   undefined  — both axes are positive (no transform)
+//   string     — literal flip only (e.g. "scaleX(-1)")
+//   AST expr   — at least one axis is a prop expression; emits a template
+//                literal like `${props.X ? 'scaleX(-1)' : ''} ${props.Y ?
+//                'scaleY(-1)' : ''}` so each usage applies its own per-axis
+//                flip at runtime.
+function flipTransformExpr(
+    flip: { x: unknown; y: unknown } | undefined,
+): string | ast.Expression | undefined {
+    if (!flip) return undefined
+    const xExpr = expressionPropName(flip.x)
+    const yExpr = expressionPropName(flip.y)
+    const xLit = flip.x === true
+    const yLit = flip.y === true
+    const xPiece = !!flip.x
+    const yPiece = !!flip.y
+    if (!xPiece && !yPiece) return undefined
+    // Pure literal path: just emit the CSS string.
+    if (!xExpr && !yExpr) {
+        const parts: string[] = []
+        if (xLit) parts.push('scaleX(-1)')
+        if (yLit) parts.push('scaleY(-1)')
+        return parts.length ? parts.join(' ') : undefined
+    }
+    // Expression-driven: build `${flipX ? 'scaleX(-1)' : ''} ${flipY ?
+    // 'scaleY(-1)' : ''}` using JS conditional expressions.
+    const conditionalPart = (prop: unknown, css: string): ast.Expression => {
+        if (prop === true) return f.createStringLiteral(css)
+        const name = expressionPropName(prop)
+        if (!name) return f.createStringLiteral('')
+        return f.createConditionalExpression(
+            propAccess(name),
+            f.createToken(ast.SyntaxKind.QuestionToken),
+            f.createStringLiteral(css),
+            f.createToken(ast.SyntaxKind.ColonToken),
+            f.createStringLiteral(''),
+        )
+    }
+    return templateString(['', ' ', ''], [
+        conditionalPart(flip.x, 'scaleX(-1)'),
+        conditionalPart(flip.y, 'scaleY(-1)'),
+    ])
 }

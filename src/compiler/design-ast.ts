@@ -267,6 +267,14 @@ export interface DNodeBase {
   opacity?: number;
   /** Rotation in degrees CCW. */
   rotation?: number;
+  /** Per-axis flip from the figma 2x3 affine matrix. INNER nodes carry
+   *  relativeTransform-derived sign; ROOT nodes fold in ancestor cumulative
+   *  flip via absoluteTransform so a usage rendered in isolation matches the
+   *  figma reference (which always uses cumulative). HTML transform cascade
+   *  composes parent × child naturally, so internal flips cancel just like
+   *  figma's geometry. Promotion may replace either axis with a Value<boolean>
+   *  expression when usages differ from the master. */
+  flip?: { x: Value<boolean>; y: Value<boolean> };
   /** Absolute positioning metadata. Omitted for ordinary flow children. */
   absolute?: AbsoluteLayout;
   /** Offset from the node's design box to the exported render bounds. */

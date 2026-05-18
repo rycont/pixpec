@@ -29,6 +29,8 @@ abstract class DContainerNode<T extends DFlex | DStack | DBox> extends DNodeClas
       "shadow",
       "cornerRadius",
       "cornerSmoothing",
+      "flip.x",
+      "flip.y",
       "clip",
     ];
     if (this.node.padding) {

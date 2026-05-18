@@ -112,6 +112,12 @@ export interface RawNode {
   absoluteRenderBounds?: { x: number; y: number; width: number; height: number } | null;
   /** Rotation in degrees CCW. */
   rotation?: number;
+  /** Figma's 2x3 affine matrix relative to parent: [[xx,xy,tx],[yx,yy,ty]].
+   *  Carries the node's own scale/flip (sx = xx sign when no rotation). */
+  relativeTransform?: number[][];
+  /** Cumulative absolute 2x3 affine matrix. ROOT nodes use this to fold the
+   *  ancestor chain's flips that won't cascade through HTML rendering. */
+  absoluteTransform?: number[][];
   /** Layer-level opacity (0..1). */
   opacity?: number;
   /** When parent is auto-layout, ABSOLUTE removes child from flex flow. */

@@ -295,6 +295,20 @@ async function dumpNode(node) {
   const absoluteRenderBounds = safe(() => node.absoluteRenderBounds, undefined);
   if (absoluteRenderBounds !== undefined) out.absoluteRenderBounds = clean(absoluteRenderBounds);
   if (typeof node.rotation === 'number' && Math.abs(node.rotation) >= 0.01) out.rotation = node.rotation;
+  // Capture relative + absolute 2x3 affine matrices so compile can derive the
+  // per-node flip (relative for INNER, absolute for ROOT — INNER cascades via
+  // HTML, ROOT needs the ancestor cumulative since the chain isn't rendered).
+  const captureMatrix = (key) => {
+    const m = safe(() => node[key], undefined);
+    if (!m || typeof m !== 'object') return;
+    const r0 = m[0], r1 = m[1];
+    if (!r0 || !r1) return;
+    if (typeof r0[0] !== 'number' || typeof r0[1] !== 'number' || typeof r0[2] !== 'number') return;
+    if (typeof r1[0] !== 'number' || typeof r1[1] !== 'number' || typeof r1[2] !== 'number') return;
+    out[key] = [[r0[0], r0[1], r0[2]], [r1[0], r1[1], r1[2]]];
+  };
+  captureMatrix('relativeTransform');
+  captureMatrix('absoluteTransform');
   if (node.type === 'INSTANCE' && typeof node.scaleFactor === 'number') out.scaleFactor = node.scaleFactor;
   if (typeof node.opacity === 'number' && node.opacity < 0.999) out.opacity = node.opacity;
   if (node.layoutPositioning) out.layoutPositioning = node.layoutPositioning;
