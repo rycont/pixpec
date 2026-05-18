@@ -40,7 +40,7 @@ function targetSidecarRelativePath(ctx: Ctx, filename: string): string {
     if (base === 'generated' || base === 'breakdown') {
         return `../.pixpec/assets/${filename}`
     }
-    return `.pixpec/assets/${filename}`
+    return `./.pixpec/assets/${filename}`
 }
 
 /** Build a relative import path from `<outputDir>` to the shared asset file.
