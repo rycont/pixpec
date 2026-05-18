@@ -93,16 +93,34 @@ export async function exportNodeSvg(opts: DumpOptions): Promise<string> {
     if (!node) return { error: 'node_not_found: ' + ${JSON.stringify(opts.nodeId)} };
     try {
       let bytes = await node.exportAsync({ format: 'SVG_STRING' });
-      // figma rounds viewBox/width/height to integers in SVG export even when
-      // the source vector has fractional dimensions, so the path ends up
-      // occupying <100% of the SVG box. Patch viewBox/width/height back to
-      // the raw figma node size (which matches the path's true bbox).
+      // Reconcile two figma quirks: SVG export sometimes rounds viewBox to
+      // integers while paths use fractional coords (paths overflow the box),
+      // and other times node.width/height are integer-rounded while viewBox
+      // carries the precise float dimensions (overwriting would shrink the
+      // box and clip paths). Prefer the value with sub-pixel precision; if
+      // both look integer, take MAX so the box never shrinks.
       const w = node.width, h = node.height;
       if (typeof w === 'number' && typeof h === 'number' && w > 0 && h > 0) {
+        const vbMatch = bytes.match(/viewBox="([^"]+)"/);
+        let vbW = w, vbH = h;
+        if (vbMatch) {
+          const parts = vbMatch[1].trim().split(/\\s+/).map(Number);
+          if (parts.length === 4 && parts.every(function (n) { return Number.isFinite(n); })) {
+            const pickPrecise = function (a, b) {
+              const aFrac = Math.abs(a - Math.round(a)) > 0.001;
+              const bFrac = Math.abs(b - Math.round(b)) > 0.001;
+              if (aFrac && !bFrac) return a;
+              if (!aFrac && bFrac) return b;
+              return Math.max(a, b);
+            };
+            vbW = pickPrecise(parts[2], w);
+            vbH = pickPrecise(parts[3], h);
+          }
+        }
         bytes = bytes
-          .replace(/viewBox="[^"]+"/, 'viewBox="0 0 ' + w + ' ' + h + '"')
-          .replace(/(\\s)width="[^"]+"/, '$1width="' + w + '"')
-          .replace(/(\\s)height="[^"]+"/, '$1height="' + h + '"');
+          .replace(/viewBox="[^"]+"/, 'viewBox="0 0 ' + vbW + ' ' + vbH + '"')
+          .replace(/(\\s)width="[^"]+"/, '$1width="' + vbW + '"')
+          .replace(/(\\s)height="[^"]+"/, '$1height="' + vbH + '"');
       }
       return { svg: bytes };
     } catch (e) {
@@ -416,15 +434,31 @@ async function dumpNode(node) {
   if (VECTORLIKE.has(node.type)) {
     try {
       let bytes = await node.exportAsync({ format: 'SVG_STRING' });
-      // Same fractional-viewBox correction as exportNodeSvg (line ~95):
-      // figma rounds the exported viewBox to integers, so patch back to the
-      // node's true width/height so the path occupies 100% of the SVG box.
+      // Prefer sub-pixel-precise dim between existing viewBox and node dim.
+      // See exportNodeSvg (line ~95) for the rationale: figma is inconsistent
+      // between exports, sometimes rounding viewBox and sometimes node dims.
       const w = node.width, h = node.height;
       if (typeof w === 'number' && typeof h === 'number' && w > 0 && h > 0) {
+        const vbMatch = bytes.match(/viewBox="([^"]+)"/);
+        let vbW = w, vbH = h;
+        if (vbMatch) {
+          const parts = vbMatch[1].trim().split(/\\s+/).map(Number);
+          if (parts.length === 4 && parts.every((n) => Number.isFinite(n))) {
+            const pickPrecise = (a, b) => {
+              const aFrac = Math.abs(a - Math.round(a)) > 0.001;
+              const bFrac = Math.abs(b - Math.round(b)) > 0.001;
+              if (aFrac && !bFrac) return a;
+              if (!aFrac && bFrac) return b;
+              return Math.max(a, b);
+            };
+            vbW = pickPrecise(parts[2], w);
+            vbH = pickPrecise(parts[3], h);
+          }
+        }
         bytes = bytes
-          .replace(/viewBox="[^"]+"/, 'viewBox="0 0 ' + w + ' ' + h + '"')
-          .replace(/(\s)width="[^"]+"/, '$1width="' + w + '"')
-          .replace(/(\s)height="[^"]+"/, '$1height="' + h + '"');
+          .replace(/viewBox="[^"]+"/, 'viewBox="0 0 ' + vbW + ' ' + vbH + '"')
+          .replace(/(\\s)width="[^"]+"/, '$1width="' + vbW + '"')
+          .replace(/(\\s)height="[^"]+"/, '$1height="' + vbH + '"');
       }
       out.svg = bytes;
     } catch (_) {

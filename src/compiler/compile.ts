@@ -1243,6 +1243,46 @@ function solidFillOverride(n: RawNode, opts: CompileOptions): Color {
   return value;
 }
 
+// Best-effort: return the vector's rendered fill iff it resolves to exactly
+// one visible SOLID paint. Multi-paint or gradient vectors are skipped — the
+// IR's single `fill` field can't represent them and the SVG bytes already
+// carry the geometry-attached colors.
+function svgViewBoxDim(svg: string): { w: number; h: number } | undefined {
+  const match = svg.match(/viewBox="([^"]+)"/);
+  if (!match) return undefined;
+  const parts = match[1].trim().split(/\s+/).map(Number);
+  if (parts.length !== 4 || !parts.every((n) => Number.isFinite(n))) return undefined;
+  const w = parts[2];
+  const h = parts[3];
+  if (!(w > 0 && h > 0)) return undefined;
+  return { w, h };
+}
+
+function preferPreciseLength(existing: unknown, candidate: number): typeof existing {
+  // Only override when `existing` is a px literal AND candidate is sub-pixel
+  // precise (existing is integer-rounded). Leave Fill/Hug/expression untouched.
+  if (!existing || typeof existing !== "object") return existing;
+  const rec = existing as Record<string, unknown>;
+  if (rec.kind !== "literal" || !rec.value || typeof rec.value !== "object") return existing;
+  const v = rec.value as Record<string, unknown>;
+  if (v.unit !== "px" || typeof v.value !== "number") return existing;
+  const existingPx = v.value;
+  const existingIsInt = Math.abs(existingPx - Math.round(existingPx)) < 0.001;
+  const candidateIsFrac = Math.abs(candidate - Math.round(candidate)) > 0.001;
+  if (existingIsInt && candidateIsFrac) {
+    return { kind: "literal", value: { value: candidate, unit: "px" } } as typeof existing;
+  }
+  return existing;
+}
+
+function singleSolidFillFromNode(n: RawNode, opts: CompileOptions): Color | undefined {
+  const visible = (n.fills ?? []).filter((paint) => paint.visible !== false);
+  if (visible.length !== 1 || visible[0]?.type !== "SOLID") return undefined;
+  const fill = visible[0] as RawSolidPaint;
+  const fillVarId = varId(fill.boundVariables, "color");
+  return pickColor(fill, fillVarId, opts);
+}
+
 async function compileVector(
   n: RawNode,
   opts: CompileOptions,
@@ -1251,9 +1291,14 @@ async function compileVector(
   const w = absoluteAxisSize(n, parent, "horizontal", opts);
   const h = absoluteAxisSize(n, parent, "vertical", opts);
   const fillProp = directPaintBinding(n, opts);
+  // Always surface the rendered fill when the vector resolves to a single
+  // visible SOLID paint. visualDiff compares IR fields directly, so without
+  // a fill here master vs usage always look identical even when the usage
+  // actually paints a different color (typical for nested instances where
+  // the override lives on a parent and never reaches this node's `overrides`).
   const fillOverride = overriddenField(n, opts, "fills")
     ? solidFillOverride(n, opts)
-    : undefined;
+    : singleSolidFillFromNode(n, opts);
   let svg = n.svg;
   if (!svg && opts.exportSvg) {
     svg = await exportSvgForRawNode(n, opts);
@@ -1265,11 +1310,19 @@ async function compileVector(
         `pixpec compile: SVG on ${n.name} (${n.id}) but no writeAsset hook provided`,
       );
     }
+    // Figma's node.width/height are integer-rounded but the SVG it exports
+    // carries the precise figure dim in viewBox. Using the rounded values
+    // for the impl box (e.g. 21 vs viewBox's 20.07) leaves preserveAspectRatio
+    // ="none" stretching the figure anisotropically — curves don't match the
+    // figma reference. Prefer the viewBox dims when they're sub-pixel precise.
+    const precise = svgViewBoxDim(svg);
+    const wOut = precise ? preferPreciseLength(w, precise.w) : w;
+    const hOut = precise ? preferPreciseLength(h, precise.h) : h;
     return {
       ...buildBase(n, opts, parent),
       kind: NodeKind.Vector,
-      width: w,
-      height: h,
+      width: wOut,
+      height: hOut,
       fill: fillProp
         ? { kind: "expression", type: "prop", name: fillProp }
         : fillOverride
