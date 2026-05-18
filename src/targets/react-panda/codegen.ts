@@ -177,19 +177,26 @@ function applyAxisPosition(
     if (!axis) return
     if (axis.kind === 'center') {
         // `left:50%; transform:translate(-50% + delta)` — center anchor moves
-        // the child to the parent's midpoint, then offsets by delta.
+        // the child to the parent's midpoint, then offsets by delta. When BOTH
+        // axes are center, both calls land here; append (don't overwrite)
+        // `style.transform` so the second axis doesn't drop the first one's
+        // translate.
         style[startKey] = '50%'
         const deltaProp = sizeToProp(axis.delta, ctx.env.remBase)
         const translatePct = startKey === 'left' ? 'translateX(-50%)' : 'translateY(-50%)'
         const translateAxis = startKey === 'left' ? 'translateX' : 'translateY'
-        if (
+        const zeroDelta =
             isPlainPxLiteral(axis.delta) &&
             typeof (axis.delta as { value: { value: number } }).value.value === 'number' &&
             (axis.delta as { value: { value: number } }).value.value === 0
-        ) {
-            style.transform = translatePct
-        } else if (typeof deltaProp === 'string' || typeof deltaProp === 'number') {
-            style.transform = `${translatePct} ${translateAxis}(${deltaProp})`
+        const piece = zeroDelta
+            ? translatePct
+            : typeof deltaProp === 'string' || typeof deltaProp === 'number'
+              ? `${translatePct} ${translateAxis}(${deltaProp})`
+              : undefined
+        if (piece) {
+            const prev = typeof style.transform === 'string' ? style.transform : undefined
+            style.transform = prev ? `${prev} ${piece}` : piece
         }
         return
     }
