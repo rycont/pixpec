@@ -128,6 +128,12 @@ const FIELD_TO_CSS_PROPERTY: Record<string, StaticCssProperty> = {
   cornerRadius: "borderRadius",
   "border.width": "borderWidth",
   "border.paint": "borderColor",
+  // Vector fill is rendered via SVG currentColor, driven by CSS `color` on a
+  // surrounding Panda wrapper. Bucket promoted Fill props under `color` so
+  // every observed value (token path or literal RGB) is registered for Panda
+  // staticCss — without this, the wrapper's color prop resolves to an empty
+  // class and the SVG paints its inherited (black) color.
+  fill: "color",
 };
 
 type StaticCssProperty = (typeof STATIC_CSS_PROPERTIES)[number];
@@ -450,9 +456,12 @@ export async function init(opts: {
   for (const target of cfg.targets) {
     const implDir = join(componentDir, "impl", target);
     await mkdir(implDir, { recursive: true });
+    const implSource = emitImpl(componentName, component.defs, variantMetas, target);
+    // prettier parses TS/TSX only; gpui emits Rust so it must skip fmt().
+    const formatted = target === "gpui" ? implSource : await fmt(implSource);
     await writeFile(
-      join(implDir, target === "gpui" ? "mod.go" : "index.tsx"),
-      await fmt(emitImpl(componentName, component.defs, variantMetas, target)),
+      join(implDir, target === "gpui" ? "mod.rs" : "index.tsx"),
+      formatted,
     );
   }
 
@@ -726,7 +735,20 @@ async function detectPromotions(
       const usageNode =
         usageNodes.get(nodeId) ?? usageNodesByBareId.get(stripPrefix(nodeId));
       if (!usageNode || usageNode.kind !== masterNode.kind) continue;
-      for (const diff of masterNode.visualDiff(usageNode)) {
+      for (const rawDiff of masterNode.visualDiff(usageNode)) {
+        // cornerRadius can be scalar OR a CornerRadii composite; if either
+        // side is composite, split into 4 per-corner diffs so promotion can
+        // produce primitive (length) props instead of one opaque object.
+        const splits =
+          rawDiff.field === "cornerRadius" &&
+          (isCornerRadiiObj(rawDiff.before) || isCornerRadiiObj(rawDiff.after))
+            ? (["tl", "tr", "br", "bl"] as const).map((corner) => ({
+                field: `cornerRadius.${corner}`,
+                before: cornerOf(rawDiff.before, corner),
+                after: cornerOf(rawDiff.after, corner),
+              })).filter((d) => stableJsonStr(d.before) !== stableJsonStr(d.after))
+            : [rawDiff];
+        for (const diff of splits) {
         const prop = promotedPropName(
           masterNode.sourceName ?? "node",
           diff.field,
@@ -749,6 +771,7 @@ async function detectPromotions(
           },
           count: (counts.get(key)?.count ?? 0) + 1,
         });
+        }
       }
     }
   }
@@ -912,6 +935,17 @@ function writePath(
   value: unknown,
 ): void {
   const parts = path.split(".").filter(Boolean);
+  // Special-case cornerRadius.<corner>: scalar/undefined master must first
+  // be upgraded to a CornerRadii composite (spreading the scalar to every
+  // corner) so individual corners can be promoted to per-prop expressions
+  // without losing the existing radius on untouched corners.
+  if (parts.length === 2 && parts[0] === "cornerRadius") {
+    const existing = target.cornerRadius;
+    if (!existing || !isCornerRadiiObj(existing)) {
+      const scalar = existing ?? null;
+      target.cornerRadius = { tl: scalar, tr: scalar, br: scalar, bl: scalar };
+    }
+  }
   let current = target;
   for (const part of parts.slice(0, -1)) {
     const next = current[part];
@@ -1288,6 +1322,9 @@ function emitImpl(
   if (target === "react-panda") {
     return emitReactPandaImpl(componentName, defs, variants);
   }
+  if (target === "gpui") {
+    return emitGpuiImpl(componentName, defs, variants);
+  }
   const variantProps = Object.entries(defs)
     .filter(([, def]) => def.kind === "variant")
     .map(([name]) => name);
@@ -1385,6 +1422,86 @@ export const impl: FC<${componentName}Props> = (props) => {
   const key = ${keyExpr}
   const Picked = (VARIANTS as unknown as Record<string, FC<${componentName}Props>>)[key] ?? V_${generated[0]?.id}
   return Picked ? <Picked {...props} /> : null
+}
+`;
+}
+
+function emitGpuiImpl(
+  componentName: string,
+  defs: Record<string, PropDef>,
+  variants: Array<{ variant: VariantSource; path: string; ast: DNode }>,
+): string {
+  // GPUI dispatcher: include each variant's generated `index.rs` as a `#[path]`
+  // submodule (each defines its own `pub struct Generated; impl Render`),
+  // expose a public component struct keyed on the variant props, and pick a
+  // variant at render time by composing the same `Name=Value|…` key the
+  // react-panda dispatcher uses. Variant `Generated` types differ per
+  // submodule, so we erase them via `cx.new(|_| …).into_any_element()` —
+  // `Entity<V: Render>` implements `IntoElement` in gpui.
+  const variantProps = Object.entries(defs)
+    .filter(([, def]) => def.kind === "variant")
+    .map(([name]) => name);
+  const entries = variants.map((v) => ({
+    modName: `v_${safeId(v.variant.key ?? v.variant.id).toLowerCase()}`,
+    importPath: `../../${v.path}/gpui/index.rs`,
+    key: variantProps
+      .map((name) => `${name}=${String(v.variant.props[name])}`)
+      .join("|"),
+  }));
+  // Dedupe by key so a duplicate match arm never sneaks in (which would be a
+  // hard compile error). Init guarantees unique variant-prop combos so this
+  // only matters when variantProps is empty (all keys collapse to "").
+  const seen = new Set<string>();
+  const dedup = entries.filter((e) => {
+    if (seen.has(e.key)) return false;
+    seen.add(e.key);
+    return true;
+  });
+  const modDecls = entries
+    .map((e) => `#[path = ${JSON.stringify(e.importPath)}]\nmod ${e.modName};`)
+    .join("\n");
+  const fields = variantProps
+    .map((name) => `    pub ${name}: String,`)
+    .join("\n");
+  // Empty braced struct is valid Rust and keeps `Default` derivable for the
+  // zero-variant-prop case.
+  const structBody = fields ? `{\n${fields}\n}` : "{}";
+  const keyExpr =
+    variantProps.length === 0
+      ? `String::new()`
+      : `format!(${JSON.stringify(
+          variantProps.map((n) => `${n}={}`).join("|"),
+        )}, ${variantProps.map((n) => `self.${n}`).join(", ")})`;
+  const arms = dedup
+    .map(
+      (e) =>
+        `            ${JSON.stringify(e.key)} => cx.new(|_| ${e.modName}::Generated).into_any_element(),`,
+    )
+    .join("\n");
+  const fallback = entries[0]
+    ? `cx.new(|_| ${entries[0].modName}::Generated).into_any_element()`
+    : `gpui::div().into_any_element()`;
+  return `// AUTO-GENERATED by pixpec init.
+// Component: ${componentName}
+
+#![allow(unused_imports, non_snake_case)]
+
+use gpui::{div, AnyElement, Context, IntoElement, Render, Window};
+use gpui::prelude::*;
+
+${modDecls}
+
+#[derive(Clone, Default)]
+pub struct ${componentName} ${structBody}
+
+impl Render for ${componentName} {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let key = ${keyExpr};
+        match key.as_str() {
+${arms}
+            _ => ${fallback},
+        }
+    }
 }
 `;
 }
@@ -1550,7 +1667,11 @@ function collectStaticTokens(
  *  rem (matching codegen) so cssgen emits the corresponding utility class. */
 function staticCssValueFromProp(value: unknown): string | undefined {
   if (typeof value === "string") {
-    return isStaticCssValue(value) ? value : undefined;
+    // Bare token path (e.g. "content.standard.primary") — Panda recognises
+    // these as design tokens and emits the var() form for matching utility
+    // classes. Pass through so staticCss enumerates the token.
+    if (isStaticCssValue(value) || looksLikeTokenPath(value)) return value;
+    return undefined;
   }
   if (!value || typeof value !== "object") return undefined;
   const rec = value as Record<string, unknown>;
@@ -1561,8 +1682,33 @@ function staticCssValueFromProp(value: unknown): string | undefined {
       if (v.unit === "rem") return `${+v.value.toFixed(6)}rem`;
       return `${v.value}${v.unit}`;
     }
+    // Literal RGB color → CSS string Panda can extract as a utility class.
+    // Without this, raw figma colors with no token binding never reach
+    // staticCss and render as inherited (black) at runtime.
+    if (typeof v.r === "number" && typeof v.g === "number" && typeof v.b === "number") {
+      const a = typeof v.a === "number" ? v.a : 1;
+      if (a >= 1) {
+        return `#${[v.r, v.g, v.b].map((n) => Number(n).toString(16).padStart(2, "0")).join("")}`;
+      }
+      // Match capture's colorRecordToCss formatting (no spaces) so the
+      // staticCss-registered value and the runtime prop value land in the
+      // exact same Panda class lookup key.
+      return `rgba(${v.r},${v.g},${v.b},${+a.toFixed(6)})`;
+    }
   }
   return undefined;
+}
+
+function looksLikeTokenPath(value: string): boolean {
+  return (
+    value.includes(".") &&
+    !value.startsWith("#") &&
+    !value.startsWith("rgb") &&
+    !value.startsWith("hsl") &&
+    !value.startsWith("var(") &&
+    !/^\d/.test(value) &&
+    !/[\s/(]/.test(value)
+  );
 }
 
 function cssPropertyForField(field: string): StaticCssProperty | undefined {
@@ -1792,6 +1938,26 @@ function literal(value: unknown): string {
 
 function stableJson(value: unknown): string {
   return JSON.stringify(sortJson(value));
+}
+
+const stableJsonStr = stableJson;
+
+function isCornerRadiiObj(v: unknown): boolean {
+  return (
+    !!v &&
+    typeof v === "object" &&
+    !Array.isArray(v) &&
+    !("kind" in (v as Record<string, unknown>)) &&
+    ("tl" in (v as Record<string, unknown>) ||
+      "tr" in (v as Record<string, unknown>) ||
+      "br" in (v as Record<string, unknown>) ||
+      "bl" in (v as Record<string, unknown>))
+  );
+}
+
+function cornerOf(v: unknown, corner: "tl" | "tr" | "br" | "bl"): unknown {
+  if (isCornerRadiiObj(v)) return (v as Record<string, unknown>)[corner];
+  return v;
 }
 
 function sortJson(value: unknown): unknown {

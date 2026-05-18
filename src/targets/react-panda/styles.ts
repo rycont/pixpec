@@ -6,6 +6,7 @@ import * as f from '@typescript/native-preview/ast/factory'
 import {
     callExpression,
     jsxAttr,
+    jsxEl,
     jsxSelf,
     nodeFlagsConst,
     noTokenFlags,
@@ -14,6 +15,7 @@ import {
     propertyAssignment,
     stringLiteral,
     styleAttr,
+    styledTag,
 } from './ast.ts'
 import { cssBackgroundLayer } from './data-lowerer.ts'
 
@@ -188,16 +190,26 @@ export function tintSwapJsx(
     if (!fillProp) {
         return normalSvg
     }
-    const tintedSvg = jsxSelf(
-        tinted,
-        svgAttrs(styleAttr({ ...baseStyle, color: propAccess(fillProp) })),
+    // Wrap tinted SVG in a `<styled.span color={props.X}>` so Panda's JSX prop
+    // pipeline resolves whatever the value is: design-token paths get
+    // converted to their CSS variable, raw hex/rgb get matched to a staticCss-
+    // pre-emitted utility class. `display: contents` keeps the wrapper out of
+    // the box model. init.ts's collectStaticTokens registers every observed
+    // value under the `color` property so Panda's cssgen emits the matching
+    // classes — without that registration, raw values produce hash classes
+    // with no rule and the SVG paints its inherited (black) color.
+    const tintedSvg = jsxSelf(tinted, svgAttrs(styleAttr(baseStyle)))
+    const tintedWrap = jsxEl(
+        styledTag('span'),
+        [jsxAttr('color', propAccess(fillProp)), styleAttr({ display: 'contents' })],
+        [tintedSvg],
     )
     return f.createJsxExpression(
         undefined,
         f.createConditionalExpression(
             propAccess(fillProp),
             QUESTION,
-            tintedSvg as unknown as ast.Expression,
+            tintedWrap as unknown as ast.Expression,
             COLON,
             normalSvg as unknown as ast.Expression,
         ),
