@@ -80,7 +80,7 @@ export async function codegenGpui(root: DNode, ctx: CodegenContext): Promise<Cod
 
 #![allow(unused_imports)]
 
-use gpui::{div, img, px, rgba, rgb, Context, FontWeight, IntoElement, ObjectFit, Render, Window};
+use gpui::{div, img, px, relative, rgba, rgb, Context, FontWeight, IntoElement, ObjectFit, Render, Window};
 use gpui::prelude::*;
 
 pub struct Generated;

@@ -16,8 +16,13 @@ export async function emitNode(
   parentDirection?: FlowDirection,
 ): Promise<string> {
   switch (n.kind) {
-    case NodeKind.DataScope:
-      return emitNode(n.child, ctx, indent, parentDirection)
+    case NodeKind.DataScope: {
+      const defaults: Record<string, unknown> = { ...(ctx.propDefaults ?? {}) }
+      for (const [name, entry] of Object.entries(n.data)) {
+        if (entry?.default !== undefined) defaults[name] = entry.default
+      }
+      return emitNode(n.child, { ...ctx, propDefaults: defaults }, indent, parentDirection)
+    }
     case NodeKind.Flex:
     case NodeKind.Stack:
     case NodeKind.Box:

@@ -19,24 +19,35 @@ export function isAxisLength(value: unknown): value is LengthValue {
 }
 
 export function lengthExpr(value: LengthValue, ctx: GpuiEmitContext): string {
-  return scaledPx(lengthNumber(value, ctx), ctx)
+  const resolved = resolveLength(value, ctx)
+  if (resolved.kind === 'pct') return `relative(${num(resolved.value / 100)})`
+  return scaledPx(resolved.value, ctx)
+}
+
+type ResolvedLength = { kind: 'px'; value: number } | { kind: 'pct'; value: number }
+
+function resolveLength(value: LengthValue, ctx: GpuiEmitContext): ResolvedLength {
+  if (typeof value === 'string') return { kind: 'px', value: ctx.tokenValueMap[value] ?? 0 }
+  if (value.kind === 'expression') {
+    // GPUI emits per-variant baked code (one .rs per variant, no runtime
+    // prop indirection), so a prop-expression length resolves to the
+    // variant's default carried on the surrounding DataScope.
+    const inDefaults = ctx.propDefaults?.[value.name]
+    if (inDefaults !== undefined) return resolveLength(inDefaults as LengthValue, ctx)
+    throw new Error(`gpui target: prop-expression length '${value.name}' has no default in scope`)
+  }
+  if (value.value.unit === '%') return { kind: 'pct', value: value.value.value }
+  return { kind: 'px', value: value.value.value }
 }
 
 export function lengthNumber(value: LengthValue, ctx: GpuiEmitContext): number {
-  if (typeof value === 'string') return ctx.tokenValueMap[value] ?? 0
-  if (value.kind === 'expression') {
-    throw new Error(`gpui target does not support prop expression lengths: ${value.name}`)
-  }
-  if (value.value.unit === '%') {
-    // Scale-anchor children carry inset/sizes as parent-relative percentages.
-    // GPUI's chain API expects absolute px, and the call site doesn't have
-    // the parent dimension here — surface the gap explicitly rather than
-    // silently emitting the bare percent value as if it were px.
+  const resolved = resolveLength(value, ctx)
+  if (resolved.kind === 'pct') {
     throw new Error(
-      `gpui target does not yet support '%' lengths (Scale-anchor child); value=${value.value.value}%`,
+      `gpui target: '%' length cannot collapse to raw px (need parent dim); value=${resolved.value}%`,
     )
   }
-  return value.value.value
+  return resolved.value
 }
 
 export function scaledPx(value: number | ExpressionValue, ctx: GpuiEmitContext): string {
@@ -73,7 +84,11 @@ export function colorLiteralFromValue(
     // TokenRef — look up in token color map (css string)
     return parseCssColor(ctx.tokenColorMap[value])
   }
-  if (value.kind === 'expression') return undefined
+  if (value.kind === 'expression') {
+    const resolved = ctx.propDefaults?.[value.name]
+    if (resolved !== undefined) return colorLiteralFromValue(resolved as Color | Paint, ctx)
+    return undefined
+  }
   // literal
   const v = value.value
   if (!v) return undefined

@@ -1,7 +1,7 @@
 import type { AxisPosition, DNode } from '../../../compiler/design-ast.ts'
 import type { GpuiChain } from './chain.ts'
 import type { GpuiEmitContext } from './context.ts'
-import { lengthNumber, scaledPx, scaledPxWithOffset } from './values.ts'
+import { lengthExpr, lengthNumber, scaledPx, scaledPxWithOffset } from './values.ts'
 
 export function addNodeLayout(
   chain: GpuiChain,
@@ -25,9 +25,25 @@ function applyAxis(
 ): void {
   if (!axis || axis.kind !== 'inset') return
   if (axis.start !== undefined) {
-    chain.method(startKey, scaledPxWithOffset(lengthNumber(axis.start, ctx), ctx, offset))
+    chain.method(startKey, insetExpr(axis.start, ctx, offset))
   }
   if (axis.end !== undefined) {
-    chain.method(endKey, scaledPx(lengthNumber(axis.end, ctx), ctx))
+    chain.method(endKey, insetExpr(axis.end, ctx, undefined))
   }
+}
+
+function insetExpr(
+  value: import('../../../compiler/design-ast.ts').LengthValue,
+  ctx: GpuiEmitContext,
+  offset: number | undefined,
+): string {
+  // Insets need the offset (render-bounds shift) baked into px values.
+  // For % units the offset isn't meaningful — pass through lengthExpr.
+  const isPctLiteral =
+    !!value &&
+    typeof value === 'object' &&
+    (value as { kind?: unknown }).kind === 'literal' &&
+    (value as { value?: { unit?: unknown } }).value?.unit === '%'
+  if (isPctLiteral || offset === undefined) return lengthExpr(value, ctx)
+  return scaledPxWithOffset(lengthNumber(value, ctx), ctx, offset)
 }

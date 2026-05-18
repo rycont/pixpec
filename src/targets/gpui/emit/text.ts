@@ -144,6 +144,7 @@ function sliceRuns(runs: DTextRun[], fullContent: string, byteStart: number, byt
 }
 
 function hasStyledRuns(n: DText): boolean {
+  if (process.env.PIXPEC_GPUI_DISABLE_STYLED_RUNS === '1') return false
   if (!n.runs || n.runs.length === 0) return false
   return hasDistinctColors(n.runs, n.color)
 }
