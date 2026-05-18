@@ -356,15 +356,16 @@ export class Renderer {
                 const sharp = (await import('sharp')).default
                 const captureOne = async (i: number) => {
                     const b = bounds[i]!
+                    // Snap clip to integer pixel boundaries — getBoundingClientRect
+                    // returns sub-pixel float dims and CDP's clip rounding can shift
+                    // the captured icon by one column relative to figma's PNG.
+                    const cx = Math.max(0, Math.floor(b.x))
+                    const cy = Math.max(0, Math.floor(b.y))
+                    const cw = Math.max(1, Math.ceil(b.x + b.w) - cx)
+                    const ch = Math.max(1, Math.ceil(b.y + b.h) - cy)
                     const { data } = (await cdp.send('Page.captureScreenshot', {
                         format: 'png',
-                        clip: {
-                            x: Math.max(0, b.x),
-                            y: Math.max(0, b.y),
-                            width: Math.max(1, b.w),
-                            height: Math.max(1, b.h),
-                            scale: dpr,
-                        },
+                        clip: { x: cx, y: cy, width: cw, height: ch, scale: dpr },
                         captureBeyondViewport: true,
                         fromSurface: true,
                         omitBackground: true,
@@ -631,9 +632,21 @@ async function screenshotVisualBounds(
                 `screenshotVisualBounds: selector not found or empty after shift: ${selector}`,
             )
         }
+        // Snap clip to integer pixel boundaries. getBoundingClientRect returns
+        // sub-pixel float dims; CDP's clip apparently rounds the width UP,
+        // producing a screenshot one column wider than the rendered box.
+        // Floor x/y so the screenshot's leftmost column = the box's leftmost
+        // rendered pixel (matching figma's PNG which has zero left padding);
+        // ceil width/height so we don't truncate visible content.
+        const integerClip = {
+            x: Math.floor(bounds.x),
+            y: Math.floor(bounds.y),
+            width: Math.ceil(bounds.x + bounds.width) - Math.floor(bounds.x),
+            height: Math.ceil(bounds.y + bounds.height) - Math.floor(bounds.y),
+        }
         const { data } = (await cdp.send('Page.captureScreenshot', {
             format: 'png',
-            clip: { ...bounds, scale: 1 },
+            clip: { ...integerClip, scale: 1 },
             captureBeyondViewport: true,
             fromSurface: true,
             omitBackground: true,

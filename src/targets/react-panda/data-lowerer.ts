@@ -50,7 +50,12 @@ export function sizeToPropLiteral(s: Length, remBase: number): string | number {
         return 0
     }
     if (s.unit === '%') {
-        return `${+s.value.toFixed(6)}%`
+        // toFixed(6) rounds the 7th digit, which for repeating fractions like
+        // 26/192=13.5416666... bumps the value UP to 13.541667 — when chromium
+        // multiplies that back by 192 it lands at 26.00000064, one column past
+        // figma's exact-integer render. Use 10 digits so the round-trip stays
+        // within rasterizer epsilon of the exact value.
+        return `${+s.value.toFixed(10)}%`
     }
     return px2rem(s.value, remBase)
 }

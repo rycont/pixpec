@@ -178,7 +178,11 @@ export function tintSwapJsx(
     const svgAttrs = (extra?: ast.JsxAttributeLike): ast.JsxAttributeLike[] => {
         const a: ast.JsxAttributeLike[] = [
             jsxAttr('preserveAspectRatio', 'none'),
-            jsxAttr('shapeRendering', 'crispEdges'),
+            // geometricPrecision = chromium's default antialiased rasterization,
+            // matching figma's PNG export which always emits anti-aliased edges.
+            // crispEdges would skip the halo columns figma includes around each
+            // edge, producing a 1-px alpha-step diff between figma and impl.
+            jsxAttr('shapeRendering', 'geometricPrecision'),
             ...extraAttrs,
         ]
         if (extra) {

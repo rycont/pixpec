@@ -1059,9 +1059,14 @@ async function render() {
         background: box?.bg ?? 'transparent',
         ...(box?.color ? { color: box.color } : {}),
         boxSizing: 'border-box',
-        display: 'inline-flex',
-        alignItems: 'center',
-        justifyContent: 'center',
+        // Use block so content keeps its natural size and overflows the
+        // wrapper without flex-shrink: when render-bounds are smaller than
+        // the variant box (nested-instance usages), inline-flex shrinks the
+        // variant to wrapper-width and the SVG's % insets recompute against
+        // the smaller box, shifting the icon. Block + overflow:hidden
+        // matches figma's behaviour: content drawn at its own origin, clipped
+        // outside the render-bounds rectangle.
+        display: 'block',
         position: 'relative',
         overflow: box?.overflow ?? 'hidden',
       }
@@ -1072,17 +1077,12 @@ async function render() {
         style.paddingBottom = px2rem(box?.paddingBottom ?? 0)
         style.paddingLeft = px2rem(box?.paddingLeft ?? 0)
       }
-      if (
-        box?.paddingTop !== undefined ||
-        box?.paddingRight !== undefined ||
-        box?.paddingBottom !== undefined ||
-        box?.paddingLeft !== undefined
-      ) {
-        style.alignItems = 'flex-start'
-        style.justifyContent = 'flex-start'
-      }
-      if (box?.width !== undefined) style.width = px2rem(box.width)
-      if (box?.height !== undefined) style.height = px2rem(box.height)
+      // Round wrapper width UP to an integer design-px so each case wrapper
+      // sits on an integer-pixel boundary in the inline flow. Combined with
+      // flex-start alignment (above), content stays at the top-left so the
+      // ceiling doesn't shift the icon centered in a larger box.
+      if (box?.width !== undefined) style.width = px2rem(Math.ceil(box.width))
+      if (box?.height !== undefined) style.height = px2rem(Math.ceil(box.height))
       return style
     }
     const nextTree = createElement(

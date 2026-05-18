@@ -312,7 +312,13 @@ function px(n: number): LengthValue {
 }
 
 function pct(n: number): LengthValue {
-  return { kind: "literal", value: { value: normalizeNumber(n), unit: "%" } };
+  // toFixed(6) rounds the 7th digit, so e.g. 13.5416666... rounds UP to
+  // 13.541667 — multiplying by 192 yields 26.00000064 instead of just-under-26,
+  // which chromium rasterizes one column to the right of figma's PNG render.
+  // Use a higher precision (toFixed(10)) so the percentage's float64 product
+  // with any parent dim stays within rasterizer epsilon of the exact value.
+  const truncated = +n.toFixed(10);
+  return { kind: "literal", value: { value: Object.is(truncated, -0) ? 0 : truncated, unit: "%" } };
 }
 
 /** Build a per-axis AbsoluteLayout entry from a Figma constraint + raw px
