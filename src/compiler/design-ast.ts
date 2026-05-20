@@ -279,9 +279,10 @@ export interface DNodeBase {
   absolute?: AbsoluteLayout;
   /** Offset from the node's design box to the exported render bounds. */
   renderBoundsOffset?: { x: LengthValue; y: LengthValue };
-  /** Node visibility. When expression-valued, an owner component prop gates
-   * this node without a parallel binding field. */
-  visible?: Value<boolean>;
+  /** Node hidden state. Omitted means visible. When expression-valued, an
+   * owner component prop gates this node; emitters render when the prop is
+   * not false. */
+  hidden?: Value<boolean>;
 }
 
 /** Container with explicit auto-layout — children laid out left-to-right
@@ -417,7 +418,6 @@ export interface DInstance extends DNodeBase {
 export interface DUnknown extends DNodeBase {
   kind: NodeKind.Unknown;
   sourceType?: string;
-  hidden?: boolean;
   width: LengthValue;
   height: LengthValue;
 }

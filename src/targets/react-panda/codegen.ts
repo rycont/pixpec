@@ -13,6 +13,7 @@ import {
     callExpression,
     exportModifier,
     jsxEl,
+    jsxAttr,
     keywordExpression,
     nodeFlagsConst,
     propAccess,
@@ -30,7 +31,7 @@ import { emitShape } from './lowerers/shape.ts'
 import { emitText } from './lowerers/text.ts'
 import { emitUnknown } from './lowerers/unknown.ts'
 import { emitVector } from './lowerers/vector.ts'
-import { expressionPropName, nodeSourceId, sizeToProp } from './sizing.ts'
+import { expressionPropName, literalValue, nodeSourceId, sizeToProp } from './sizing.ts'
 import { squircleHookMarker } from './styles.ts'
 
 // View-level codegen (breakdown) hands us a raw root without a DataScope
@@ -58,7 +59,7 @@ function generatedPropsSource(scope: DDataScope, _rootPropsTypeName: string): st
     const fields = Object.entries(scope.data)
         .map(([key, def]) => {
             const type = reactPandaPropType(def.type)
-            return `    ${key}: ${type}`
+            return `    ${propsKey(key)}: ${type}`
         })
         .join('\n')
     return `export interface ${propsTypeName(scope)} {\n${fields}\n}\n`
@@ -66,9 +67,13 @@ function generatedPropsSource(scope: DDataScope, _rootPropsTypeName: string): st
 
 function generatedDefaultsSource(scope: DDataScope): string {
     const lines = Object.entries(scope.data)
-        .map(([key, def]) => `    ${key}: ${defaultLiteral(def)},`)
+        .map(([key, def]) => `    ${propsKey(key)}: ${defaultLiteral(def)},`)
         .join('\n')
     return `const DEFAULTS: ${propsTypeName(scope)} = {\n${lines}\n}\n`
+}
+
+function propsKey(name: string): string {
+    return /^[A-Za-z_$][A-Za-z0-9_$]*$/.test(name) ? name : JSON.stringify(name)
 }
 
 function defaultLiteral(def: { type?: string; default?: unknown }): string {
@@ -217,27 +222,37 @@ function applyAxisPosition(
     }
 }
 
-function wrapVisibility(n: DNode, jsx: ast.JsxChild, ctx: Ctx, parent: ParentCtx): LowerResult {
+function wrapHidden(n: DNode, jsx: ast.JsxChild, ctx: Ctx, parent: ParentCtx): LowerResult {
     const uses = emptyUses()
-    const visibleProp = expressionPropName(n.visible)
-    if (!visibleProp || (!parent.has(LocalCtx.Flex) && !parent.has(LocalCtx.Stack))) {
+    const hiddenLiteral = literalValue<boolean>(n.hidden)
+    if (hiddenLiteral === true) {
+        return { jsx: f.createJsxExpression(undefined, keywordExpression(ast.SyntaxKind.NullKeyword)), uses }
+    }
+    const hiddenProp = expressionPropName(n.hidden)
+    if (!hiddenProp) {
         return { jsx, uses }
     }
     const cond = f.createBinaryExpression(
         undefined,
-        propAccess(visibleProp),
+        propAccess(hiddenProp),
         undefined,
         f.createToken(ast.SyntaxKind.ExclamationEqualsEqualsToken),
         keywordExpression(ast.SyntaxKind.FalseKeyword),
     )
-    const conditional = f.createConditionalExpression(
+    const optional = f.createConditionalExpression(
         cond,
         f.createToken(ast.SyntaxKind.QuestionToken),
-        f.createParenthesizedExpression(jsx as unknown as ast.Expression),
+        jsxChildExpression(jsx),
         f.createToken(ast.SyntaxKind.ColonToken),
         keywordExpression(ast.SyntaxKind.NullKeyword),
     )
-    return { jsx: f.createJsxExpression(undefined, conditional), uses }
+    return { jsx: f.createJsxExpression(undefined, optional), uses }
+}
+
+function jsxChildExpression(jsx: ast.JsxChild): ast.Expression {
+    const expr = ast.isJsxExpression(jsx) ? jsx.expression : jsx
+    if (expr && ast.isExpression(expr)) return expr
+    return jsxEl(styledTag('span'), [], [jsx])
 }
 
 setNodeDispatcher((n, ctx, parent) => emitNode(n, ctx, parent))
@@ -276,9 +291,9 @@ async function emitNode(n: DNode, ctx: Ctx, parent: ParentCtx): Promise<LowerRes
     mergeUses(uses, inner.uses)
     const abs = wrapAbsolute(n, inner.jsx, ctx)
     mergeUses(uses, abs.uses)
-    const vis = wrapVisibility(n, abs.jsx, ctx, parent)
-    mergeUses(uses, vis.uses)
-    return { jsx: vis.jsx, uses }
+    const hidden = wrapHidden(n, abs.jsx, ctx, parent)
+    mergeUses(uses, hidden.uses)
+    return { jsx: hidden.jsx, uses }
 }
 
 // Top-level emit: produce a self-contained .tsx string.
@@ -526,6 +541,7 @@ export async function codegenReactPanda(
             remBase: ctx.remBase ?? 16,
             registry: ctx.registry ?? new Map(),
             tokenMap: ctx.designSystem?.tokens ?? {},
+            tokenValues: ctx.designSystem?.tokenValues ?? {},
             typographyMap: ctx.designSystem?.typography ?? {},
             outputDir: ctx.outputDir,
             rootDir: ctx.rootDir,

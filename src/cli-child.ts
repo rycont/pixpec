@@ -1,11 +1,12 @@
 import { spawn } from "node:child_process";
+import { dirname, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 
 export async function runCurrentCliChild(
   args: string[],
   opts: { cwd: string; env?: NodeJS.ProcessEnv },
 ): Promise<void> {
-  const entry = process.argv[1];
-  if (!entry) throw new Error("pixpec child CLI: current CLI entry is unknown");
+  const entry = resolve(dirname(fileURLToPath(import.meta.url)), "cli.ts");
   const env = { ...(opts.env ?? process.env) };
   env.NODE_OPTIONS ??= "--max-old-space-size=1024";
   await new Promise<void>((resolve, reject) => {

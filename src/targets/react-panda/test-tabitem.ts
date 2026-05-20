@@ -61,7 +61,7 @@ const inner: DNode = {
                 _fill: { kind: 'expression', type: 'prop', name: 'iconFill' },
             },
             sizing: { horizontal: Sizing.Fixed, vertical: Sizing.Fixed },
-            visible: { kind: 'expression', type: 'prop', name: 'leftIcon' },
+            hidden: { kind: 'expression', type: 'prop', name: 'leftIcon' },
         } as DNode,
         // Label text
         {

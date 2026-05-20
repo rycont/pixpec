@@ -149,6 +149,10 @@ export async function exportNodeSvg(opts: DumpOptions): Promise<string> {
  *  `rootId` and returns a RawNode tree as plain JSON. */
 function pluginScript(rootId: string | string[]): string {
   return `
+// Dump must preserve hidden descendants inside instances. Figma Dev Mode
+// defaults this flag to true, which makes instance.children/getNodeByIdAsync
+// omit invisible instance children.
+figma.skipInvisibleInstanceChildren = false;
 const ROOT_IDS = ${JSON.stringify(Array.isArray(rootId) ? rootId : [rootId])};
 const FRAMELIKE = new Set(['FRAME', 'COMPONENT', 'INSTANCE', 'COMPONENT_SET']);
 const SHAPELIKE = new Set(['RECTANGLE', 'ELLIPSE', 'POLYGON', 'STAR', 'LINE']);
@@ -278,7 +282,6 @@ async function readComponentProperties(out, node, mainComponent) {
 }
 async function dumpNode(node) {
   if (!node) return null;
-  if (node.visible === false) return null;
   const out = {
     id: node.id,
     name: node.name,

@@ -92,6 +92,14 @@ export function valueToExpr(v: unknown): ast.Expression {
 // `props.X` — kept as PropertyAccess (not destructured to a local) so figma
 // prop names that collide with imports don't shadow each other.
 export function propAccess(key: string): ast.Expression {
+    if (!/^[A-Za-z_$][A-Za-z0-9_$]*$/.test(key)) {
+        return f.createElementAccessExpression(
+            f.createIdentifier('props'),
+            undefined,
+            stringLiteral(key),
+            0 as ast.NodeFlags,
+        )
+    }
     return f.createPropertyAccessExpression(
         f.createIdentifier('props'),
         undefined,

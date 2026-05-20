@@ -267,6 +267,7 @@ export function squircleStyleExpression(key: string): ast.JsxExpression {
         undefined,
         f.createObjectLiteralExpression(
             [
+                propertyAssignment(f.createIdentifier('borderRadius'), stringLiteral('0')),
                 propertyAssignment(
                     f.createIdentifier('clipPath'),
                     f.createIdentifier(`squircleClipPath${key}`),
@@ -285,6 +286,7 @@ export function squircleFillBackgroundStyleExpression(
         undefined,
         f.createObjectLiteralExpression(
             [
+                propertyAssignment(f.createIdentifier('borderRadius'), stringLiteral('0')),
                 propertyAssignment(
                     f.createIdentifier('clipPath'),
                     f.createIdentifier(`squircleClipPath${hookKey}`),

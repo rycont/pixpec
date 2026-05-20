@@ -359,6 +359,7 @@ export interface ComponentSetSource {
   fileKey: string;
   nodeId: string;
   name: string;
+  pageAttached?: boolean;
 }
 
 export async function findComponentSetSourceByKey(opts: {
@@ -370,6 +371,24 @@ export async function findComponentSetSourceByKey(opts: {
 const code = `
 const targetKey = ${JSON.stringify(opts.componentSetKey)};
 await figma.loadAllPagesAsync();
+function pageOf(node) {
+  let p = node;
+  while (p && p.type !== 'PAGE') p = p.parent;
+  return p || null;
+}
+function sourceFromInstance(inst) {
+  let main = null;
+  try { main = inst.mainComponent; } catch (_) { main = null; }
+  if (!main) return null;
+  const set = main.parent && main.parent.type === 'COMPONENT_SET' ? main.parent : null;
+  if (set && set.key === targetKey && set.remote !== true) {
+    return { nodeId: set.id, name: set.name, pageAttached: !!pageOf(set) };
+  }
+  if (main.key === targetKey && main.remote !== true) {
+    return { nodeId: main.id, name: main.name, pageAttached: !!pageOf(main) };
+  }
+  return null;
+}
 for (const page of figma.root.children) {
   const sets = page.findAllWithCriteria({ types: ['COMPONENT_SET'] });
   for (const set of sets) {
@@ -383,6 +402,11 @@ for (const page of figma.root.children) {
       return { nodeId: component.id, name: component.name };
     }
   }
+  const instances = page.findAllWithCriteria({ types: ['INSTANCE'] });
+  for (const inst of instances) {
+    const source = sourceFromInstance(inst);
+    if (source) return source;
+  }
 }
 return null;
 `;
@@ -394,18 +418,88 @@ return null;
         { encoding: "utf8", maxBuffer: 16 * 1024 * 1024 },
       );
       const found = cleanControlValue(JSON.parse(stdout)) as
-        | { nodeId?: string; name?: string }
+        | { nodeId?: string; name?: string; pageAttached?: boolean }
         | null;
       if (found?.nodeId) {
         return {
           fileKey: tab.key,
           nodeId: found.nodeId,
           name: found.name ?? found.nodeId,
+          pageAttached: found.pageAttached,
         };
       }
     } catch {
       // Ignore tabs that cannot be searched; the caller reports failure if
       // no open source tab contains the requested component set key.
+    }
+  }
+  return undefined;
+}
+
+export async function findComponentSetSourceForVariant(opts: {
+  componentSetKey: string;
+  variantKey?: string;
+  variantName?: string;
+  cfigmaBin?: string;
+}): Promise<ComponentSetSource | undefined> {
+  const tabs = await listFigmaTabs({ cfigmaBin: opts.cfigmaBin });
+  const bin = opts.cfigmaBin ?? "cfigma";
+const code = `
+const targetSetKey = ${JSON.stringify(opts.componentSetKey)};
+const targetVariantKey = ${JSON.stringify(opts.variantKey ?? null)};
+const targetVariantName = ${JSON.stringify(opts.variantName ?? null)};
+await figma.loadAllPagesAsync();
+function pageOf(node) {
+  let p = node;
+  while (p && p.type !== 'PAGE') p = p.parent;
+  return p || null;
+}
+function sourceFromMain(main) {
+  if (!main) return null;
+  const set = main.parent && main.parent.type === 'COMPONENT_SET' ? main.parent : null;
+  if (set && set.key === targetSetKey) {
+    return { nodeId: set.id, name: set.name, pageAttached: !!pageOf(set) };
+  }
+  if (main.key === targetSetKey) {
+    return { nodeId: main.id, name: main.name, pageAttached: !!pageOf(main) };
+  }
+  return null;
+}
+for (const page of figma.root.children) {
+  const instances = page.findAllWithCriteria({ types: ['INSTANCE'] });
+  for (const inst of instances) {
+    let main = null;
+    try { main = inst.mainComponent; } catch (_) { main = null; }
+    if (!main) continue;
+    if (targetVariantKey && main.key !== targetVariantKey) continue;
+    if (!targetVariantKey && targetVariantName && main.name !== targetVariantName) continue;
+    const source = sourceFromMain(main);
+    if (source) return source;
+  }
+}
+return null;
+`;
+  for (const tab of tabs) {
+    try {
+      const { stdout } = await execFileAsync(
+        bin,
+        ["--tab", tab.key, "exec", code],
+        { encoding: "utf8", maxBuffer: 16 * 1024 * 1024 },
+      );
+      const found = cleanControlValue(JSON.parse(stdout)) as
+        | { nodeId?: string; name?: string; pageAttached?: boolean }
+        | null;
+      if (found?.nodeId) {
+        return {
+          fileKey: tab.key,
+          nodeId: found.nodeId,
+          name: found.name ?? found.nodeId,
+          pageAttached: found.pageAttached,
+        };
+      }
+    } catch {
+      // Ignore tabs that cannot be searched; the caller can fall back to the
+      // key-level lookup or report the unresolved dependency.
     }
   }
   return undefined;

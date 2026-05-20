@@ -1,6 +1,7 @@
 import type { DUnknown } from '../../../compiler/design-ast.ts'
 import { jsxSelf, styleAttr, styledTag } from '../ast.ts'
 import { px2rem, sizeToPx } from '../data-lowerer.ts'
+import { literalValue } from '../sizing.ts'
 import type { LowererCtx as Ctx, LowerResult } from '../lowerer-types.ts'
 import { emptyUses } from '../lowerer-types.ts'
 
@@ -13,7 +14,7 @@ export async function emitUnknown(n: DUnknown, ctx: Ctx): Promise<LowerResult> {
     const wpx = px2rem(w, ctx.env.remBase)
     const hpx = px2rem(h, ctx.env.remBase)
     let style: Record<string, unknown>
-    if (n.hidden) {
+    if (literalValue<boolean>(n.hidden) === true) {
         style = { width: wpx, height: hpx, opacity: 0 }
     } else if (w === 0 || h === 0) {
         style = { display: 'none' }

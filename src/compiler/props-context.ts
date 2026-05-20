@@ -89,7 +89,7 @@ export function rawOverrideFieldForDNodeField(field: string): string {
     return "fills";
   if (field === "border.paint") return "strokes";
   if (field === "textStyleRef") return "textStyleId";
-  if (field === "visible") return "visible";
+  if (field === "hidden") return "visible";
   if (field.startsWith("component.")) return "componentProperties";
   return field;
 }

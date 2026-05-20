@@ -34,10 +34,18 @@ function makeGenerateAssetWriter(assetsDir: string) {
 import { dump, exportNodeSvg } from './dumper/index.ts'
 import type { RawNode } from './dumper/raw-node.ts'
 import { compile, loadRegistry, type Registry } from './compiler/index.ts'
+import {
+  resolveRegistryEntryForInstance,
+  resolveRegistryVariant,
+} from './compiler/registry.ts'
 import type { DNode } from './compiler/design-ast.ts'
 import { getTarget, resolveConfiguredTargets } from './targets/index.ts'
 import { loadConfig } from './init.ts'
-import { findComponentSetSourceByKey, listFigmaTabs } from './cfigma-meta.ts'
+import {
+  findComponentSetSourceByKey,
+  findComponentSetSourceForVariant,
+  listFigmaTabs,
+} from './cfigma-meta.ts'
 import type { ViewCodegenConfig } from './targets/types.ts'
 
 export interface GenerateOptions {
@@ -97,6 +105,18 @@ export interface GenerateContext {
   fontManifest?: unknown
   registry: Registry
   targetRegistry: Map<string, { componentName: string; dir: string; hasProps: boolean }>
+}
+
+export interface MissingComponentRoot {
+  componentSetKey: string
+  variantKey?: string
+  variantName?: string
+  reason: "missing-component" | "missing-variant"
+}
+
+export interface EnsureRegistryResult {
+  registry: Registry
+  missingComponentRoots: MissingComponentRoot[]
 }
 
 export interface GenerateManyOptions extends Omit<GenerateOptions, 'target'> {
@@ -189,6 +209,7 @@ export async function runGeneratePrepared(
   let tab: { key: string } | undefined
   if (!ast) {
     let raw: RawNode
+    let detachUnregisteredInstances = false
     if (opts.raw && opts.tabKey) {
       raw = opts.raw
       tab = { key: opts.tabKey }
@@ -199,12 +220,14 @@ export async function runGeneratePrepared(
       raw = await dump({ cfigmaBin: cfg.cfigmaBin ?? 'cfigma', tab: tab.key, nodeId })
     }
     if (!opts.detachInstances) {
-      registry = await ensureRegistryForRaw(raw, {
+      const ensured = await ensureRegistryForRaw(raw, {
         registry,
         componentsDir,
         cfigmaBin: cfg.cfigmaBin,
         cwd: root,
       })
+      registry = ensured.registry
+      detachUnregisteredInstances = ensured.missingComponentRoots.length > 0
     }
     context.registry = registry
     context.targetRegistry = toTargetRegistry(registry)
@@ -225,7 +248,7 @@ export async function runGeneratePrepared(
       exportSvg: (id) => exportNodeSvg({ cfigmaBin: cfg.cfigmaBin ?? 'cfigma', tab: tabKey, nodeId: id }),
       detachInstances: opts.detachInstances,
       detachRootInstance: opts.detachRootInstance,
-      detachUnregisteredInstances: true,
+      detachUnregisteredInstances,
       writeAsset: makeGenerateAssetWriter(assetsOutDir),
     })
   }
@@ -294,27 +317,37 @@ export async function ensureRegistryForRaw(
     cfigmaBin?: string
     cwd: string
   },
-): Promise<Registry> {
+): Promise<EnsureRegistryResult> {
   let registry = opts.registry
   const initialized = new Set<string>()
+  const missingComponentRoots = new Map<string, MissingComponentRoot>()
   for (let pass = 0; pass < 12; pass += 1) {
-    const missing = collectMissingComponentSetKeys(raw, registry).filter(
-      (key) => !initialized.has(key),
+    const missing = collectUnresolvedComponentDependencies(raw, registry).filter(
+      (dep) => !initialized.has(dependencyKey(dep)),
     )
-    if (missing.length === 0) return registry
-    for (const key of missing) {
-      const source = await findComponentSetSourceByKey({
-        componentSetKey: key,
-        cfigmaBin: opts.cfigmaBin,
-      })
+    if (missing.length === 0) {
+      return { registry, missingComponentRoots: [...missingComponentRoots.values()] }
+    }
+    for (const dep of missing) {
+      const source = dep.reason === "missing-variant"
+        ? await findComponentSetSourceForVariant({
+            componentSetKey: dep.componentSetKey,
+            variantKey: dep.variantKey,
+            variantName: dep.variantName,
+            cfigmaBin: opts.cfigmaBin,
+          })
+        : await findComponentSetSourceByKey({
+            componentSetKey: dep.componentSetKey,
+            cfigmaBin: opts.cfigmaBin,
+          })
+      initialized.add(dependencyKey(dep))
       if (!source) {
-        throw new Error(
-          `pixpec init: INSTANCE references unregistered component key ${key}, ` +
-            `and no open non-remote COMPONENT/COMPONENT_SET with that key was found. ` +
-            `Open the source library file in a tab (e.g. via cfigma) and re-run init.`,
+        missingComponentRoots.set(dependencyKey(dep), dep)
+        console.warn(
+          `[generate] dependency root not found in open Figma tabs; will allow detach fallback for ${dep.componentSetKey}`,
         )
+        continue
       }
-      initialized.add(key)
       console.log(
         `[generate] auto-init dependency ${source.name} (${source.fileKey}:${source.nodeId})`,
       )
@@ -323,7 +356,7 @@ export async function ensureRegistryForRaw(
         componentId: `${source.fileKey}:${source.nodeId}`,
         cwd: opts.cwd,
         skipExisting: true,
-        skipVerify: true,
+        allowRemoteProxy: dep.reason === "missing-variant",
       })
       registry = await loadRegistry(opts.componentsDir)
     }
@@ -331,17 +364,66 @@ export async function ensureRegistryForRaw(
   throw new Error('pixpec generate: recursive component init exceeded 12 passes')
 }
 
-function collectMissingComponentSetKeys(raw: RawNode, registry: Registry): string[] {
-  const out = new Set<string>()
+interface ComponentDependency {
+  componentSetKey: string
+  variantKey?: string
+  variantName?: string
+  reason: "missing-component" | "missing-variant"
+}
+
+function dependencyKey(dep: ComponentDependency): string {
+  return [
+    dep.reason,
+    dep.componentSetKey,
+    dep.variantKey ?? "",
+    dep.variantName ?? "",
+  ].join("\0")
+}
+
+function collectUnresolvedComponentDependencies(
+  raw: RawNode,
+  registry: Registry,
+): ComponentDependency[] {
+  const out = new Map<string, ComponentDependency>()
   const visit = (node: RawNode) => {
     if (node.type === 'INSTANCE') {
       const key = node.mainComponent?.parentKey ?? node.mainComponent?.key
-      if (key && !registry.has(key)) out.add(key)
+      if (key) {
+        const entry = resolveRegistryEntryForInstance(
+          registry,
+          key,
+          node.mainComponent?.key,
+          node.mainComponent?.name,
+        )
+        if (!entry) {
+          const dep: ComponentDependency = {
+            componentSetKey: key,
+            variantKey: node.mainComponent?.key,
+            variantName: node.mainComponent?.name,
+            reason: "missing-component",
+          }
+          out.set(dependencyKey(dep), dep)
+        } else if (
+          !resolveRegistryVariant(
+            entry,
+            node.mainComponent?.key,
+            node.mainComponent?.name,
+          )
+        ) {
+          const dep: ComponentDependency = {
+            componentSetKey: key,
+            variantKey: node.mainComponent?.key,
+            variantName: node.mainComponent?.name,
+            reason: "missing-variant",
+          }
+          out.set(dependencyKey(dep), dep)
+        }
+      }
     }
     for (const child of node.children ?? []) visit(child)
   }
   visit(raw)
-  return [...out]
+  return [...out.values()]
 }
 
 async function loadTokenMaps(root: string): Promise<{

@@ -66,7 +66,10 @@ import type {
   RawDropShadowEffect,
 } from "../dumper/raw-node.ts";
 import type { Registry } from "./registry.ts";
-import { resolveRegistryVariant } from "./registry.ts";
+import {
+  resolveRegistryEntryForInstance,
+  resolveRegistryVariant,
+} from "./registry.ts";
 import {
   indexDNodeClasses,
   materializeDNode,
@@ -671,11 +674,11 @@ function buildBase(
 ): DNodeBase {
   const out: DNodeBase = { sourceId: n.id, sourceName: n.name };
   if (n.componentPropertyReferences?.visible && !opts.detachRootInstance) {
-    out.visible = propValue(
+    out.hidden = propValue(
       publicComponentPropName(n.componentPropertyReferences.visible),
     );
   } else if (n.visible === false) {
-    out.visible = literalValue(false);
+    out.hidden = literalValue(true);
   }
   if (typeof n.opacity === "number" && n.opacity < 1) out.opacity = n.opacity;
   if (typeof n.rotation === "number" && Math.abs(n.rotation) >= 0.01)
@@ -697,7 +700,8 @@ function buildBase(
     if (isAxisAligned) {
       const flipX = r0[0]! < 0;
       const flipY = r1[1]! < 0;
-      if (flipX || flipY) out.flip = { x: flipX, y: flipY };
+      if (flipX || flipY)
+        out.flip = { x: literalValue(flipX), y: literalValue(flipY) };
     }
   }
   if (parent && n.layoutPositioning === "ABSOLUTE") {
@@ -744,6 +748,25 @@ function axisSize(
   const sizing = sizingFromRaw(rawSizing);
   if (sizing === Sizing.Fill) return Sizing.Fill;
   if (sizing === Sizing.Hug) return Sizing.Hug;
+  const value = axis === "horizontal" ? nodeWidth(n) : nodeHeight(n);
+  const variable = axis === "horizontal" ? nodeWidthVar(n) : nodeHeightVar(n);
+  return pickSize(value, variable, opts);
+}
+
+function hugMeasuredMinSize(
+  n: RawNode,
+  axis: "horizontal" | "vertical",
+  opts: CompileOptions,
+): LengthValue | undefined {
+  const rawSizing =
+    axis === "horizontal" ? n.layoutSizingHorizontal : n.layoutSizingVertical;
+  if (rawSizing !== "HUG") return undefined;
+  const childSizing =
+    axis === "horizontal" ? "layoutSizingHorizontal" : "layoutSizingVertical";
+  const hasDirectFillChild = (n.children ?? []).some(
+    (c) => c.visible !== false && c.layoutPositioning !== "ABSOLUTE" && c[childSizing] === "FILL",
+  );
+  if (!hasDirectFillChild) return undefined;
   const value = axis === "horizontal" ? nodeWidth(n) : nodeHeight(n);
   const variable = axis === "horizontal" ? nodeWidthVar(n) : nodeHeightVar(n);
   return pickSize(value, variable, opts);
@@ -844,6 +867,32 @@ function exactComponentProps(n: RawNode): Record<string, string | boolean> {
   return out;
 }
 
+function dataScopeDefaultProps(ast?: DNode): Record<string, string | number | boolean> {
+  if (!ast || ast.kind !== NodeKind.DataScope) return {};
+  const out: Record<string, string | number | boolean> = {};
+  for (const [key, entry] of Object.entries(ast.data)) {
+    const value = entry.default;
+    if (
+      typeof value === "string" ||
+      typeof value === "number" ||
+      typeof value === "boolean"
+    ) {
+      out[key] = value;
+    }
+  }
+  return out;
+}
+
+function componentPropsForInstance(
+  n: RawNode,
+  variantAst?: DNode,
+): Record<string, string | number | boolean> {
+  return {
+    ...dataScopeDefaultProps(variantAst),
+    ...exactComponentProps(n),
+  };
+}
+
 function indexDNodes(nodes: DNode[]): Map<string, DNodeClass> {
   return indexDNodeClasses(materializeDNodes(nodes));
 }
@@ -862,16 +911,23 @@ function exposedProps(
   return out;
 }
 
-function fieldConsumer(tree: DNode, remBase = 16) {
+function fieldConsumer(tree: DNode, master?: DNode, remBase = 16) {
   const byId = indexDNodes([tree]);
   byId.set("$root", materializeDNode(tree));
   const byBareId = indexDNodesByBareId([tree]);
+  const byMasterId = master
+    ? structuralDNodeMap(containerRoot(master), tree)
+    : undefined;
   const consumed = new Set<string>();
   return {
     consumed,
     consume(nodeId: string, field: string): unknown {
       consumed.add(`${nodeId}\0${field}`);
-      const node = byId.get(nodeId) ?? byBareId.get(stripPrefix(nodeId));
+      const node =
+        byMasterId?.get(nodeId) ??
+        byMasterId?.get(stripPrefix(nodeId)) ??
+        byId.get(nodeId) ??
+        byBareId.get(stripPrefix(nodeId));
       if (!node) return undefined;
       return normalizeConsumedField(node.readField(field));
     },
@@ -900,22 +956,29 @@ function hasUnconsumedDNodeDiff(
   master: DNode | undefined,
   usage: DNode | undefined,
   consumedFields: Set<string>,
+  props: Record<string, unknown> = {},
 ): boolean {
   if (!master) return !!usage;
   if (!usage) return true;
   const masterRoot = containerRoot(master);
   if (!masterRoot) return true;
-  const masterNodes = indexDNodes([masterRoot]);
-  masterNodes.set("$root", materializeDNode(masterRoot));
-  const usageNodes = indexDNodes([usage]);
-  usageNodes.set("$root", materializeDNode(usage));
-  const usageNodesByBareId = indexDNodesByBareId([usage]);
-  for (const [nodeId, masterNode] of masterNodes) {
-    const usageNode =
-      usageNodes.get(nodeId) ?? usageNodesByBareId.get(stripPrefix(nodeId));
+  const matched = structuralDNodePairs(masterRoot, usage, { props });
+  if (!matched) {
+    if (process.env.PIXPEC_DEBUG_UNCONSUMED === "1")
+      console.warn("[pixpec debug] unconsumed structural match failed");
+    return true;
+  }
+  for (const { id: nodeId, master: masterNode, usage: usageNode } of matched) {
     if (!usageNode || usageNode.kind !== masterNode.kind) return true;
     for (const diff of masterNode.visualDiff(usageNode)) {
       if (consumedFields.has(`${nodeId}\0${diff.field}`)) continue;
+      if (process.env.PIXPEC_DEBUG_UNCONSUMED === "1")
+        console.warn("[pixpec debug] unconsumed visual diff", {
+          nodeId,
+          field: diff.field,
+          before: diff.before,
+          after: diff.after,
+        });
       return true;
     }
   }
@@ -926,6 +989,137 @@ function containerRoot(node: DNode): DNode | undefined {
   if (node.kind === NodeKind.DataScope)
     return containerRoot((node as DDataScope).child);
   return node;
+}
+
+function structuralDNodeMap(
+  master: DNode | undefined,
+  usage: DNode | undefined,
+): Map<string, DNodeClass> {
+  const out = new Map<string, DNodeClass>();
+  const pairs = structuralDNodePairs(master, usage, {
+    allowMissingHiddenExpression: true,
+  });
+  if (!pairs) return out;
+  for (const pair of pairs) {
+    out.set(pair.id, pair.usage);
+    out.set(stripPrefix(pair.id), pair.usage);
+  }
+  return out;
+}
+
+function structuralDNodePairs(
+  master: DNode | undefined,
+  usage: DNode | undefined,
+  options: {
+    props?: Record<string, unknown>;
+    allowMissingHiddenExpression?: boolean;
+  } = {},
+): Array<{ id: string; master: DNodeClass; usage: DNodeClass }> | undefined {
+  if (!master || !usage) return undefined;
+  const masterRoot = materializeDNode(master);
+  const usageRoot = materializeDNode(usage);
+  const pairs: Array<{ id: string; master: DNodeClass; usage: DNodeClass }> = [];
+  const visit = (masterNode: DNodeClass, usageNode: DNodeClass, fallbackId: string): boolean => {
+    if (masterNode.kind !== usageNode.kind) {
+      debugStructuralMismatch("kind", masterNode, usageNode, fallbackId, options);
+      return false;
+    }
+    const id = masterNode.sourceId ?? fallbackId;
+    pairs.push({ id, master: masterNode, usage: usageNode });
+    if (
+      isEffectivelyHidden(masterNode, options) &&
+      isEffectivelyHidden(usageNode, options)
+    ) {
+      return true;
+    }
+    const masterChildren = masterNode.children();
+    const usageChildren = usageNode.children();
+    let usageIndex = 0;
+    for (let masterIndex = 0; masterIndex < masterChildren.length; masterIndex += 1) {
+      const masterChild = masterChildren[masterIndex];
+      const usageChild = usageChildren[usageIndex];
+      if (!usageChild && isMissingHiddenAllowed(masterChild, options)) continue;
+      if (!usageChild) {
+        debugStructuralMismatch("missing-usage-child", masterChild, usageNode, `${id}/${masterIndex}`, options);
+        return false;
+      }
+      if (
+        isMissingHiddenAllowed(masterChild, options)
+      ) {
+        usageIndex += 1;
+        continue;
+      }
+      if (!visit(masterChild, usageChild, `${id}/${masterIndex}`)) {
+        if (isMissingHiddenAllowed(masterChild, options)) continue;
+        return false;
+      }
+      usageIndex += 1;
+    }
+    if (usageIndex !== usageChildren.length) {
+      debugStructuralMismatch("extra-usage-children", masterNode, usageChildren[usageIndex], id, options);
+      return false;
+    }
+    return true;
+  };
+  return visit(masterRoot, usageRoot, "$root") ? pairs : undefined;
+}
+
+function debugStructuralMismatch(
+  reason: string,
+  masterNode: DNodeClass,
+  usageNode: DNodeClass | undefined,
+  id: string,
+  options: { props?: Record<string, unknown>; allowMissingHiddenExpression?: boolean },
+): void {
+  if (process.env.PIXPEC_DEBUG_UNCONSUMED !== "1") return;
+  console.warn("[pixpec debug] structural mismatch detail", {
+    reason,
+    id,
+    master: {
+      kind: masterNode.kind,
+      sourceId: masterNode.sourceId,
+      sourceName: masterNode.sourceName,
+      hidden: masterNode.readField("hidden"),
+      children: masterNode.children().length,
+    },
+    usage: usageNode
+      ? {
+          kind: usageNode.kind,
+          sourceId: usageNode.sourceId,
+          sourceName: usageNode.sourceName,
+          hidden: usageNode.readField("hidden"),
+          children: usageNode.children().length,
+        }
+      : undefined,
+    props: options.props,
+  });
+}
+
+function isMissingHiddenAllowed(
+  node: DNodeClass,
+  options: { props?: Record<string, unknown>; allowMissingHiddenExpression?: boolean },
+): boolean {
+  const hidden = node.readField("hidden");
+  if (!hidden || typeof hidden !== "object") return false;
+  const record = hidden as Record<string, unknown>;
+  if (record.kind !== "expression" || record.type !== "prop") return false;
+  const name = record.name;
+  if (typeof name !== "string") return false;
+  if (options.allowMissingHiddenExpression) return true;
+  return options.props?.[name] === false;
+}
+
+function isEffectivelyHidden(
+  node: DNodeClass,
+  options: { props?: Record<string, unknown>; allowMissingHiddenExpression?: boolean },
+): boolean {
+  const hidden = node.readField("hidden");
+  if (!hidden || typeof hidden !== "object") return false;
+  const record = hidden as Record<string, unknown>;
+  if (record.kind === "literal") return record.value === true;
+  if (record.kind !== "expression" || record.type !== "prop") return false;
+  const name = record.name;
+  return typeof name === "string" && options.props?.[name] === false;
 }
 
 function indexDNodesByBareId(nodes: DNode[]): Map<string, DNodeClass> {
@@ -1313,7 +1507,7 @@ async function compileVector(
   n: RawNode,
   opts: CompileOptions,
   parent?: RawNode,
-): Promise<DVector | DImage> {
+): Promise<DVector | DImage | DUnknown> {
   const w = absoluteAxisSize(n, parent, "horizontal", opts);
   const h = absoluteAxisSize(n, parent, "vertical", opts);
   const fillProp = directPaintBinding(n, opts);
@@ -1327,8 +1521,26 @@ async function compileVector(
     : singleSolidFillFromNode(n, opts);
   let svg = n.svg;
   if (!svg && opts.exportSvg) {
-    svg = await exportSvgForRawNode(n, opts);
+    try {
+      svg = await exportSvgForRawNode(n, opts);
+    } catch (error) {
+      svg = svgFromVectorPaths(n);
+      if (!svg) {
+        if (isEmptyVectorExportError(error)) {
+          return {
+            ...buildBase(n, opts, parent),
+            kind: NodeKind.Unknown,
+            sourceType: n.type,
+            hidden: literalValue(true),
+            width: w ?? px(n.width ?? 0),
+            height: h ?? px(n.height ?? 0),
+          };
+        }
+        throw error;
+      }
+    }
   }
+  svg ??= svgFromVectorPaths(n);
   if (svg) {
     const asset = await persistSvgString(svg, opts);
     if (!asset) {
@@ -1342,8 +1554,12 @@ async function compileVector(
     // ="none" stretching the figure anisotropically — curves don't match the
     // figma reference. Prefer the viewBox dims when they're sub-pixel precise.
     const precise = svgViewBoxDim(svg);
-    const wOut = precise ? preferPreciseLength(w, precise.w) : w;
-    const hOut = precise ? preferPreciseLength(h, precise.h) : h;
+    const wOut = (precise && w ? preferPreciseLength(w, precise.w) : w) as
+      | LengthValue
+      | undefined;
+    const hOut = (precise && h ? preferPreciseLength(h, precise.h) : h) as
+      | LengthValue
+      | undefined;
     return {
       ...buildBase(n, opts, parent),
       kind: NodeKind.Vector,
@@ -1361,10 +1577,47 @@ async function compileVector(
   return {
     ...buildBase(n, opts, parent),
     kind: NodeKind.Image,
-    width: w,
-    height: h,
+    width: w ?? px(n.width ?? 0),
+    height: h ?? px(n.height ?? 0),
     asset: "",
   };
+}
+
+function svgFromVectorPaths(n: RawNode): string | undefined {
+  const paths = n.vectorPaths;
+  if (!paths?.length) return undefined;
+  const w = n.width ?? n.absoluteBoundingBox?.width;
+  const h = n.height ?? n.absoluteBoundingBox?.height;
+  if (typeof w !== "number" || typeof h !== "number" || w <= 0 || h <= 0) {
+    return undefined;
+  }
+  const body = paths
+    .map((path) => {
+      const rule =
+        path.windingRule === "EVENODD"
+          ? ' fill-rule="evenodd" clip-rule="evenodd"'
+          : "";
+      return `<path${rule} d="${escapeXmlAttr(path.data)}" fill="#000000"/>`;
+    })
+    .join("");
+  return `<svg width="${w}" height="${h}" viewBox="0 0 ${w} ${h}" fill="none" xmlns="http://www.w3.org/2000/svg">${body}</svg>`;
+}
+
+function escapeXmlAttr(value: string): string {
+  return value
+    .replace(/&/g, "&amp;")
+    .replace(/"/g, "&quot;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
+}
+
+function isEmptyVectorExportError(error: unknown): boolean {
+  let current: unknown = error;
+  while (current instanceof Error) {
+    if (/visible layers/i.test(current.message)) return true;
+    current = current.cause;
+  }
+  return false;
 }
 
 async function persistSvgString(
@@ -1394,7 +1647,7 @@ async function compileContainer(
   const stroke = firstSolidFill(n.strokes);
   const gradientStroke = firstGradientFill(n.strokes);
   const childRaws = (n.children ?? []).filter(
-    (c) => c.visible !== false && (c.isMask || !isInvisibleShape(c)),
+    (c) => c.isMask || !isInvisibleShape(c),
   );
   const children = await compileChildren(
     childRaws,
@@ -1423,13 +1676,13 @@ async function compileContainer(
     ...buildBase(n, opts, parent),
     width: axisSize(n, "horizontal", opts),
     height: axisSize(n, "vertical", opts),
-    minWidth: pickSize(n.minWidth, varId(n.boundVariables, "minWidth"), opts),
+    minWidth:
+      pickSize(n.minWidth, varId(n.boundVariables, "minWidth"), opts) ??
+      hugMeasuredMinSize(n, "horizontal", opts),
     maxWidth: pickSize(n.maxWidth, varId(n.boundVariables, "maxWidth"), opts),
-    minHeight: pickSize(
-      n.minHeight,
-      varId(n.boundVariables, "minHeight"),
-      opts,
-    ),
+    minHeight:
+      pickSize(n.minHeight, varId(n.boundVariables, "minHeight"), opts) ??
+      hugMeasuredMinSize(n, "vertical", opts),
     maxHeight: pickSize(
       n.maxHeight,
       varId(n.boundVariables, "maxHeight"),
@@ -1585,7 +1838,12 @@ async function compileInstance(
   if (opts.detachInstances) return compileContainer(n, childOpts, parent, true);
 
   const setKey = n.mainComponent?.parentKey ?? n.mainComponent?.key;
-  const entry = setKey ? opts.registry.get(setKey) : undefined;
+  const entry = resolveRegistryEntryForInstance(
+    opts.registry,
+    setKey,
+    n.mainComponent?.key,
+    n.mainComponent?.name,
+  );
   if (!entry) {
     if (opts.detachUnregisteredInstances && (n.children?.length ?? 0) > 0) {
       // Detached subtree has no surrounding component to provide prop values,
@@ -1614,20 +1872,55 @@ async function compileInstance(
   // BorderColor) and root-level promotions ($root.padding.top etc) are
   // available to propsFromFigma via the field consumer's "$root" lookup.
   const compiledRoot = await compileContainer(n, childOpts, parent, false);
-  const fields = fieldConsumer(compiledRoot, opts.remBase);
-  const props: Record<string, unknown> =
-    variant?.propsFromFigma?.(
-      exactComponentProps(n),
+  const fields = fieldConsumer(compiledRoot, variant?.ast, opts.remBase);
+  const componentProps = componentPropsForInstance(n, variant?.ast);
+  let props: Record<string, unknown> = {};
+  try {
+    props =
+      variant?.propsFromFigma?.(
+      componentProps,
       exposedProps(n, compiledRoot),
       fields,
-    ) ?? {};
-  if (hasUnconsumedDNodeDiff(variant?.ast, compiledRoot, fields.consumed))
+      ) ?? {};
+  } catch (error) {
+    if (process.env.PIXPEC_DEBUG_UNCONSUMED === "1")
+      console.warn("[pixpec debug] propsFromFigma failed", {
+        id: n.id,
+        name: n.name,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    if (n.visible === false) {
+      return {
+        ...buildBase(n, opts, parent),
+        kind: NodeKind.Instance,
+        componentName: entry.componentName,
+        props: componentProps,
+      };
+    }
     return compileContainer(
       n,
       { ...opts, detachRootInstance: true },
       parent,
       false,
     );
+  }
+  if (
+    n.visible !== false &&
+    hasUnconsumedDNodeDiff(variant?.ast, compiledRoot, fields.consumed, props)
+  ) {
+    if (process.env.PIXPEC_DEBUG_UNCONSUMED === "1")
+      console.warn("[pixpec debug] detaching instance after unconsumed diff", {
+        id: n.id,
+        name: n.name,
+        props,
+      });
+    return compileContainer(
+      n,
+      { ...opts, detachRootInstance: true },
+      parent,
+      false,
+    );
+  }
   return {
     ...buildBase(n, opts, parent),
     kind: NodeKind.Instance,
@@ -1659,7 +1952,7 @@ async function compileNode(
   if (n.isMask) {
     return {
       ...compileUnknown(n, opts, parent),
-      hidden: true,
+      hidden: literalValue(true),
     };
   }
   // Fold pure-visual subtrees (non-autolayout Frame/Group/Shape only, no

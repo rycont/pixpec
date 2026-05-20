@@ -366,13 +366,8 @@ export async function emitContainer(n: DFlex | DStack | DBox, ctx: Ctx, parent: 
     if (promotedInsetBorderAttr) attrs.push(promotedInsetBorderAttr)
     if (flipStyleAttr) attrs.push(flipStyleAttr)
     const squircleRadius =
-        n.cornerSmoothing &&
-        n.cornerSmoothing > 0 &&
-        n.width &&
-        n.height &&
-        sizingH === Sizing.Fixed &&
-        sizingV === Sizing.Fixed
-            ? sizeToPx(n.cornerRadius as LengthValue)
+        n.cornerSmoothing && n.cornerSmoothing > 0
+            ? sizeToPxWithTokens(n.cornerRadius as LengthValue, ctx)
             : undefined
     const squircleHook =
         squircleRadius !== undefined
@@ -498,6 +493,13 @@ function insideCssBorderLayoutInsetPx(n: DFlex | DStack | DBox): number {
     const borderPaintProp = expressionPropName(n.border.paint as unknown as Value<Color>)
     const colorStr = paintToProp(n.border.paint)
     return borderPaintProp || colorStr?.includes('gradient(') ? wPx : 0
+}
+
+function sizeToPxWithTokens(value: LengthValue | undefined, ctx: Ctx): number | undefined {
+    if (typeof value === 'string') {
+        return ctx.env.tokenValues[value]
+    }
+    return sizeToPx(value)
 }
 
 function isRenderBoundsFromAbsoluteChild(n: DFlex | DStack | DBox): boolean {

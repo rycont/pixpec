@@ -60,7 +60,14 @@ export async function loadRegistry(componentsDir: string): Promise<Registry> {
     if (!existsSync(manifestPath)) continue;
     const entry = await loadOne(dir, manifestPath);
     if (!entry) continue;
-    for (const key of manifestKeys(entry.manifest)) reg.set(key, entry);
+    for (const key of manifestKeys(entry.manifest)) {
+      if (!reg.has(key)) {
+        reg.set(key, entry);
+      } else {
+        const sourceId = entry.manifest.figma?.componentSetId ?? entry.componentName;
+        reg.set(`${key}\0${sourceId}`, entry);
+      }
+    }
   }
   return reg;
 }
@@ -140,6 +147,26 @@ export function resolveRegistryVariant(
   if (key && entry.variants[key]) return entry.variants[key];
   if (!variantName) return undefined;
   return Object.values(entry.variants).find((v) => v.name === variantName);
+}
+
+export function resolveRegistryEntryForInstance(
+  registry: Registry,
+  componentSetKey?: string,
+  variantKey?: string,
+  variantName?: string,
+): RegistryEntry | undefined {
+  if (!componentSetKey) return undefined;
+  const entries = [...new Set(registry.values())];
+  const exact = entries.find((entry) => {
+    if (!manifestKeys(entry.manifest).includes(componentSetKey)) return false;
+    return !!resolveRegistryVariant(entry, variantKey, variantName);
+  });
+  if (exact) return exact;
+  const bySetKey = registry.get(componentSetKey);
+  if (bySetKey) return bySetKey;
+  return entries.find((entry) => {
+    return !!resolveRegistryVariant(entry, variantKey ?? componentSetKey, variantName);
+  });
 }
 
 function readManifest(path: string): PixpecManifest {

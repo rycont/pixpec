@@ -19,7 +19,7 @@ import { parse as parseToml } from "smol-toml";
 import { listFigmaTabs, scanAllOpenTabsForInit } from "./cfigma-meta.ts";
 import { runCurrentCliChild } from "./cli-child.ts";
 import { preflightCfigmaExport } from "./figma.ts";
-import { dump, dumpMany } from "./dumper/index.ts";
+import { dump, dumpMany, exportNodeSvg } from "./dumper/index.ts";
 import type { RawNode } from "./dumper/raw-node.ts";
 import {
   compile,
@@ -204,6 +204,7 @@ export async function init(opts: {
   cwd?: string;
   skipExisting?: boolean;
   skipVerify?: boolean;
+  allowRemoteProxy?: boolean;
 }): Promise<InitResult> {
   const { cfg, root } = await loadConfig(opts.cwd);
   const { fileKey, nodeId } = parseComponentId(opts.componentId);
@@ -228,17 +229,24 @@ export async function init(opts: {
   });
   let registry = await loadRegistry(componentsDir);
   const { ensureRegistryForRaw } = await import("./generate.ts");
-  registry = await ensureRegistryForRaw(raw, {
+  const ensured = await ensureRegistryForRaw(raw, {
     registry,
     componentsDir,
     cfigmaBin: cfg.cfigmaBin,
     cwd: root,
   });
+  registry = ensured.registry;
+  const detachUnregisteredInstances = ensured.missingComponentRoots.length > 0;
   const designContext = await loadCompileDesignContext(root, componentsDir);
   const typeTransformer = new DesignAstTypeTransformer();
   // Compute the component name from the raw figma name up-front so the
   // shared `assets/` dir is known before compile starts writing into it.
-  const componentName = pascalize(raw.name);
+  const componentName = await resolveComponentName(
+    componentsDir,
+    pascalize(raw.name),
+    raw.key,
+    nodeId,
+  );
   const componentDir = join(componentsDir, componentName);
   await mkdir(componentDir, { recursive: true });
   const masterAssetsDir = join(componentDir, "assets");
@@ -250,6 +258,9 @@ export async function init(opts: {
     registry,
     designContext,
     masterAssetsDir,
+    opts.allowRemoteProxy === true,
+    { cfigmaBin: cfg.cfigmaBin ?? "cfigma", tab: tab.key },
+    detachUnregisteredInstances,
   );
   const analysisRegistry = component.key
     ? new Map([...registry].filter(([key]) => key !== component.key))
@@ -278,6 +289,8 @@ export async function init(opts: {
         analysisRegistry,
         designContext,
         caseAssetsDir,
+        { cfigmaBin: cfg.cfigmaBin ?? "cfigma", tab: u.fileKey },
+        detachUnregisteredInstances,
       ),
       render: parseRenderBox(usageRaw),
     });
@@ -523,8 +536,11 @@ async function buildComponentSource(
   registry: Awaited<ReturnType<typeof loadRegistry>>,
   designContext: CompileDesignContext,
   masterAssetsDir: string,
+  allowRemoteProxy = false,
+  exportContext?: { cfigmaBin: string; tab: string },
+  detachUnregisteredInstances = false,
 ) {
-  if (raw.remote) {
+  if (raw.remote && !allowRemoteProxy) {
     throw new Error(
       `remote component proxy is not a valid init target: ${raw.id} (${raw.name})`,
     );
@@ -549,7 +565,14 @@ async function buildComponentSource(
         ...compileComponentRefDefaults(variantRaw),
       },
       raw: variantRaw,
-      ir: await compileForInit(variantRaw, registry, designContext, masterAssetsDir),
+      ir: await compileForInit(
+        variantRaw,
+        registry,
+        designContext,
+        masterAssetsDir,
+        exportContext,
+        detachUnregisteredInstances,
+      ),
       render: parseRenderBox(variantRaw),
     });
   }
@@ -567,6 +590,8 @@ async function compileForInit(
   registry: Awaited<ReturnType<typeof loadRegistry>>,
   design: CompileDesignContext,
   assetsDir: string,
+  exportContext?: { cfigmaBin: string; tab: string },
+  detachUnregisteredInstances = false,
 ): Promise<DNode> {
   return compile(raw, {
     registry,
@@ -575,6 +600,15 @@ async function compileForInit(
     tokenColorMap: design.tokenColorMap,
     typographyMap: design.typographyMap,
     writeAsset: makeAssetWriter(assetsDir),
+    detachUnregisteredInstances,
+    exportSvg: exportContext
+      ? (id) =>
+          exportNodeSvg({
+            cfigmaBin: exportContext.cfigmaBin,
+            tab: exportContext.tab,
+            nodeId: id,
+          })
+      : undefined,
   });
 }
 
@@ -583,15 +617,26 @@ async function compileUsageForInit(
   registry: Awaited<ReturnType<typeof loadRegistry>>,
   design: CompileDesignContext,
   assetsDir: string,
+  exportContext?: { cfigmaBin: string; tab: string },
+  detachUnregisteredInstances = false,
 ): Promise<DNode> {
   return compile(raw, {
     registry,
     detachRootInstance: true,
+    detachUnregisteredInstances,
     tokenMap: design.tokenMap,
     tokenValueMap: design.tokenValueMap,
     tokenColorMap: design.tokenColorMap,
     typographyMap: design.typographyMap,
     writeAsset: makeAssetWriter(assetsDir),
+    exportSvg: exportContext
+      ? (id) =>
+          exportNodeSvg({
+            cfigmaBin: exportContext.cfigmaBin,
+            tab: exportContext.tab,
+            nodeId: id,
+          })
+      : undefined,
   });
 }
 
@@ -613,7 +658,7 @@ function makeAssetWriter(assetsDir: string) {
   };
 }
 
-async function loadCompileDesignContext(
+export async function loadCompileDesignContext(
   root: string,
   componentsDir: string,
 ): Promise<CompileDesignContext> {
@@ -783,19 +828,20 @@ async function detectPromotions(
     ([, items]) => items.length > 1,
   );
   if (conflicts.length > 0) {
-    console.warn(
-      `[init] ambiguous promoted prop(s) — keeping first occurrence: ${conflicts
-        .map(([prop]) => JSON.stringify(prop))
-        .join(", ")}`,
+    const details = conflicts
+      .map(([prop, items]) => {
+        const sources = items
+          .map((item) => `${item.nodeId}:${item.field}`)
+          .join(", ");
+        return `${prop} <= ${sources}`;
+      })
+      .join("\n");
+    throw new Error(
+      `pixpec init: ambiguous promoted prop name(s). Rename the source layers ` +
+        `or adjust promotion naming so each promoted field has a unique prop.\n${details}`,
     );
   }
-  const seen = new Set<string>();
-  const deduped = promoted.filter((p) => {
-    if (seen.has(p.prop)) return false;
-    seen.add(p.prop);
-    return true;
-  });
-  return deduped.map((source) => {
+  return promoted.map((source) => {
     const masterNode = indexDNodes(master).get(source.nodeId);
     if (!masterNode) return source;
     if (source.field.startsWith("component.")) return source;
@@ -835,10 +881,6 @@ function dataScopeEntries(
 ): Record<string, DataScopeEntry> {
   const entries: Record<string, DataScopeEntry> = {};
   for (const [name, def] of Object.entries(defs)) {
-    // Skip Figma VARIANT-kind props: the impl dispatch layer already routes
-    // by variant key, so per-variant render code never reads these. Including
-    // them in the render-time props interface is pure noise.
-    if (def.kind === "variant") continue;
     entries[name] = {
       type: def.dataType,
       default: variant.props[name] ?? def.defaultValue,
@@ -1595,6 +1637,43 @@ async function importFresh(path: string): Promise<Record<string, unknown>> {
   return (await import(
     `${pathToFileURL(path).href}?t=${Date.now()}`
   )) as Record<string, unknown>;
+}
+
+async function resolveComponentName(
+  componentsDir: string,
+  baseName: string,
+  componentSetKey: string | undefined,
+  nodeId: string,
+): Promise<string> {
+  const base = baseName || "Component";
+  if (!componentSetKey) return base;
+  let candidate = base;
+  let suffix = sanitize(nodeId).replace(/_/g, "") || "Source";
+  let index = 1;
+  while (true) {
+    const pixpecPath = join(componentsDir, candidate, "pixpec.json");
+    if (!existsSync(pixpecPath)) return candidate;
+    try {
+      const parsed = JSON.parse(await readFile(pixpecPath, "utf8")) as {
+        figma?: { componentSetKey?: string | string[]; componentSetId?: string };
+      };
+      const keys = Array.isArray(parsed.figma?.componentSetKey)
+        ? parsed.figma?.componentSetKey
+        : parsed.figma?.componentSetKey
+          ? [parsed.figma.componentSetKey]
+          : [];
+      if (
+        keys.includes(componentSetKey) &&
+        (!parsed.figma?.componentSetId || parsed.figma.componentSetId === nodeId)
+      ) {
+        return candidate;
+      }
+    } catch (_) {
+      return candidate;
+    }
+    candidate = `${base}${suffix}${index === 1 ? "" : index}`;
+    index += 1;
+  }
 }
 
 function uniqueDirName(

@@ -42,7 +42,7 @@ export abstract class DNodeClass<T extends DNode = DNode> {
       const before = this.readField(field);
       const after = other.readField(field);
       if (isExpressionValue(before) || isExpressionValue(after)) continue;
-      if (stableJson(before) === stableJson(after)) continue;
+      if (equivalentValue(before, after)) continue;
       diffs.push({ field, before, after });
     }
     return diffs;
@@ -53,7 +53,7 @@ export abstract class DNodeClass<T extends DNode = DNode> {
   }
 
   protected visualFields(): string[] {
-    return ["visible"];
+    return ["hidden"];
   }
 }
 
@@ -78,6 +78,29 @@ function readPath(value: unknown, path: string): unknown {
 
 function isExpressionValue(value: unknown): boolean {
   return !!value && typeof value === "object" && (value as { kind?: unknown }).kind === "expression";
+}
+
+function equivalentValue(a: unknown, b: unknown): boolean {
+  if (typeof a === "number" && typeof b === "number") {
+    return Math.abs(a - b) < 0.01;
+  }
+  if (!a || !b || typeof a !== "object" || typeof b !== "object") {
+    return stableJson(a) === stableJson(b);
+  }
+  if (Array.isArray(a) || Array.isArray(b)) {
+    if (!Array.isArray(a) || !Array.isArray(b) || a.length !== b.length) {
+      return false;
+    }
+    return a.every((item, index) => equivalentValue(item, b[index]));
+  }
+  const aRecord = a as Record<string, unknown>;
+  const bRecord = b as Record<string, unknown>;
+  const aKeys = Object.keys(aRecord).sort();
+  const bKeys = Object.keys(bRecord).sort();
+  if (aKeys.length !== bKeys.length) return false;
+  return aKeys.every((key, index) => {
+    return key === bKeys[index] && equivalentValue(aRecord[key], bRecord[key]);
+  });
 }
 
 function stableJson(value: unknown): string {

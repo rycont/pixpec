@@ -7,6 +7,7 @@ export interface Env {
     readonly remBase: number
     readonly registry: Map<string, TargetComponentMeta>
     readonly tokenMap: Record<string, string>
+    readonly tokenValues: Record<string, number>
     readonly typographyMap: Record<string, string>
     readonly outputDir?: string
     readonly rootDir?: string
